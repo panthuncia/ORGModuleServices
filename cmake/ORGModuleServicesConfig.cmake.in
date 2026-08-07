@@ -1,0 +1,4 @@
+@PACKAGE_INIT@
+include(CMakeFindDependencyMacro)
+find_dependency(BasicRHI CONFIG)
+include("${CMAKE_CURRENT_LIST_DIR}/ORGModuleServicesTargets.cmake")
