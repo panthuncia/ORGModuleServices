@@ -1,5 +1,6 @@
 #pragma once
 #include <ORGModuleServices/FrameUploadArena.h>
+#include <ORGModuleServices/CompileFlightRegistry.h>
 #include <ORGModuleServices/DescriptorViewCache.h>
 #include <ORGModuleServices/StreamingUpload.h>
 #include <ORGModuleServices/PipelineService.h>

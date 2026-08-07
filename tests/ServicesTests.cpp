@@ -1,5 +1,6 @@
 #include <ORGModuleServices/PipelineService.h>
 #include <ORGModuleServices/DescriptorViewCache.h>
+#include <ORGModuleServices/CompileFlightRegistry.h>
 #if defined(ORG_MODULE_SERVICES_HAS_DXC)
 #include <ORGModuleServices/ShaderCompiler.h>
 #endif
@@ -9,6 +10,8 @@
 #include <cstring>
 
 int main() {
+	org::services::CompileFlightRegistry<int> flights;
+	assert(flights.TryBecomeOwnerOrWait(1)); assert(flights.ActiveCount() == 1); flights.Complete(1);
 	org::services::DescriptorViewCache views;
 	auto viewHandle = views.GetOrCreate({ 10, 20, 0 }, [] { return org::services::DescriptorView{ 1, 2, std::make_shared<int>(3) }; });
 	assert(views.Resolve(viewHandle)); views.InvalidateResource(10); assert(!views.Resolve(viewHandle));
