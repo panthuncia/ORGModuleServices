@@ -22,6 +22,8 @@ struct ShaderCompileRequest {
     std::wstring target;
     std::vector<ShaderDefine> defines;
     std::vector<std::wstring> arguments;
+	std::vector<std::filesystem::path> includeDirectories;
+	std::vector<std::filesystem::path> dependencyFiles;
     ShaderBinaryFormat format{ ShaderBinaryFormat::Dxil };
     bool debugInfo{};
     bool warningsAsErrors{ true };

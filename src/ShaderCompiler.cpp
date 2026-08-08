@@ -8,6 +8,8 @@
 #include <wrl/client.h>
 
 #include <fstream>
+#include <array>
+#include <cstring>
 #include <mutex>
 #include <unordered_map>
 
@@ -22,6 +24,19 @@ uint64_t HashBytes(uint64_t hash, const void* data, size_t size) noexcept {
 template<class T> uint64_t HashValue(uint64_t hash, const T& value) noexcept { return HashBytes(hash, &value, sizeof(value)); }
 uint64_t HashWide(uint64_t hash, std::wstring_view value) noexcept { return HashBytes(hash, value.data(), value.size() * sizeof(wchar_t)); }
 
+uint64_t HashFile(uint64_t hash, const std::filesystem::path& path) noexcept {
+	hash = HashWide(hash, path.native());
+	std::ifstream stream(path, std::ios::binary);
+	if (!stream) return HashValue(hash, std::uint64_t{});
+	std::array<char, 4096> bytes{};
+	while (stream) {
+		stream.read(bytes.data(), bytes.size());
+		const auto count = stream.gcount();
+		if (count > 0) hash = HashBytes(hash, bytes.data(), static_cast<std::size_t>(count));
+	}
+	return hash;
+}
+
 struct CacheHeader { uint32_t magic{ 0x5347524f }; uint16_t version{ 1 }; uint8_t format{}; uint8_t reserved{}; uint64_t key{}; uint64_t size{}; };
 }
 
@@ -34,11 +49,22 @@ public:
             if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                 reinterpret_cast<LPCWSTR>(&HashBytes), &ownModule)) {
                 wchar_t modulePath[MAX_PATH]{};
-                if (GetModuleFileNameW(ownModule, modulePath, MAX_PATH))
-                    module_ = LoadLibraryW((std::filesystem::path(modulePath).parent_path() / L"dxcompiler.dll").c_str());
+                if (GetModuleFileNameW(ownModule, modulePath, MAX_PATH)) {
+					const auto directory = std::filesystem::path(modulePath).parent_path();
+					validatorModule_ = LoadLibraryW((directory / L"dxil.dll").c_str());
+					module_ = LoadLibraryW((directory / L"dxcompiler.dll").c_str());
+				}
             }
         }
         if (!module_) return;
+		// dxcompiler loads the validator dynamically by basename. Applications such as
+		// SKSE keep the compiler beside the plugin rather than beside the executable,
+		// so explicitly preload the matching sibling validator before compiling.
+		if (!validatorModule_) {
+			wchar_t compilerPath[MAX_PATH]{};
+			if (GetModuleFileNameW(module_, compilerPath, MAX_PATH))
+				validatorModule_ = LoadLibraryW((std::filesystem::path(compilerPath).parent_path() / L"dxil.dll").c_str());
+		}
         const auto create = reinterpret_cast<DxcCreateInstanceProc>(GetProcAddress(module_, "DxcCreateInstance"));
         if (!create || FAILED(create(CLSID_DxcUtils, IID_PPV_ARGS(&utils_))) ||
             FAILED(create(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler_)))) {
@@ -54,7 +80,12 @@ public:
 			if (!ec) { const auto ticks = stamp.time_since_epoch().count(); compilerFingerprint_ = HashValue(compilerFingerprint_, ticks); }
 		}
     }
-    ~Impl() { compiler_.Reset(); utils_.Reset(); if (module_) FreeLibrary(module_); }
+    ~Impl() {
+		compiler_.Reset();
+		utils_.Reset();
+		if (module_) FreeLibrary(module_);
+		if (validatorModule_) FreeLibrary(validatorModule_);
+	}
 
     uint64_t Key(const ShaderCompileRequest& request) const noexcept {
         uint64_t hash = HashBytes(1469598103934665603ULL, request.source.data(), request.source.size());
@@ -63,7 +94,9 @@ public:
         hash = HashValue(hash, request.format); hash = HashValue(hash, request.debugInfo); hash = HashValue(hash, request.warningsAsErrors);
         for (const auto& define : request.defines) { hash = HashWide(hash, define.name); hash = HashWide(hash, define.value); }
         for (const auto& argument : request.arguments) hash = HashWide(hash, argument);
-        constexpr uint32_t compilerArgumentsVersion = 1; hash = HashValue(hash, compilerArgumentsVersion);
+		for (const auto& directory : request.includeDirectories) hash = HashWide(hash, directory.native());
+		for (const auto& dependency : request.dependencyFiles) hash = HashFile(hash, dependency);
+		constexpr uint32_t compilerArgumentsVersion = 3; hash = HashValue(hash, compilerArgumentsVersion);
 		return HashValue(hash, compilerFingerprint_);
     }
 
@@ -111,10 +144,13 @@ public:
         if (request.debugInfo) { owned.emplace_back(L"-Zi"); owned.emplace_back(L"-Qembed_debug"); }
         if (request.format == ShaderBinaryFormat::Spirv) owned.emplace_back(L"-spirv");
         for (const auto& define : request.defines) owned.push_back(L"-D" + define.name + (define.value.empty() ? L"" : L"=" + define.value));
+		for (const auto& directory : request.includeDirectories) { owned.emplace_back(L"-I"); owned.push_back(directory.native()); }
         owned.insert(owned.end(), request.arguments.begin(), request.arguments.end());
         std::vector<const wchar_t*> arguments; arguments.reserve(owned.size()); for (const auto& value : owned) arguments.push_back(value.c_str());
         ComPtr<IDxcResult> compileResult;
-        if (FAILED(compiler_->Compile(&buffer, arguments.data(), static_cast<UINT32>(arguments.size()), nullptr, IID_PPV_ARGS(&compileResult)))) {
+		ComPtr<IDxcIncludeHandler> includeHandler;
+		if ((!request.includeDirectories.empty() && FAILED(utils_->CreateDefaultIncludeHandler(&includeHandler))) ||
+			FAILED(compiler_->Compile(&buffer, arguments.data(), static_cast<UINT32>(arguments.size()), includeHandler.Get(), IID_PPV_ARGS(&compileResult)))) {
             result.diagnostics = "DXC invocation failed"; return result;
         }
         ComPtr<IDxcBlobUtf8> errors; compileResult->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
@@ -122,12 +158,24 @@ public:
         HRESULT status{}; compileResult->GetStatus(&status); if (FAILED(status)) return result;
         ComPtr<IDxcBlob> object; compileResult->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&object), nullptr);
         if (!object) { result.diagnostics += "\nDXC produced no object"; return result; }
-        const auto* first = static_cast<const std::byte*>(object->GetBufferPointer()); result.binary.assign(first, first + object->GetBufferSize());
+		const auto* first = static_cast<const std::byte*>(object->GetBufferPointer());
+		if (request.format == ShaderBinaryFormat::Dxil && object->GetBufferSize() >= 20 &&
+			std::memcmp(first, "DXBC", 4) == 0) {
+			bool unsignedContainer = true;
+			for (size_t index = 4; index < 20; ++index)
+				unsignedContainer &= first[index] == std::byte{};
+			if (unsignedContainer) {
+				result.diagnostics += "\nDXC produced unsigned DXIL; ensure the matching dxil.dll validator is available beside dxcompiler.dll";
+				return result;
+			}
+		}
+		result.binary.assign(first, first + object->GetBufferSize());
         Store(result); { std::scoped_lock lock(mutex_); memory_[key] = result; } return result;
     }
 
     std::filesystem::path cacheDirectory_;
     HMODULE module_{};
+	HMODULE validatorModule_{};
     ComPtr<IDxcUtils> utils_;
     ComPtr<IDxcCompiler3> compiler_;
     std::mutex mutex_;
