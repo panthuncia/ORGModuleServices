@@ -2,21 +2,20 @@ cmake_minimum_required(VERSION 3.21)
 project(ORGModuleServices LANGUAGES CXX)
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/ORGCompileShader.cmake)
 
 option(ORG_MODULE_SERVICES_ENABLE_DXC "Build DXC shader compilation support" ON)
 option(ORG_MODULE_SERVICES_ENABLE_VULKAN "Enable SPIR-V shader targets" OFF)
 option(ORG_MODULE_SERVICES_BUILD_TESTS "Build ORGModuleServices tests" OFF)
 
 add_library(ORGModuleServices STATIC
-    src/FrameUploadArena.cpp
-    src/DescriptorViewCache.cpp
     src/PipelineService.cpp)
 add_library(ORGModuleServices::ORGModuleServices ALIAS ORGModuleServices)
 target_compile_features(ORGModuleServices PUBLIC cxx_std_20)
 target_include_directories(ORGModuleServices PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
-target_link_libraries(ORGModuleServices PUBLIC BasicRHI::BasicRHI d3d12)
+target_link_libraries(ORGModuleServices PUBLIC BasicRHI::BasicRHI OpenRenderGraph::OpenRenderGraph)
 target_compile_definitions(ORGModuleServices PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 
 if(ORG_MODULE_SERVICES_ENABLE_DXC)
@@ -25,7 +24,7 @@ if(ORG_MODULE_SERVICES_ENABLE_DXC)
             "${CMAKE_CURRENT_LIST_DIR}/../FidelityFX-SDK/framework/cauldron/framework/libs/dxc/inc"
             "${CMAKE_CURRENT_LIST_DIR}/../../extern/FidelityFX-SDK/framework/cauldron/framework/libs/dxc/inc")
     if(ORG_MODULE_SERVICES_DXC_INCLUDE_DIR)
-        target_sources(ORGModuleServices PRIVATE src/ShaderCompiler.cpp)
+        target_sources(ORGModuleServices PRIVATE src/ShaderCompiler.cpp src/ShaderServiceAdapter.cpp)
         target_include_directories(ORGModuleServices PRIVATE "${ORG_MODULE_SERVICES_DXC_INCLUDE_DIR}")
         target_compile_definitions(ORGModuleServices PUBLIC ORG_MODULE_SERVICES_HAS_DXC=1)
         if(ORG_MODULE_SERVICES_ENABLE_VULKAN)
@@ -57,3 +56,4 @@ write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/ORGModuleServicesCo
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ORGModuleServicesConfig.cmake
     ${CMAKE_CURRENT_BINARY_DIR}/ORGModuleServicesConfigVersion.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ORGModuleServices)
+install(FILES cmake/ORGCompileShader.cmake DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ORGModuleServices)
