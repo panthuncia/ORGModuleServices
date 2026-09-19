@@ -1,4 +1,5 @@
 #include <ORGModuleServices/ShaderCompiler.h>
+#include <rhi.h>
 
 #include <Windows.h>
 #include <unknwn.h>
@@ -24,10 +25,10 @@ uint64_t HashBytes(uint64_t hash, const void* data, size_t size) noexcept {
 template<class T> uint64_t HashValue(uint64_t hash, const T& value) noexcept { return HashBytes(hash, &value, sizeof(value)); }
 uint64_t HashWide(uint64_t hash, std::wstring_view value) noexcept { return HashBytes(hash, value.data(), value.size() * sizeof(wchar_t)); }
 
-uint64_t HashFile(uint64_t hash, const std::filesystem::path& path) noexcept {
-	hash = HashWide(hash, path.native());
+uint64_t HashFileContents(const std::filesystem::path& path) noexcept {
+	uint64_t hash = 1469598103934665603ULL;
 	std::ifstream stream(path, std::ios::binary);
-	if (!stream) return HashValue(hash, std::uint64_t{});
+	if (!stream) return 0;
 	std::array<char, 4096> bytes{};
 	while (stream) {
 		stream.read(bytes.data(), bytes.size());
@@ -42,8 +43,14 @@ struct CacheHeader { uint32_t magic{ 0x5347524f }; uint16_t version{ 1 }; uint8_
 
 class ShaderCompiler::Impl {
 public:
-    explicit Impl(std::filesystem::path cacheDirectory) : cacheDirectory_(std::move(cacheDirectory)) {
-        module_ = LoadLibraryW(L"dxcompiler.dll");
+    Impl(std::filesystem::path cacheDirectory, const std::filesystem::path& compilerDirectory) : cacheDirectory_(std::move(cacheDirectory)) {
+        if (!compilerDirectory.empty()) {
+            // The validator first: dxcompiler resolves it by basename.
+            validatorModule_ = LoadLibraryW((compilerDirectory / L"dxil.dll").c_str());
+            module_ = LoadLibraryW((compilerDirectory / L"dxcompiler.dll").c_str());
+            if (!module_ && validatorModule_) { FreeLibrary(validatorModule_); validatorModule_ = nullptr; }
+        }
+        if (!module_) module_ = LoadLibraryW(L"dxcompiler.dll");
         if (!module_) {
             HMODULE ownModule{};
             if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -90,14 +97,33 @@ public:
     uint64_t Key(const ShaderCompileRequest& request) const noexcept {
         uint64_t hash = HashBytes(1469598103934665603ULL, request.source.data(), request.source.size());
         hash = HashBytes(hash, request.sourceName.data(), request.sourceName.size());
-        hash = HashWide(hash, request.entryPoint); hash = HashWide(hash, request.target);
+        hash = HashWide(hash, request.entryPoint); hash = HashWide(hash, request.target); hash = HashWide(hash, request.languageVersion);
         hash = HashValue(hash, request.format); hash = HashValue(hash, request.debugInfo); hash = HashValue(hash, request.warningsAsErrors);
         for (const auto& define : request.defines) { hash = HashWide(hash, define.name); hash = HashWide(hash, define.value); }
         for (const auto& argument : request.arguments) hash = HashWide(hash, argument);
 		for (const auto& directory : request.includeDirectories) hash = HashWide(hash, directory.native());
-		for (const auto& dependency : request.dependencyFiles) hash = HashFile(hash, dependency);
-		constexpr uint32_t compilerArgumentsVersion = 3; hash = HashValue(hash, compilerArgumentsVersion);
+		for (const auto& dependency : request.dependencyFiles) { hash = HashWide(hash, dependency.native()); hash = HashValue(hash, DependencyHash(dependency)); }
+		constexpr uint32_t compilerArgumentsVersion = 4; hash = HashValue(hash, compilerArgumentsVersion);
 		return HashValue(hash, compilerFingerprint_);
+    }
+
+    // Content hash of a dependency, re-read only when its size or write time changes: a permutation
+    // set shares one include tree, and every key would otherwise re-hash all of it.
+    uint64_t DependencyHash(const std::filesystem::path& path) const noexcept {
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(path, ec);
+        if (ec) return 0;
+        const auto stamp = std::filesystem::last_write_time(path, ec).time_since_epoch().count();
+        if (ec) return 0;
+        {
+            std::scoped_lock lock(dependencyMutex_);
+            if (const auto found = dependencies_.find(path.native()); found != dependencies_.end() && found->second.size == size && found->second.stamp == stamp)
+                return found->second.hash;
+        }
+        const uint64_t hash = HashFileContents(path);
+        std::scoped_lock lock(dependencyMutex_);
+        dependencies_[path.native()] = { static_cast<uint64_t>(size), static_cast<int64_t>(stamp), hash };
+        return hash;
     }
 
     std::filesystem::path CachePath(uint64_t key) const {
@@ -139,10 +165,11 @@ public:
         DxcBuffer buffer{ sourceBlob->GetBufferPointer(), sourceBlob->GetBufferSize(), DXC_CP_UTF8 };
         std::vector<std::wstring> owned;
         owned.emplace_back(L"-E"); owned.push_back(request.entryPoint); owned.emplace_back(L"-T"); owned.push_back(request.target);
-        owned.emplace_back(L"-HV"); owned.emplace_back(L"2021");
+        owned.emplace_back(L"-HV"); owned.push_back(request.languageVersion.empty() ? std::wstring(L"2021") : request.languageVersion);
         if (request.warningsAsErrors) owned.emplace_back(L"-WX");
         if (request.debugInfo) { owned.emplace_back(L"-Zi"); owned.emplace_back(L"-Qembed_debug"); }
-        if (request.format == ShaderBinaryFormat::Spirv) owned.emplace_back(L"-spirv");
+        // Same SPIR-V ABI as BasicRHI's Vulkan backend expects (descriptor-heap bindings, DX layout).
+        if (request.format == ShaderBinaryFormat::Spirv) rhi::AppendVulkanDxcSpirvArguments(owned);
         for (const auto& define : request.defines) owned.push_back(L"-D" + define.name + (define.value.empty() ? L"" : L"=" + define.value));
 		for (const auto& directory : request.includeDirectories) { owned.emplace_back(L"-I"); owned.push_back(directory.native()); }
         owned.insert(owned.end(), request.arguments.begin(), request.arguments.end());
@@ -182,9 +209,12 @@ public:
     std::unordered_map<uint64_t, ShaderArtifact> memory_;
     std::unordered_map<uint64_t, std::shared_future<ShaderArtifact>> flights_;
 	uint64_t compilerFingerprint_{ 1469598103934665603ULL };
+	struct DependencyEntry { uint64_t size{}; int64_t stamp{}; uint64_t hash{}; };
+	mutable std::mutex dependencyMutex_;
+	mutable std::unordered_map<std::wstring, DependencyEntry> dependencies_;
 };
 
-ShaderCompiler::ShaderCompiler(std::filesystem::path path) : impl_(std::make_unique<Impl>(std::move(path))) {}
+ShaderCompiler::ShaderCompiler(std::filesystem::path path, std::filesystem::path compilerDirectory) : impl_(std::make_unique<Impl>(std::move(path), compilerDirectory)) {}
 ShaderCompiler::~ShaderCompiler() = default;
 ShaderCompiler::ShaderCompiler(ShaderCompiler&&) noexcept = default;
 ShaderCompiler& ShaderCompiler::operator=(ShaderCompiler&&) noexcept = default;

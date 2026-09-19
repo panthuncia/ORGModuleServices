@@ -22,7 +22,8 @@ if(ORG_MODULE_SERVICES_ENABLE_DXC)
     find_path(ORG_MODULE_SERVICES_DXC_INCLUDE_DIR dxcapi.h
         HINTS
             "${CMAKE_CURRENT_LIST_DIR}/../FidelityFX-SDK/framework/cauldron/framework/libs/dxc/inc"
-            "${CMAKE_CURRENT_LIST_DIR}/../../extern/FidelityFX-SDK/framework/cauldron/framework/libs/dxc/inc")
+            "${CMAKE_CURRENT_LIST_DIR}/../../extern/FidelityFX-SDK/framework/cauldron/framework/libs/dxc/inc"
+            "$ENV{VULKAN_SDK}/Include/dxc")
     if(ORG_MODULE_SERVICES_DXC_INCLUDE_DIR)
         target_sources(ORGModuleServices PRIVATE src/ShaderCompiler.cpp src/ShaderServiceAdapter.cpp)
         target_include_directories(ORGModuleServices PRIVATE "${ORG_MODULE_SERVICES_DXC_INCLUDE_DIR}")

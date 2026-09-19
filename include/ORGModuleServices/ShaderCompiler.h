@@ -25,6 +25,8 @@ struct ShaderCompileRequest {
 	std::vector<std::filesystem::path> includeDirectories;
 	std::vector<std::filesystem::path> dependencyFiles;
     ShaderBinaryFormat format{ ShaderBinaryFormat::Dxil };
+    // DXC -HV: 2018 keeps the pre-2021 semantics (vector ternaries, ...) that FXC-era sources rely on.
+    std::wstring languageVersion{ L"2021" };
     bool debugInfo{};
     bool warningsAsErrors{ true };
 };
@@ -40,7 +42,11 @@ struct ShaderArtifact {
 
 class ShaderCompiler {
 public:
-    explicit ShaderCompiler(std::filesystem::path cacheDirectory = {});
+    // compilerDirectory: load dxcompiler.dll and dxil.dll from there. Otherwise the loader's search
+    // order applies, then the directory of the module this library is linked into. In-process
+    // hosts (game plugins) should pass it: another dxcompiler.dll, possibly without SPIR-V support,
+    // may already be loaded by basename.
+    explicit ShaderCompiler(std::filesystem::path cacheDirectory = {}, std::filesystem::path compilerDirectory = {});
     ~ShaderCompiler();
     ShaderCompiler(ShaderCompiler&&) noexcept;
     ShaderCompiler& operator=(ShaderCompiler&&) noexcept;
