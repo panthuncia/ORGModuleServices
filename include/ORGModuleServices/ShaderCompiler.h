@@ -27,6 +27,8 @@ struct ShaderCompileRequest {
     ShaderBinaryFormat format{ ShaderBinaryFormat::Dxil };
     // DXC -HV: 2018 keeps the pre-2021 semantics (vector ternaries, ...) that FXC-era sources rely on.
     std::wstring languageVersion{ L"2021" };
+    // Source-level debug info: embedded PDB for DXIL, OpSource/OpLine for SPIR-V, with
+    // every source file's text embedded. sourceName is the file name the debug info and diagnostics refer to.
     bool debugInfo{};
     bool warningsAsErrors{ true };
 };

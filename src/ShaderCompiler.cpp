@@ -103,7 +103,7 @@ public:
         for (const auto& argument : request.arguments) hash = HashWide(hash, argument);
 		for (const auto& directory : request.includeDirectories) hash = HashWide(hash, directory.native());
 		for (const auto& dependency : request.dependencyFiles) { hash = HashWide(hash, dependency.native()); hash = HashValue(hash, DependencyHash(dependency)); }
-		constexpr uint32_t compilerArgumentsVersion = 4; hash = HashValue(hash, compilerArgumentsVersion);
+		constexpr uint32_t compilerArgumentsVersion = 6; hash = HashValue(hash, compilerArgumentsVersion);
 		return HashValue(hash, compilerFingerprint_);
     }
 
@@ -167,12 +167,21 @@ public:
         owned.emplace_back(L"-E"); owned.push_back(request.entryPoint); owned.emplace_back(L"-T"); owned.push_back(request.target);
         owned.emplace_back(L"-HV"); owned.push_back(request.languageVersion.empty() ? std::wstring(L"2021") : request.languageVersion);
         if (request.warningsAsErrors) owned.emplace_back(L"-WX");
-        if (request.debugInfo) { owned.emplace_back(L"-Zi"); owned.emplace_back(L"-Qembed_debug"); }
+        // SPIR-V gets -Zi's OpSource (every file's text embedded) and OpLine, which Nsight and RenderDoc
+        // read; -Qembed_debug is the DXIL container's equivalent. Not -fspv-debug=vulkan[-with-source]:
+        // its DebugValues keep dead loads alive, which changes the resources a stage uses, and DXC 1.9's
+        // validator rejects some of its scopes against the embedded text.
+        if (request.debugInfo) {
+            owned.emplace_back(L"-Zi");
+            if (request.format == ShaderBinaryFormat::Dxil) owned.emplace_back(L"-Qembed_debug");
+        }
         // Same SPIR-V ABI as BasicRHI's Vulkan backend expects (descriptor-heap bindings, DX layout).
         if (request.format == ShaderBinaryFormat::Spirv) rhi::AppendVulkanDxcSpirvArguments(owned);
         for (const auto& define : request.defines) owned.push_back(L"-D" + define.name + (define.value.empty() ? L"" : L"=" + define.value));
 		for (const auto& directory : request.includeDirectories) { owned.emplace_back(L"-I"); owned.push_back(directory.native()); }
         owned.insert(owned.end(), request.arguments.begin(), request.arguments.end());
+        // The positional argument names the main file for diagnostics, debug info and relative includes.
+        if (!request.sourceName.empty()) owned.emplace_back(request.sourceName.begin(), request.sourceName.end());
         std::vector<const wchar_t*> arguments; arguments.reserve(owned.size()); for (const auto& value : owned) arguments.push_back(value.c_str());
         ComPtr<IDxcResult> compileResult;
 		ComPtr<IDxcIncludeHandler> includeHandler;
