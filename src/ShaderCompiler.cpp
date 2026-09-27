@@ -1,5 +1,6 @@
 #include <ORGModuleServices/ShaderCompiler.h>
 #include <rhi.h>
+#include <BasicTelemetry/Tracy.h>
 
 #include <Windows.h>
 #include <unknwn.h>
@@ -95,6 +96,7 @@ public:
 	}
 
     uint64_t Key(const ShaderCompileRequest& request) const noexcept {
+        BT_ZONE_SCOPE("ORG.ShaderCompiler.BuildKey");
         uint64_t hash = HashBytes(1469598103934665603ULL, request.source.data(), request.source.size());
         hash = HashBytes(hash, request.sourceName.data(), request.sourceName.size());
         hash = HashWide(hash, request.entryPoint); hash = HashWide(hash, request.target); hash = HashWide(hash, request.languageVersion);
@@ -102,7 +104,10 @@ public:
         for (const auto& define : request.defines) { hash = HashWide(hash, define.name); hash = HashWide(hash, define.value); }
         for (const auto& argument : request.arguments) hash = HashWide(hash, argument);
 		for (const auto& directory : request.includeDirectories) hash = HashWide(hash, directory.native());
-		for (const auto& dependency : request.dependencyFiles) { hash = HashWide(hash, dependency.native()); hash = HashValue(hash, DependencyHash(dependency)); }
+		{
+            BT_ZONE_SCOPE("ORG.ShaderCompiler.DependencyKeys");
+		    for (const auto& dependency : request.dependencyFiles) { hash = HashWide(hash, dependency.native()); hash = HashValue(hash, DependencyHash(dependency)); }
+        }
 		constexpr uint32_t compilerArgumentsVersion = 6; hash = HashValue(hash, compilerArgumentsVersion);
 		return HashValue(hash, compilerFingerprint_);
     }
@@ -110,11 +115,21 @@ public:
     // Content hash of a dependency, re-read only when its size or write time changes: a permutation
     // set shares one include tree, and every key would otherwise re-hash all of it.
     uint64_t DependencyHash(const std::filesystem::path& path) const noexcept {
-        std::error_code ec;
-        const auto size = std::filesystem::file_size(path, ec);
-        if (ec) return 0;
-        const auto stamp = std::filesystem::last_write_time(path, ec).time_since_epoch().count();
-        if (ec) return 0;
+        // Both witnesses in one filesystem/VFS lookup, without changing cache invalidation.
+        WIN32_FILE_ATTRIBUTE_DATA attributes{};
+        if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attributes) ||
+            (attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) return 0;
+        uint64_t size = (uint64_t(attributes.nFileSizeHigh) << 32) | attributes.nFileSizeLow;
+        int64_t stamp = static_cast<int64_t>((uint64_t(attributes.ftLastWriteTime.dwHighDateTime) << 32) |
+            attributes.ftLastWriteTime.dwLowDateTime);
+        if (attributes.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+            // filesystem follows symlinks; attribute queries describe the link itself.
+            std::error_code ec;
+            size = std::filesystem::file_size(path, ec);
+            if (ec) return 0;
+            stamp = std::filesystem::last_write_time(path, ec).time_since_epoch().count();
+            if (ec) return 0;
+        }
         {
             std::scoped_lock lock(dependencyMutex_);
             if (const auto found = dependencies_.find(path.native()); found != dependencies_.end() && found->second.size == size && found->second.stamp == stamp)
@@ -231,7 +246,9 @@ bool ShaderCompiler::Available() const noexcept { return impl_ && impl_->compile
 uint64_t ShaderCompiler::BuildKey(const ShaderCompileRequest& request) const noexcept { return impl_->Key(request); }
 
 std::shared_future<ShaderArtifact> ShaderCompiler::CompileAsync(ShaderCompileRequest request) {
+    BT_ZONE_SCOPE("ORG.ShaderCompiler.CompileAsync");
     const uint64_t key = BuildKey(request);
+    BT_ZONE_NAMED(enqueueZone, "ORG.ShaderCompiler.Enqueue");
     std::scoped_lock lock(impl_->mutex_);
     if (auto found = impl_->flights_.find(key); found != impl_->flights_.end()) return found->second;
     std::vector<std::byte> source(request.source.begin(), request.source.end()); request.source = {};
