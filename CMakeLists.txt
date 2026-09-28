@@ -7,6 +7,14 @@ include(${CMAKE_CURRENT_LIST_DIR}/cmake/ORGCompileShader.cmake)
 option(ORG_MODULE_SERVICES_ENABLE_DXC "Build DXC shader compilation support" ON)
 option(ORG_MODULE_SERVICES_ENABLE_VULKAN "Enable SPIR-V shader targets" OFF)
 option(ORG_MODULE_SERVICES_BUILD_TESTS "Build ORGModuleServices tests" OFF)
+option(ORG_MODULE_SERVICES_ENABLE_ASYNC_STATE_GRAPH "Build the shared CPU dependency engine" OFF)
+
+# Backend-independent coordination and immutable slot ownership. Kept separate
+# from shader/RHI services so CPU-only consumers and tests need no device.
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/AsyncRuntime.cmake)
+if(ORG_MODULE_SERVICES_ENABLE_ASYNC_STATE_GRAPH)
+    include(${CMAKE_CURRENT_LIST_DIR}/cmake/AsyncStateGraph.cmake)
+endif()
 
 add_library(ORGModuleServices STATIC
     src/PipelineService.cpp)
@@ -38,6 +46,7 @@ endif()
 
 if(ORG_MODULE_SERVICES_BUILD_TESTS)
     enable_testing()
+    add_subdirectory(tests/Async)
     add_executable(ORGModuleServicesTests tests/ServicesTests.cpp)
     target_link_libraries(ORGModuleServicesTests PRIVATE ORGModuleServices::ORGModuleServices)
     add_test(NAME ORGModuleServicesTests COMMAND ORGModuleServicesTests)

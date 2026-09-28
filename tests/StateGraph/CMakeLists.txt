@@ -1,0 +1,27 @@
+cmake_minimum_required(VERSION 3.21)
+project(ORGAsyncStateGraphTests LANGUAGES CXX)
+enable_testing()
+
+# Optional source dependency for standalone validation; no renderer/RHI is configured.
+if(NOT ORG_ASYNC_TEST_USE_INSTALLED AND ORG_ASYNC_TEST_TELEMETRY_SOURCE AND NOT TARGET BasicTelemetry::Core)
+    set(BASICTELEMETRY_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(BASICTELEMETRY_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+    set(BASICTELEMETRY_ENABLE_TRACY OFF CACHE BOOL "" FORCE)
+    set(BASICTELEMETRY_BUILD_ARTIFACTS OFF CACHE BOOL "" FORCE)
+    add_subdirectory(${ORG_ASYNC_TEST_TELEMETRY_SOURCE} telemetry)
+endif()
+if(ORG_ASYNC_TEST_USE_INSTALLED)
+    find_package(ORGAsyncStateGraph CONFIG REQUIRED)
+else()
+    include(../../cmake/AsyncStateGraph.cmake)
+endif()
+add_executable(ORGAsyncStateGraphTests StateGraphTests.cpp)
+target_link_libraries(ORGAsyncStateGraphTests PRIVATE ORGModuleServices::AsyncStateGraph)
+target_compile_options(ORGAsyncStateGraphTests PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/UNDEBUG,-UNDEBUG>)
+if(WIN32)
+    add_custom_command(TARGET ORGAsyncStateGraphTests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:TBB::tbb>
+            $<TARGET_FILE_DIR:ORGAsyncStateGraphTests>)
+endif()
+add_test(NAME ORGAsyncStateGraphTests COMMAND ORGAsyncStateGraphTests)
+set_tests_properties(ORGAsyncStateGraphTests PROPERTIES TIMEOUT 30)
