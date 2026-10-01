@@ -1445,12 +1445,17 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
 			retentionTrace->Config().detail == AsyncStateGraphTraceDetail::FullDependencies;
 		std::uint64_t reclaimedInBatch = 0;
 		static const bool traceGpuLifetime = [] {
+#ifdef _WIN32
 			char* value = nullptr;
 			size_t length = 0;
 			const bool enabled = _dupenv_s(&value, &length, "SARP_GPU_LIFETIME_TRACE") == 0 &&
 				value && value[0] && value[0] != '0';
 			std::free(value);
 			return enabled;
+#else
+			const char* value = std::getenv("SARP_GPU_LIFETIME_TRACE");
+			return value && value[0] && value[0] != '0';
+#endif
 		}();
 		StoredVersionKey candidate;
 		for (std::size_t examined = 0;

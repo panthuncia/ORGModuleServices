@@ -1,23 +1,81 @@
 #include <ORGModuleServices/ShaderCompiler.h>
-#include <rhi.h>
+#include <rhi_shader_abi.h> // not rhi.h: on Linux its Win32 adapter clashes with DXC's
 #include <BasicTelemetry/Tracy.h>
 
+#if defined(_WIN32)
 #include <Windows.h>
 #include <unknwn.h>
 #include <objidl.h>
 #include <oaidl.h>
 #include <dxcapi.h>
 #include <wrl/client.h>
+#else
+#include <dlfcn.h>
+#include <dxcapi.h>
+#endif
 
 #include <fstream>
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
 
 namespace org::services {
 namespace {
+#if defined(_WIN32)
 using Microsoft::WRL::ComPtr;
+using ModuleHandle = HMODULE;
+constexpr const wchar_t* kCompilerLibrary = L"dxcompiler.dll";
+constexpr const wchar_t* kValidatorLibrary = L"dxil.dll";
+
+ModuleHandle OpenLibrary(const std::filesystem::path& path) noexcept { return LoadLibraryW(path.c_str()); }
+void CloseLibrary(ModuleHandle module) noexcept { if (module) FreeLibrary(module); }
+void* LibrarySymbol(ModuleHandle module, const char* name) noexcept { return reinterpret_cast<void*>(GetProcAddress(module, name)); }
+std::filesystem::path LibraryPath(ModuleHandle module) {
+    wchar_t path[MAX_PATH]{};
+    return module && GetModuleFileNameW(module, path, MAX_PATH) ? std::filesystem::path(path) : std::filesystem::path{};
+}
+// The module this library is linked into (a DLL host keeps DXC beside itself, not the executable).
+std::filesystem::path OwnModulePath(const void* address) {
+    HMODULE ownModule{};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(address), &ownModule)) return {};
+    return LibraryPath(ownModule);
+}
+#else
+// WinAdapter.h's CComPtr with the WRL ComPtr spelling this file uses.
+template<class T> class ComPtr : public CComPtr<T> {
+public:
+    T* Get() const noexcept { return this->p; }
+    void Reset() noexcept { this->Release(); }
+};
+using ModuleHandle = void*;
+constexpr const char* kCompilerLibrary = "libdxcompiler.so";
+// SPIR-V needs no validator, and DXIL is only consumed by D3D12.
+constexpr const char* kValidatorLibrary = "libdxil.so";
+
+ModuleHandle OpenLibrary(const std::filesystem::path& path) noexcept { return dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL); }
+void CloseLibrary(ModuleHandle module) noexcept { if (module) dlclose(module); }
+void* LibrarySymbol(ModuleHandle module, const char* name) noexcept { return dlsym(module, name); }
+std::filesystem::path AddressPath(const void* address) {
+    Dl_info info{};
+    return dladdr(address, &info) && info.dli_fname ? std::filesystem::path(info.dli_fname) : std::filesystem::path{};
+}
+std::filesystem::path LibraryPath(ModuleHandle module) {
+    void* symbol = module ? dlsym(module, "DxcCreateInstance") : nullptr;
+    return symbol ? AddressPath(symbol) : std::filesystem::path{};
+}
+std::filesystem::path OwnModulePath(const void* address) {
+    // dladdr names the executable by argv[0]; /proc/self/exe is the real path.
+    auto path = AddressPath(address);
+    if (path.empty() || !path.has_parent_path()) {
+        std::error_code ec;
+        path = std::filesystem::read_symlink("/proc/self/exe", ec);
+    }
+    return path;
+}
+#endif
 uint64_t HashBytes(uint64_t hash, const void* data, size_t size) noexcept {
     const auto* bytes = static_cast<const unsigned char*>(data);
     for (size_t i = 0; i < size; ++i) { hash ^= bytes[i]; hash *= 1099511628211ULL; }
@@ -25,6 +83,10 @@ uint64_t HashBytes(uint64_t hash, const void* data, size_t size) noexcept {
 }
 template<class T> uint64_t HashValue(uint64_t hash, const T& value) noexcept { return HashBytes(hash, &value, sizeof(value)); }
 uint64_t HashWide(uint64_t hash, std::wstring_view value) noexcept { return HashBytes(hash, value.data(), value.size() * sizeof(wchar_t)); }
+uint64_t HashPath(uint64_t hash, const std::filesystem::path& value) noexcept {
+    const auto& native = value.native();
+    return HashBytes(hash, native.data(), native.size() * sizeof(native[0]));
+}
 
 uint64_t HashFileContents(const std::filesystem::path& path) noexcept {
 	uint64_t hash = 1469598103934665603ULL;
@@ -47,21 +109,16 @@ public:
     Impl(std::filesystem::path cacheDirectory, const std::filesystem::path& compilerDirectory) : cacheDirectory_(std::move(cacheDirectory)) {
         if (!compilerDirectory.empty()) {
             // The validator first: dxcompiler resolves it by basename.
-            validatorModule_ = LoadLibraryW((compilerDirectory / L"dxil.dll").c_str());
-            module_ = LoadLibraryW((compilerDirectory / L"dxcompiler.dll").c_str());
-            if (!module_ && validatorModule_) { FreeLibrary(validatorModule_); validatorModule_ = nullptr; }
+            validatorModule_ = OpenLibrary(compilerDirectory / kValidatorLibrary);
+            module_ = OpenLibrary(compilerDirectory / kCompilerLibrary);
+            if (!module_ && validatorModule_) { CloseLibrary(validatorModule_); validatorModule_ = nullptr; }
         }
-        if (!module_) module_ = LoadLibraryW(L"dxcompiler.dll");
+        if (!module_) module_ = OpenLibrary(kCompilerLibrary);
         if (!module_) {
-            HMODULE ownModule{};
-            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                reinterpret_cast<LPCWSTR>(&HashBytes), &ownModule)) {
-                wchar_t modulePath[MAX_PATH]{};
-                if (GetModuleFileNameW(ownModule, modulePath, MAX_PATH)) {
-					const auto directory = std::filesystem::path(modulePath).parent_path();
-					validatorModule_ = LoadLibraryW((directory / L"dxil.dll").c_str());
-					module_ = LoadLibraryW((directory / L"dxcompiler.dll").c_str());
-				}
+            if (const auto ownPath = OwnModulePath(reinterpret_cast<const void*>(&HashBytes)); !ownPath.empty()) {
+                const auto directory = ownPath.parent_path();
+                validatorModule_ = OpenLibrary(directory / kValidatorLibrary);
+                module_ = OpenLibrary(directory / kCompilerLibrary);
             }
         }
         if (!module_) return;
@@ -69,19 +126,17 @@ public:
 		// SKSE keep the compiler beside the plugin rather than beside the executable,
 		// so explicitly preload the matching sibling validator before compiling.
 		if (!validatorModule_) {
-			wchar_t compilerPath[MAX_PATH]{};
-			if (GetModuleFileNameW(module_, compilerPath, MAX_PATH))
-				validatorModule_ = LoadLibraryW((std::filesystem::path(compilerPath).parent_path() / L"dxil.dll").c_str());
+			if (const auto compilerPath = LibraryPath(module_); !compilerPath.empty())
+				validatorModule_ = OpenLibrary(compilerPath.parent_path() / kValidatorLibrary);
 		}
-        const auto create = reinterpret_cast<DxcCreateInstanceProc>(GetProcAddress(module_, "DxcCreateInstance"));
+        const auto create = reinterpret_cast<DxcCreateInstanceProc>(LibrarySymbol(module_, "DxcCreateInstance"));
         if (!create || FAILED(create(CLSID_DxcUtils, IID_PPV_ARGS(&utils_))) ||
             FAILED(create(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler_)))) {
-            compiler_.Reset(); utils_.Reset(); FreeLibrary(module_); module_ = nullptr;
+            compiler_.Reset(); utils_.Reset(); CloseLibrary(module_); module_ = nullptr;
         }
         if (!cacheDirectory_.empty()) { std::error_code ec; std::filesystem::create_directories(cacheDirectory_, ec); }
-		wchar_t compilerPath[MAX_PATH]{};
-		if (module_ && GetModuleFileNameW(module_, compilerPath, MAX_PATH)) {
-			const std::filesystem::path path(compilerPath); compilerFingerprint_ = HashWide(compilerFingerprint_, path.native());
+		if (const auto path = module_ ? LibraryPath(module_) : std::filesystem::path{}; !path.empty()) {
+			compilerFingerprint_ = HashPath(compilerFingerprint_, path);
 			std::error_code ec; const auto size = std::filesystem::file_size(path, ec);
 			if (!ec) compilerFingerprint_ = HashValue(compilerFingerprint_, size);
 			ec.clear(); const auto stamp = std::filesystem::last_write_time(path, ec);
@@ -91,8 +146,8 @@ public:
     ~Impl() {
 		compiler_.Reset();
 		utils_.Reset();
-		if (module_) FreeLibrary(module_);
-		if (validatorModule_) FreeLibrary(validatorModule_);
+		CloseLibrary(module_);
+		CloseLibrary(validatorModule_);
 	}
 
     uint64_t Key(const ShaderCompileRequest& request) const noexcept {
@@ -103,10 +158,10 @@ public:
         hash = HashValue(hash, request.format); hash = HashValue(hash, request.debugInfo); hash = HashValue(hash, request.warningsAsErrors);
         for (const auto& define : request.defines) { hash = HashWide(hash, define.name); hash = HashWide(hash, define.value); }
         for (const auto& argument : request.arguments) hash = HashWide(hash, argument);
-		for (const auto& directory : request.includeDirectories) hash = HashWide(hash, directory.native());
+		for (const auto& directory : request.includeDirectories) hash = HashPath(hash, directory);
 		{
             BT_ZONE_SCOPE("ORG.ShaderCompiler.DependencyKeys");
-		    for (const auto& dependency : request.dependencyFiles) { hash = HashWide(hash, dependency.native()); hash = HashValue(hash, DependencyHash(dependency)); }
+		    for (const auto& dependency : request.dependencyFiles) { hash = HashPath(hash, dependency); hash = HashValue(hash, DependencyHash(dependency)); }
         }
 		constexpr uint32_t compilerArgumentsVersion = 6; hash = HashValue(hash, compilerArgumentsVersion);
 		return HashValue(hash, compilerFingerprint_);
@@ -115,6 +170,7 @@ public:
     // Content hash of a dependency, re-read only when its size or write time changes: a permutation
     // set shares one include tree, and every key would otherwise re-hash all of it.
     uint64_t DependencyHash(const std::filesystem::path& path) const noexcept {
+#if defined(_WIN32)
         // Both witnesses in one filesystem/VFS lookup, without changing cache invalidation.
         WIN32_FILE_ATTRIBUTE_DATA attributes{};
         if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attributes) ||
@@ -130,6 +186,14 @@ public:
             stamp = std::filesystem::last_write_time(path, ec).time_since_epoch().count();
             if (ec) return 0;
         }
+#else
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(path, ec)) return 0;
+        const uint64_t size = std::filesystem::file_size(path, ec);
+        if (ec) return 0;
+        const int64_t stamp = static_cast<int64_t>(std::filesystem::last_write_time(path, ec).time_since_epoch().count());
+        if (ec) return 0;
+#endif
         {
             std::scoped_lock lock(dependencyMutex_);
             if (const auto found = dependencies_.find(path.native()); found != dependencies_.end() && found->second.size == size && found->second.stamp == stamp)
@@ -142,7 +206,7 @@ public:
     }
 
     std::filesystem::path CachePath(uint64_t key) const {
-        wchar_t name[32]{}; swprintf_s(name, L"%016llx.orgshader", static_cast<unsigned long long>(key)); return cacheDirectory_ / name;
+        char name[32]{}; std::snprintf(name, sizeof(name), "%016llx.orgshader", static_cast<unsigned long long>(key)); return cacheDirectory_ / name;
     }
     bool Load(uint64_t key, ShaderBinaryFormat format, ShaderArtifact& artifact) const {
         if (cacheDirectory_.empty()) return false;
@@ -155,7 +219,7 @@ public:
     }
     void Store(const ShaderArtifact& artifact) const {
         if (cacheDirectory_.empty() || !artifact) return;
-        const auto destination = CachePath(artifact.key); auto temporary = destination; temporary += L".tmp";
+        const auto destination = CachePath(artifact.key); auto temporary = destination; temporary += ".tmp";
         std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
         CacheHeader header{}; header.format = static_cast<uint8_t>(artifact.format); header.key = artifact.key; header.size = artifact.binary.size();
         stream.write(reinterpret_cast<const char*>(&header), sizeof(header));
@@ -193,7 +257,7 @@ public:
         // Same SPIR-V ABI as BasicRHI's Vulkan backend expects (descriptor-heap bindings, DX layout).
         if (request.format == ShaderBinaryFormat::Spirv) rhi::AppendVulkanDxcSpirvArguments(owned);
         for (const auto& define : request.defines) owned.push_back(L"-D" + define.name + (define.value.empty() ? L"" : L"=" + define.value));
-		for (const auto& directory : request.includeDirectories) { owned.emplace_back(L"-I"); owned.push_back(directory.native()); }
+		for (const auto& directory : request.includeDirectories) { owned.emplace_back(L"-I"); owned.push_back(directory.wstring()); }
         owned.insert(owned.end(), request.arguments.begin(), request.arguments.end());
         // The positional argument names the main file for diagnostics, debug info and relative includes.
         if (!request.sourceName.empty()) owned.emplace_back(request.sourceName.begin(), request.sourceName.end());
@@ -225,8 +289,8 @@ public:
     }
 
     std::filesystem::path cacheDirectory_;
-    HMODULE module_{};
-	HMODULE validatorModule_{};
+    ModuleHandle module_{};
+	ModuleHandle validatorModule_{};
     ComPtr<IDxcUtils> utils_;
     ComPtr<IDxcCompiler3> compiler_;
     std::mutex mutex_;
@@ -235,7 +299,7 @@ public:
 	uint64_t compilerFingerprint_{ 1469598103934665603ULL };
 	struct DependencyEntry { uint64_t size{}; int64_t stamp{}; uint64_t hash{}; };
 	mutable std::mutex dependencyMutex_;
-	mutable std::unordered_map<std::wstring, DependencyEntry> dependencies_;
+	mutable std::unordered_map<std::filesystem::path::string_type, DependencyEntry> dependencies_;
 };
 
 ShaderCompiler::ShaderCompiler(std::filesystem::path path, std::filesystem::path compilerDirectory) : impl_(std::make_unique<Impl>(std::move(path), compilerDirectory)) {}
