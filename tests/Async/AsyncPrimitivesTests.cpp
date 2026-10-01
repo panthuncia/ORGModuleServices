@@ -9,7 +9,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <condition_variable>
 #include <deque>
+#include <mutex>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -421,6 +423,72 @@ void TestPump() {
     failure.Configure([](Pump::Task) { return false; }, [] {}, [&] { rejected = true; });
     assert(!failure.Notify() && rejected && !failure.Notify());
 }
+
+// Notify takes no lock: producers, two scheduler workers and an inline runner race it. Exactly one drain runs at a time, and
+// every notification is followed by a drain that began after it (level-triggered): once everyone stops, the consumer has
+// seen every producer's last value.
+void TestConcurrentPump() {
+    using Pump = org::async::SerializedTaskPump;
+    for (const auto mode : { Pump::HandoffMode::Inline, Pump::HandoffMode::Resubmit }) {
+        Pump pump;
+        std::mutex mutex;
+        std::condition_variable changed;
+        std::deque<Pump::Task> tasks;
+        bool stopping = false;
+        constexpr unsigned kProducers = 4, kPosts = 20000;
+        std::atomic<unsigned> posted[kProducers]{};
+        std::atomic<unsigned> seen[kProducers]{};
+        std::atomic<int> draining{ 0 };
+        std::atomic<unsigned> overlaps{ 0 };
+        pump.Configure([&](Pump::Task task) {
+                { std::lock_guard lock(mutex); tasks.push_back(std::move(task)); }
+                changed.notify_one();
+                return true;
+            },
+            [&] {
+                if (draining.fetch_add(1) != 0) overlaps.fetch_add(1);
+                for (unsigned p = 0; p < kProducers; ++p) seen[p].store(posted[p].load(std::memory_order_acquire), std::memory_order_relaxed);
+                draining.fetch_sub(1);
+            },
+            {}, {}, mode);
+        std::vector<std::thread> workers;
+        for (int w = 0; w < 2; ++w)
+            workers.emplace_back([&] {
+                for (;;) {
+                    Pump::Task task;
+                    {
+                        std::unique_lock lock(mutex);
+                        changed.wait(lock, [&] { return stopping || !tasks.empty(); });
+                        if (tasks.empty()) return;
+                        task = std::move(tasks.front());
+                        tasks.pop_front();
+                    }
+                    task();
+                }
+            });
+        std::atomic<bool> producing{ true };
+        std::thread inliner([&] { while (producing.load()) (void)pump.TryRunInline(); });
+        std::vector<std::thread> producers;
+        for (unsigned p = 0; p < kProducers; ++p)
+            producers.emplace_back([&, p] {
+                for (unsigned i = 1; i <= kPosts; ++i) {
+                    posted[p].store(i, std::memory_order_release);
+                    assert(pump.Notify());
+                }
+            });
+        for (auto& producer : producers) producer.join();
+        producing.store(false);
+        inliner.join();
+        while (!pump.IsIdle()) std::this_thread::yield();
+        { std::lock_guard lock(mutex); stopping = true; }
+        changed.notify_all();
+        for (auto& worker : workers) worker.join();
+        assert(overlaps.load() == 0);
+        for (unsigned p = 0; p < kProducers; ++p) assert(seen[p].load() == kPosts);
+        const auto stats = pump.GetStats();
+        assert(stats.notifications == kProducers * kPosts && stats.drainedEpoch == stats.requestedEpoch);
+    }
+}
 }
 
 int main() {
@@ -434,4 +502,5 @@ int main() {
     TestLeases();
     TestConcurrentTripleBuffer();
     TestPump();
+    TestConcurrentPump();
 }
