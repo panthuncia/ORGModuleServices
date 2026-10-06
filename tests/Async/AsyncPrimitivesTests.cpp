@@ -4,12 +4,14 @@
 #include <ORGModuleServices/Async/ArtifactResources.h>
 #include <ORGModuleServices/Async/LeasedArraySlots.h>
 #include <ORGModuleServices/Async/PublicationExchange.h>
+#include <ORGModuleServices/Async/RevisionAssembly.h>
 #include <ORGModuleServices/Async/SerializedTaskPump.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <condition_variable>
+#include <cstdio>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -335,6 +337,204 @@ void TestConcurrentPublicationExchange() {
     exchange.ReclaimRetired();
 }
 
+void TestRevisionAssembly() {
+    using namespace org::async;
+    using Fragment = RevisionFragment;
+    using Assembler = RevisionAssembler;
+    std::atomic<unsigned> notified{0};
+    Assembler assembler(3, [&] { ++notified; });
+    auto pending = [] { return std::make_shared<Fragment>(); };
+    auto value = [](int v) { return std::make_shared<const int>(v); };
+
+    // Partial readiness: published only once every named fragment is ready.
+    auto a1 = pending(), b1 = pending();
+    auto c1 = Fragment::MakeReady(value(3));
+    auto draft = assembler.Begin();
+    draft.Set(0, a1);
+    draft.Set(1, b1);
+    draft.Set(2, c1);
+    assert(assembler.Seal(std::move(draft)) == 1);
+    assert(assembler.Collect().published == 0 && assembler.TrySelect() == Assembler::Selection::Unchanged);
+    assert(a1->Resolve(value(1)) && !a1->Resolve(value(9)));
+    assert(assembler.Collect().published == 0 && notified == 0);
+    assert(b1->Resolve(value(2)) && notified == 1);
+    assert(assembler.Collect().published == 1);
+    assert(assembler.TrySelect() == Assembler::Selection::Selected);
+    const auto* active = assembler.Active();
+    assert(active->Sequence() == 1 && *active->Get<int>(0) == 1 && *active->Get<int>(1) == 2 && *active->Get<int>(2) == 3);
+    assert(!active->Get<float>(0)); // the resolved type only
+
+    // Unchanged slots inherit exact versions.
+    auto c2 = pending();
+    draft = assembler.Begin();
+    draft.Set(2, c2);
+    assert(assembler.Seal(std::move(draft)) == 2);
+    assert(assembler.Collect().published == 0 && assembler.Active()->Sequence() == 1);
+    (void)c2->Resolve(value(30));
+    assert(assembler.Collect().published == 2 && assembler.TrySelect() == Assembler::Selection::Selected);
+    active = assembler.Active();
+    assert(active->Fragment(0) == a1 && active->Fragment(1) == b1 && *active->Get<int>(2) == 30);
+
+    // Closure: a fragment requiring an exact version in another slot cannot be named beside anything else.
+    auto a3 = pending();
+    auto b3 = std::make_shared<Fragment>(std::vector<Fragment::Requirement>{{0, a3}});
+    draft = assembler.Begin();
+    draft.Set(1, b3);
+    bool rejected = false;
+    try { (void)assembler.Seal(draft); } catch (const std::logic_error&) { rejected = true; }
+    assert(rejected && assembler.LatestSequence() == 2);
+    draft.Set(0, a3);
+    assert(assembler.Seal(std::move(draft)) == 3);
+    // A draft begun before another seal is stale.
+    auto stale = assembler.Begin();
+    draft = assembler.Begin();
+    draft.Set(2, Fragment::MakeReady(value(40)));
+    assert(assembler.Seal(std::move(draft)) == 4); // inherits revision 3's pending a3 and b3
+    rejected = false;
+    try { (void)assembler.Seal(std::move(stale)); } catch (const std::logic_error&) { rejected = true; }
+    assert(rejected);
+    // Revision 4 shares 3's work in flight; both complete together, the newest wins, the older is superseded.
+    (void)b3->Resolve(value(20));
+    assert(assembler.Collect().published == 0);
+    (void)a3->Resolve(value(10));
+    assert(assembler.Collect().published == 4 && assembler.GetStats().superseded == 1 && assembler.Pending() == 0);
+    assert(assembler.TrySelect() == Assembler::Selection::Selected);
+    active = assembler.Active();
+    assert(*active->Get<int>(0) == 10 && *active->Get<int>(1) == 20 && *active->Get<int>(2) == 40);
+
+    // A newer complete revision abandons an older pending one (never cancelled before that), whose fragment may
+    // still settle later without effect.
+    auto a5 = pending();
+    draft = assembler.Begin();
+    draft.Set(0, a5);
+    draft.Set(1, Fragment::MakeReady(value(50)));
+    assert(assembler.Seal(std::move(draft)) == 5);
+    draft = assembler.Begin();
+    draft.Set(0, Fragment::MakeReady(value(60)));
+    draft.Set(1, Fragment::MakeReady(value(61)));
+    assert(assembler.Seal(std::move(draft)) == 6);
+    assert(assembler.Collect().published == 6 && assembler.GetStats().abandoned == 1 && assembler.Pending() == 0);
+    const auto before = notified.load();
+    (void)a5->Resolve(value(5));
+    assert(notified == before && assembler.Collect().published == 0);
+
+    // Latest wins over a publication the frame has not selected yet.
+    for (int v = 70; v < 72; ++v) {
+        draft = assembler.Begin();
+        draft.Set(2, Fragment::MakeReady(value(v)));
+        (void)assembler.Seal(std::move(draft));
+        assert(assembler.Collect().published == assembler.LatestSequence());
+    }
+    auto frameLease = assembler.AcquireActive();
+    assert(assembler.TrySelect() == Assembler::Selection::Selected && *assembler.Active()->Get<int>(2) == 71);
+    assert(frameLease->Sequence() == 4); // the frame's lease still owns what it selected
+
+    // Failure: the revision fails whole and the active one stays.
+    auto a9 = pending(), b9 = pending();
+    draft = assembler.Begin();
+    draft.Set(0, a9);
+    draft.Set(1, b9);
+    const auto failing = assembler.Seal(std::move(draft));
+    (void)a9->Resolve(value(90));
+    (void)b9->Fail(std::make_exception_ptr(std::runtime_error("no pipeline")));
+    auto collected = assembler.Collect();
+    assert(collected.published == 0 && collected.failures.size() == 1 && collected.failures[0].sequence == failing);
+    rejected = false;
+    try { std::rethrow_exception(collected.failures[0].error); } catch (const std::runtime_error&) { rejected = true; }
+    assert(rejected && assembler.TrySelect() == Assembler::Selection::Unchanged && *assembler.Active()->Get<int>(2) == 71);
+    // A later draft inherits the failed fragment until the coordinator names a new one.
+    draft = assembler.Begin();
+    assert(draft.Get(1) == b9 && b9->GetState() == Fragment::State::Failed);
+    draft.Set(1, Fragment::MakeReady(value(91)));
+    (void)assembler.Seal(std::move(draft));
+    assert(assembler.Collect().published == assembler.LatestSequence() && assembler.TrySelect() == Assembler::Selection::Selected);
+    assert(*assembler.Active()->Get<int>(0) == 90 && *assembler.Active()->Get<int>(1) == 91);
+    assert(assembler.GetStats().failed == 1);
+}
+
+// Producers settle fragments on many threads in any order; the frame only ever selects whole revisions, in order.
+void TestConcurrentRevisionAssembly() {
+    using namespace org::async;
+    constexpr unsigned kSlots = 4, kRevisions = 3000, kResolvers = 4;
+    RevisionAssembler assembler(kSlots);
+    std::mutex queueMutex;
+    std::deque<std::pair<std::shared_ptr<RevisionFragment>, unsigned>> queue;
+    std::atomic<bool> sealed{false};
+    std::vector<std::thread> resolvers;
+    for (unsigned t = 0; t < kResolvers; ++t)
+        resolvers.emplace_back([&, t] {
+            for (unsigned spin = 0;;) {
+                std::pair<std::shared_ptr<RevisionFragment>, unsigned> item;
+                {
+                    std::lock_guard lock(queueMutex);
+                    if (!queue.empty()) {
+                        // Take from either end, so fragments settle out of order.
+                        if ((spin++ + t) & 1) { item = std::move(queue.front()); queue.pop_front(); }
+                        else { item = std::move(queue.back()); queue.pop_back(); }
+                    }
+                }
+                if (item.first) (void)item.first->Resolve(std::make_shared<const unsigned>(item.second));
+                else if (sealed.load(std::memory_order_acquire)) return;
+                else std::this_thread::yield();
+            }
+        });
+    std::atomic<std::uint64_t> published{0};
+    std::thread coordinator([&] {
+        auto queueFragment = [&](std::shared_ptr<RevisionFragment> fragment, unsigned revision) {
+            std::lock_guard lock(queueMutex);
+            queue.emplace_back(std::move(fragment), revision);
+        };
+        for (unsigned revision = 1; revision <= kRevisions; ++revision) {
+            auto draft = assembler.Begin();
+            // Slot 0 and slot 1 change every revision (slot 1 requires slot 0's exact version: never split from it);
+            // slots 2 and 3 every few, keeping the inherited (possibly pending) version in between.
+            auto head = std::make_shared<RevisionFragment>();
+            draft.Set(0, head);
+            queueFragment(head, revision);
+            auto paired = std::make_shared<RevisionFragment>(std::vector<RevisionFragment::Requirement>{{0, head}});
+            draft.Set(1, paired);
+            queueFragment(paired, revision);
+            for (unsigned slot = 2; slot < kSlots; ++slot) {
+                if (revision != 1 && revision % (slot + 1) != 1) continue;
+                auto fragment = std::make_shared<RevisionFragment>();
+                draft.Set(slot, fragment);
+                queueFragment(std::move(fragment), revision);
+            }
+            assert(assembler.Seal(std::move(draft)) == revision);
+            if (const auto sequence = assembler.Collect().published) published.store(sequence, std::memory_order_release);
+        }
+        sealed.store(true, std::memory_order_release);
+        while (published.load(std::memory_order_acquire) != kRevisions) {
+            if (const auto sequence = assembler.Collect().published) published.store(sequence, std::memory_order_release);
+            std::this_thread::yield();
+        }
+    });
+    std::uint64_t selected = 0, selections = 0;
+    while (selected != kRevisions) {
+        if (assembler.TrySelect([&](const AssembledRevision& revision) noexcept {
+            assert(revision.Sequence() > selected);
+            for (unsigned slot = 0; slot < kSlots; ++slot) {
+                const auto v = revision.Get<unsigned>(slot);
+                assert(v && *v <= revision.Sequence());
+            }
+            assert(*revision.Get<unsigned>(0) == revision.Sequence() && *revision.Get<unsigned>(1) == revision.Sequence());
+            assert(revision.Fragment(1)->Requirements()[0].fragment == revision.Fragment(0));
+            return true;
+        }) == RevisionAssembler::Selection::Selected) {
+            selected = assembler.Active()->Sequence();
+            ++selections;
+        } else std::this_thread::yield();
+    }
+    coordinator.join();
+    for (auto& resolver : resolvers) resolver.join();
+    const auto& stats = assembler.GetStats();
+    assert(stats.sealed == kRevisions && stats.failed == 0);
+    assert(stats.published + stats.superseded + stats.abandoned == kRevisions);
+    std::printf("revision assembly: %llu published, %llu superseded, %llu abandoned, %llu selected\n",
+        static_cast<unsigned long long>(stats.published), static_cast<unsigned long long>(stats.superseded),
+        static_cast<unsigned long long>(stats.abandoned), static_cast<unsigned long long>(selections));
+}
+
 void TestLeases() {
     using Slots = org::async::LeasedArraySlots<unsigned, 3>;
     std::vector<Slots::Lease> held;
@@ -499,6 +699,8 @@ int main() {
     TestArtifactResources();
     TestPublicationExchange();
     TestConcurrentPublicationExchange();
+    TestRevisionAssembly();
+    TestConcurrentRevisionAssembly();
     TestLeases();
     TestConcurrentTripleBuffer();
     TestPump();

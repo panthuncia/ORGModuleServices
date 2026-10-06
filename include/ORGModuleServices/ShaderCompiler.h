@@ -31,6 +31,11 @@ struct ShaderCompileRequest {
     // every source file's text embedded. sourceName is the file name the debug info and diagnostics refer to.
     bool debugInfo{};
     bool warningsAsErrors{ true };
+    // When nonzero: ShaderCompiler::FingerprintInputs of this source and these dependency files, taken by the caller while
+    // they were current. The key uses it instead of hashing the source and checking every dependency file again: a
+    // permutation set shares both, and a key otherwise costs a read of every dependency's attributes (slow through a
+    // virtual file system), per permutation.
+    uint64_t inputsFingerprint{};
 };
 
 struct ShaderArtifact {
@@ -57,6 +62,9 @@ public:
 
     bool Available() const noexcept;
     uint64_t BuildKey(const ShaderCompileRequest& request) const noexcept;
+    // The source's contents and every dependency's, for ShaderCompileRequest::inputsFingerprint. A dependency's contents are
+    // re-read only when its size or write time changed since the compiler last hashed it.
+    uint64_t FingerprintInputs(std::span<const std::byte> source, const std::vector<std::filesystem::path>& dependencyFiles) const noexcept;
     std::shared_future<ShaderArtifact> CompileAsync(ShaderCompileRequest request);
     ShaderArtifact Compile(ShaderCompileRequest request);
     void ClearMemoryCache();

@@ -22,4 +22,5 @@ target_sources(ORGAsyncPrimitives INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include/ORGModuleServices/Async/GraphScheduler.h>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include/ORGModuleServices/Async/SerializedTaskPump.h>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include/ORGModuleServices/Async/LeasedArraySlots.h>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include/ORGModuleServices/Async/PublicationExchange.h>)
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include/ORGModuleServices/Async/PublicationExchange.h>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include/ORGModuleServices/Async/RevisionAssembly.h>)

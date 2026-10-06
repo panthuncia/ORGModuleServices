@@ -152,14 +152,16 @@ public:
 
     uint64_t Key(const ShaderCompileRequest& request) const noexcept {
         BT_ZONE_SCOPE("ORG.ShaderCompiler.BuildKey");
-        uint64_t hash = HashBytes(1469598103934665603ULL, request.source.data(), request.source.size());
+        uint64_t hash = request.inputsFingerprint
+            ? HashValue(1469598103934665603ULL, request.inputsFingerprint)
+            : HashBytes(1469598103934665603ULL, request.source.data(), request.source.size());
         hash = HashBytes(hash, request.sourceName.data(), request.sourceName.size());
         hash = HashWide(hash, request.entryPoint); hash = HashWide(hash, request.target); hash = HashWide(hash, request.languageVersion);
         hash = HashValue(hash, request.format); hash = HashValue(hash, request.debugInfo); hash = HashValue(hash, request.warningsAsErrors);
         for (const auto& define : request.defines) { hash = HashWide(hash, define.name); hash = HashWide(hash, define.value); }
         for (const auto& argument : request.arguments) hash = HashWide(hash, argument);
 		for (const auto& directory : request.includeDirectories) hash = HashPath(hash, directory);
-		{
+		if (!request.inputsFingerprint) {
             BT_ZONE_SCOPE("ORG.ShaderCompiler.DependencyKeys");
 		    for (const auto& dependency : request.dependencyFiles) { hash = HashPath(hash, dependency); hash = HashValue(hash, DependencyHash(dependency)); }
         }
@@ -308,6 +310,13 @@ ShaderCompiler::ShaderCompiler(ShaderCompiler&&) noexcept = default;
 ShaderCompiler& ShaderCompiler::operator=(ShaderCompiler&&) noexcept = default;
 bool ShaderCompiler::Available() const noexcept { return impl_ && impl_->compiler_; }
 uint64_t ShaderCompiler::BuildKey(const ShaderCompileRequest& request) const noexcept { return impl_->Key(request); }
+uint64_t ShaderCompiler::FingerprintInputs(std::span<const std::byte> source, const std::vector<std::filesystem::path>& dependencyFiles) const noexcept {
+    BT_ZONE_SCOPE("ORG.ShaderCompiler.FingerprintInputs");
+    uint64_t hash = HashBytes(1469598103934665603ULL, source.data(), source.size());
+    for (const auto& dependency : dependencyFiles) { hash = HashPath(hash, dependency); hash = HashValue(hash, impl_->DependencyHash(dependency)); }
+    // Never zero, which means "none" in a request.
+    return hash ? hash : 1;
+}
 
 std::shared_future<ShaderArtifact> ShaderCompiler::CompileAsync(ShaderCompileRequest request) {
     BT_ZONE_SCOPE("ORG.ShaderCompiler.CompileAsync");

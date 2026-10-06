@@ -46,6 +46,18 @@ public:
         return false;
     }
 
+    // Latest wins: takes back a ready successor the consumer has not selected
+    // yet (retired here, released by ReclaimRetired) and publishes the
+    // candidate in its place. Either the consumer's exchange or this one takes
+    // the ready index, so a successor is never both selected and replaced.
+    // With the taken-back slot reclaimed, a slot is always free.
+    [[nodiscard]] bool TryReplace(Lease& candidate) {
+        if (!candidate) return false;
+        const auto ready = m_ready.exchange(kNone, std::memory_order_acq_rel);
+        if (ready != kNone) m_slots[ready].state.store(State::Retired, std::memory_order_release);
+        return TryPublish(candidate);
+    }
+
     template <class Accept>
     [[nodiscard]] Selection TrySelect(Accept&& accept) noexcept {
         static_assert(std::is_nothrow_invocable_r_v<bool, Accept, const T&>,
