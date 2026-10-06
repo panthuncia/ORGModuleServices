@@ -3,7 +3,9 @@
 #include <ORGModuleServices/Async/ArtifactResources.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <span>
 #include <vector>
 
 #include "Render/Runtime/IUploadService.h"
@@ -32,6 +34,9 @@ struct VersionGrowthRequest {
     // staged (the uploader copies the segments into its pages when queued).
     std::vector<VersionFill> fills;
     std::shared_ptr<const void> contents;
+    // Contents that depend on the version made (rows that embed their own device address): called on the producer's thread
+    // once the version exists, before the fills are queued, to set `fills` and `contents` (it replaces those given above).
+    std::function<void(const BufferVersion& version, std::vector<VersionFill>& fills, std::shared_ptr<const void>& contents)> contentsOf;
     std::shared_ptr<runtime::IUploadService> uploads;
 };
 
@@ -44,6 +49,14 @@ struct GrownVersion {
 
 /** @brief Any thread: makes the version and queues its fills. Throws when the version cannot be made or a fill not queued. */
 GrownVersion GrowVersion(const VersionGrowthRequest& request);
+
+/** @brief Versions that grow together (one owner's sizing): adopted as one, so ready as one. */
+struct GrownVersions {
+    std::vector<std::shared_ptr<const BufferVersion>> versions;  // by the requests' order
+    std::shared_ptr<const async::GpuSubmissionSet> ready;        // every fill's copy (null: nothing to copy)
+};
+/** @brief Any thread: GrowVersion for each request, ready together. */
+GrownVersions GrowVersions(std::span<const VersionGrowthRequest> requests);
 
 /** @brief A readiness token over upload tickets (TokenForTickets in BasicRenderer): complete when all are, failed when one was cancelled. */
 std::shared_ptr<const async::GpuSubmissionSet> TokenForTickets(std::vector<std::shared_ptr<TrackedUploadTicket>> tickets);
