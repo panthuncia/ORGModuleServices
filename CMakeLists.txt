@@ -17,7 +17,8 @@ if(ORG_MODULE_SERVICES_ENABLE_ASYNC_STATE_GRAPH)
 endif()
 
 add_library(ORGModuleServices STATIC
-    src/PipelineService.cpp)
+    src/PipelineService.cpp
+    src/VersionedBufferGrowth.cpp)
 add_library(ORGModuleServices::ORGModuleServices ALIAS ORGModuleServices)
 target_compile_features(ORGModuleServices PUBLIC cxx_std_20)
 target_include_directories(ORGModuleServices PUBLIC
