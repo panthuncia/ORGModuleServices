@@ -18,7 +18,9 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 
 namespace org::services {
@@ -221,13 +223,21 @@ public:
     }
     void Store(const ShaderArtifact& artifact) const {
         if (cacheDirectory_.empty() || !artifact) return;
-        const auto destination = CachePath(artifact.key); auto temporary = destination; temporary += ".tmp";
+        // A temporary of its own: two compiles of one key (different requesters) must not write or rename one file.
+        static std::atomic<uint64_t> stores{ 0 };
+        const auto destination = CachePath(artifact.key); auto temporary = destination;
+        temporary += "." + std::to_string(stores.fetch_add(1, std::memory_order_relaxed)) + ".tmp";
         std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
         CacheHeader header{}; header.format = static_cast<uint8_t>(artifact.format); header.key = artifact.key; header.size = artifact.binary.size();
         stream.write(reinterpret_cast<const char*>(&header), sizeof(header));
         stream.write(reinterpret_cast<const char*>(artifact.binary.data()), static_cast<std::streamsize>(artifact.binary.size())); stream.close();
+        // The publication, one at a time: a file system hook in the path (Mod Organizer's usvfs, which redirects Data/) is not safe
+        // under concurrent renames and faulted in MoveFileExW during a full recompile. A rename is rare and short.
+        static std::mutex publication;
+        std::scoped_lock lock(publication);
         std::error_code ec; std::filesystem::rename(temporary, destination, ec);
         if (ec) { std::filesystem::remove(destination, ec); ec.clear(); std::filesystem::rename(temporary, destination, ec); }
+        if (ec) std::filesystem::remove(temporary, ec);
     }
 
     ShaderArtifact CompileOwned(ShaderCompileRequest request, std::vector<std::byte> source, uint64_t key) {
