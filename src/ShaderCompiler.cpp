@@ -1,4 +1,5 @@
 #include <ORGModuleServices/ShaderCompiler.h>
+#include "CompletionFlight.h"
 #include <rhi_shader_abi.h> // not rhi.h: on Linux its Win32 adapter clashes with DXC's
 #include <BasicTelemetry/Tracy.h>
 
@@ -20,6 +21,7 @@
 #include <cstring>
 #include <atomic>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -305,16 +307,42 @@ public:
 	ModuleHandle validatorModule_{};
     ComPtr<IDxcUtils> utils_;
     ComPtr<IDxcCompiler3> compiler_;
+    using Flight = detail::CompletionFlight<ShaderArtifact>;
+
+    // A compile task's body: on the submitter's thread (or the default thread).
+    void RunFlight(const std::shared_ptr<Flight>& flight, ShaderCompileRequest request, std::vector<std::byte> source, uint64_t key) {
+        const auto format = request.format;
+        ShaderArtifact result;
+        std::exception_ptr error;
+        std::string message;
+        try { result = CompileOwned(std::move(request), std::move(source), key); }
+        catch (const std::exception& e) { error = std::current_exception(); message = e.what(); }
+        catch (...) { error = std::current_exception(); message = "shader compilation failed"; }
+        if (error) FinishFlight(flight, key, ShaderArtifact{ key, format, {}, std::move(message) }, error);
+        else FinishFlight(flight, key, std::move(result), {});
+    }
+    // Leaves the flight table first, so a later request (also one a callback makes) finds the memory cache or starts
+    // afresh, then completes the future and invokes the callbacks, outside mutex_.
+    void FinishFlight(const std::shared_ptr<Flight>& flight, uint64_t key, ShaderArtifact result, std::exception_ptr error) {
+        {
+            std::scoped_lock lock(mutex_);
+            if (auto found = flights_.find(key); found != flights_.end() && found->second == flight) flights_.erase(found);
+        }
+        if (error) flight->Fail(std::move(error), std::move(result));
+        else flight->Complete(std::move(result));
+    }
+
     std::mutex mutex_;
     std::unordered_map<uint64_t, ShaderArtifact> memory_;
-    std::unordered_map<uint64_t, std::shared_future<ShaderArtifact>> flights_;
+    std::unordered_map<uint64_t, std::shared_ptr<Flight>> flights_;
+    Submit submit_;
 	uint64_t compilerFingerprint_{ 1469598103934665603ULL };
 	struct DependencyEntry { uint64_t size{}; int64_t stamp{}; uint64_t hash{}; };
 	mutable std::mutex dependencyMutex_;
 	mutable std::unordered_map<std::filesystem::path::string_type, DependencyEntry> dependencies_;
 };
 
-ShaderCompiler::ShaderCompiler(std::filesystem::path path, std::filesystem::path compilerDirectory) : impl_(std::make_unique<Impl>(std::move(path), compilerDirectory)) {}
+ShaderCompiler::ShaderCompiler(std::filesystem::path path, std::filesystem::path compilerDirectory) : impl_(std::make_shared<Impl>(std::move(path), compilerDirectory)) {}
 ShaderCompiler::~ShaderCompiler() = default;
 ShaderCompiler::ShaderCompiler(ShaderCompiler&&) noexcept = default;
 ShaderCompiler& ShaderCompiler::operator=(ShaderCompiler&&) noexcept = default;
@@ -328,19 +356,49 @@ uint64_t ShaderCompiler::FingerprintInputs(std::span<const std::byte> source, co
     return hash ? hash : 1;
 }
 
-std::shared_future<ShaderArtifact> ShaderCompiler::CompileAsync(ShaderCompileRequest request) {
+std::shared_future<ShaderArtifact> ShaderCompiler::CompileAsync(ShaderCompileRequest request) { return CompileAsync(std::move(request), {}); }
+
+std::shared_future<ShaderArtifact> ShaderCompiler::CompileAsync(ShaderCompileRequest request, CompletionCallback onComplete) {
     BT_ZONE_SCOPE("ORG.ShaderCompiler.CompileAsync");
     const uint64_t key = BuildKey(request);
     BT_ZONE_NAMED(enqueueZone, "ORG.ShaderCompiler.Enqueue");
-    std::scoped_lock lock(impl_->mutex_);
-    if (auto found = impl_->flights_.find(key); found != impl_->flights_.end()) return found->second;
+    std::optional<ShaderArtifact> hit;
+    std::shared_ptr<Impl::Flight> flight;
+    Submit submit;
+    bool owner = false;
+    {
+        std::scoped_lock lock(impl_->mutex_);
+        if (auto found = impl_->memory_.find(key); found != impl_->memory_.end()) {
+            hit = found->second; hit->fromCache = true;
+        } else if (auto inFlight = impl_->flights_.find(key); inFlight != impl_->flights_.end()) {
+            flight = inFlight->second;
+        } else {
+            flight = std::make_shared<Impl::Flight>();
+            impl_->flights_.emplace(key, flight);
+            submit = impl_->submit_;
+            owner = true;
+        }
+    }
+    if (hit) {
+        auto future = Impl::Flight::Ready(std::move(*hit));
+        if (onComplete) onComplete(future.get());
+        return future;
+    }
+    // The owner attaches before submitting, so its callback is queued; a joiner may find the flight already done and
+    // is then invoked here, on its own thread.
+    flight->Attach(std::move(onComplete));
+    auto future = flight->Future();
+    if (!owner) return future;
+    const auto format = request.format;
     std::vector<std::byte> source(request.source.begin(), request.source.end()); request.source = {};
-    auto future = std::async(std::launch::async, [impl = impl_.get(), request = std::move(request), source = std::move(source), key]() mutable {
-        auto result = impl->CompileOwned(std::move(request), std::move(source), key);
-        std::scoped_lock lock(impl->mutex_); impl->flights_.erase(key); return result;
-    }).share();
-    impl_->flights_.emplace(key, future); return future;
+    ServiceTask task = [impl = impl_, flight, request = std::move(request), source = std::move(source), key]() mutable {
+        impl->RunFlight(flight, std::move(request), std::move(source), key);
+    };
+    if (!detail::LaunchServiceTask(submit, std::move(task)))
+        impl_->FinishFlight(flight, key, ShaderArtifact{ key, format, {}, "the shader compile submitter refused the request" }, {});
+    return future;
 }
+void ShaderCompiler::Configure(Submit submit) { std::scoped_lock lock(impl_->mutex_); impl_->submit_ = std::move(submit); }
 ShaderArtifact ShaderCompiler::Compile(ShaderCompileRequest request) { return CompileAsync(std::move(request)).get(); }
 void ShaderCompiler::ClearMemoryCache() { std::scoped_lock lock(impl_->mutex_); impl_->memory_.clear(); }
 }

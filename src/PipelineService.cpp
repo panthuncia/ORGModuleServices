@@ -1,10 +1,14 @@
 #include <ORGModuleServices/PipelineService.h>
+#include "CompletionFlight.h"
 
 #include <utility>
 #include <chrono>
+#include <optional>
 #include <stdexcept>
 
 namespace org::services {
+struct PipelineService::Flight : detail::CompletionFlight<PipelineArtifact> {};
+
 namespace {
 uint64_t Mix(uint64_t seed, uint64_t value) noexcept {
     value ^= value >> 30; value *= 0xbf58476d1ce4e5b9ULL;
@@ -24,31 +28,60 @@ uint64_t PipelineService::BuildKey(const PipelineRecipe& recipe) const noexcept 
     key = Mix(key, recipe.fixedFunctionKey); return Mix(key, recipe.deviceKey);
 }
 
-std::shared_future<PipelineArtifact> PipelineService::Request(PipelineRecipe recipe) {
+std::shared_future<PipelineArtifact> PipelineService::Request(PipelineRecipe recipe) { return Request(std::move(recipe), {}); }
+
+std::shared_future<PipelineArtifact> PipelineService::Request(PipelineRecipe recipe, CompletionCallback onComplete) {
     const uint64_t key = BuildKey(recipe);
-    std::scoped_lock lock(mutex_);
-    if (auto found = active_.find(key); found != active_.end()) {
-        std::promise<PipelineArtifact> promise; promise.set_value(found->second); return promise.get_future().share();
+    std::optional<PipelineArtifact> active;
+    std::shared_ptr<Flight> flight;
+    Submit submit;
+    uint64_t generation{};
+    {
+        std::scoped_lock lock(mutex_);
+        if (auto found = active_.find(key); found != active_.end()) {
+            active = found->second;
+        } else if (auto inFlight = inFlight_.find(key); inFlight != inFlight_.end()) {
+            flight = inFlight->second;
+        } else {
+            generation = nextGeneration_++;
+            idsByKey_[key] = recipe.id;
+            flight = std::make_shared<Flight>();
+            inFlight_.emplace(key, flight);
+            submit = submit_;
+        }
     }
-    if (auto found = inFlight_.find(key); found != inFlight_.end()) return found->second;
-    const uint64_t generation = nextGeneration_++;
-	idsByKey_[key] = recipe.id;
-    auto future = std::async(std::launch::async, [key, generation, recipe = std::move(recipe)]() mutable {
+    if (active) {
+        auto future = Flight::Ready(std::move(*active));
+        if (onComplete) onComplete(future.get());
+        return future;
+    }
+    // The owner (generation != 0) attaches before submitting, so its callback is queued; a joiner may find the build
+    // already done and is then invoked here, on its own thread.
+    flight->Attach(std::move(onComplete));
+    auto future = flight->Future();
+    if (!generation) return future;
+    // The task holds the flight, not the service: a build may outlive the service.
+    ServiceTask task = [flight, key, generation, recipe = std::move(recipe)]() mutable {
         PipelineArtifact result{ key, generation };
         try { if (!recipe.build) throw std::runtime_error("pipeline recipe has no factory"); result.payload = recipe.build();
             if (!result.payload) result.error = "pipeline factory returned no payload";
         } catch (const std::exception& e) { result.error = e.what(); } catch (...) { result.error = "pipeline factory failed"; }
-        return result;
-    }).share();
-    inFlight_.emplace(key, future);
+        recipe = {}; // release the factory's captures before the requesters are woken
+        flight->Complete(std::move(result));
+    };
+    if (!detail::LaunchServiceTask(submit, std::move(task)))
+        flight->Complete(PipelineArtifact{ key, generation, nullptr, "the pipeline submitter refused the request" });
     return future;
 }
+
+void PipelineService::Configure(Submit submit) { std::scoped_lock lock(mutex_); submit_ = std::move(submit); }
 
 void PipelineService::PublishReady(uint64_t retirementFenceValue) {
     std::scoped_lock lock(mutex_);
     for (auto it = inFlight_.begin(); it != inFlight_.end();) {
-        if (it->second.wait_for(std::chrono::seconds(0)) != std::future_status::ready) { ++it; continue; }
-        auto artifact = it->second.get();
+        const auto& future = it->second->Future();
+        if (future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) { ++it; continue; }
+        auto artifact = future.get();
         if (artifact) {
 			const auto id = idsByKey_[it->first];
 			if (auto priorKey = activeKeyById_.find(id); priorKey != activeKeyById_.end() && priorKey->second != it->first) {

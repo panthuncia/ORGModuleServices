@@ -3,11 +3,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <future>
 #include <memory>
 #include <span>
 #include <string>
 #include <vector>
+
+#include <ORGModuleServices/ServiceExecutor.h>
 
 namespace org::services {
 
@@ -49,6 +52,11 @@ struct ShaderArtifact {
 
 class ShaderCompiler {
 public:
+    using Submit = ServiceSubmit;
+    // Receives the artifact of a CompileAsync call. A failure is an artifact without a binary whose diagnostics say why
+    // (an exception thrown by the compile is also delivered this way, while the future rethrows it).
+    using CompletionCallback = std::function<void(const ShaderArtifact&)>;
+
     // compilerDirectory: load dxcompiler.dll and dxil.dll from there. Otherwise the loader's search
     // order applies, then the directory of the module this library is linked into. In-process
     // hosts (game plugins) should pass it: another dxcompiler.dll, possibly without SPIR-V support,
@@ -66,12 +74,26 @@ public:
     // re-read only when its size or write time changed since the compiler last hashed it.
     uint64_t FingerprintInputs(std::span<const std::byte> source, const std::vector<std::filesystem::path>& dependencyFiles) const noexcept;
     std::shared_future<ShaderArtifact> CompileAsync(ShaderCompileRequest request);
+    // As above, and invokes onComplete exactly once with the artifact, after it is available through the returned
+    // future, never while the compiler holds a lock of its own (it may call back into the compiler):
+    // - a memory-cache hit: at once, on the calling thread, and no work is submitted;
+    // - joining a request already in flight for the same key: on the thread that completes that request, or at once on
+    //   the calling thread when it has already completed;
+    // - otherwise: on the thread that runs the compile (the submitter's, see Configure); a refused submission
+    //   completes at once on the calling thread with an error artifact.
+    std::shared_future<ShaderArtifact> CompileAsync(ShaderCompileRequest request, CompletionCallback onComplete);
+    // Synchronous: blocks on CompileAsync. Never call it from a thread the configured submitter needs in order to run
+    // the compile (for example the thread that drains a manual queue).
     ShaderArtifact Compile(ShaderCompileRequest request);
+    // Installs the executor every compile is submitted to; empty restores the default (one new thread per compile).
+    // Setup: call before the compiler is shared with other threads. Requests submitted earlier keep their executor.
+    // Queued compiles keep the compiler's internals alive, so destroying the ShaderCompiler before they run is safe.
+    void Configure(Submit submit);
     void ClearMemoryCache();
 
 private:
     class Impl;
-    std::unique_ptr<Impl> impl_;
+    std::shared_ptr<Impl> impl_; // shared with the compiles in flight
 };
 
 }
