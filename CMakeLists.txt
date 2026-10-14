@@ -17,7 +17,9 @@ if(ORG_MODULE_SERVICES_ENABLE_ASYNC_STATE_GRAPH)
 endif()
 
 add_library(ORGModuleServices STATIC
+    src/GrowableBufferSet.cpp
     src/PipelineService.cpp
+    src/TransportBuffer.cpp
     src/VersionedBufferGrowth.cpp)
 add_library(ORGModuleServices::ORGModuleServices ALIAS ORGModuleServices)
 target_compile_features(ORGModuleServices PUBLIC cxx_std_20)
@@ -49,6 +51,7 @@ if(ORG_MODULE_SERVICES_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests/Async)
     add_subdirectory(tests/Services)
+    add_subdirectory(tests/Growth)
     add_executable(ORGModuleServicesTests tests/ServicesTests.cpp)
     target_link_libraries(ORGModuleServicesTests PRIVATE ORGModuleServices::ORGModuleServices)
     add_test(NAME ORGModuleServicesTests COMMAND ORGModuleServicesTests)

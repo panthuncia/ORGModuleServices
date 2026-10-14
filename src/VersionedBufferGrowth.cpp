@@ -1,10 +1,27 @@
 #include <ORGModuleServices/VersionedBufferGrowth.h>
 
 #include <algorithm>
+#include <array>
 #include <stdexcept>
 #include <string>
 
 namespace org::services {
+
+namespace {
+
+// What a zero fill copies from: one static page, as many segments as the version needs.
+constexpr std::size_t kZeroPageBytes = 64 * 1024;
+const std::array<std::byte, kZeroPageBytes> kZeroPage{};
+
+} // namespace
+
+VersionFill ZeroFill(std::uint64_t bytes) {
+    VersionFill fill;
+    fill.segments.reserve(static_cast<std::size_t>((bytes + kZeroPageBytes - 1) / kZeroPageBytes));
+    for (std::uint64_t at = 0; at < bytes; at += kZeroPageBytes)
+        fill.segments.push_back({kZeroPage.data(), static_cast<std::size_t>(std::min<std::uint64_t>(kZeroPageBytes, bytes - at))});
+    return fill;
+}
 
 std::shared_ptr<const async::GpuSubmissionSet> TokenForTickets(std::vector<std::shared_ptr<TrackedUploadTicket>> tickets) {
     std::erase(tickets, nullptr);

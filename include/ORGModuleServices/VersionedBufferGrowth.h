@@ -25,6 +25,9 @@ struct VersionFill {
     std::vector<StreamingUploadSegment> segments;  // gathered in order; their memory is the request's `contents`
 };
 
+/** @brief Zeros for `bytes` from offset 0, from one static page (no allocation per fill): a zero-filled version's contents. */
+VersionFill ZeroFill(std::uint64_t bytes);
+
 struct VersionGrowthRequest {
     std::shared_ptr<VersionedBuffer> buffer;
     // The new size: structured elements, else raw bytes.
