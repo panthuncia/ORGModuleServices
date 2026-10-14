@@ -63,6 +63,11 @@ std::size_t NamedVersions::AdoptAll() const {
     return adopted;
 }
 
+void NamedVersions::Bind(std::uint64_t safeAt) const noexcept {
+    for (const auto& entry : m_entries)
+        if (entry.lease) entry.lease.Bind(safeAt);
+}
+
 // ---- Build ----
 
 void GrowableBufferSet::Build::Require(GrowableHandle handle, std::uint64_t units) {
@@ -109,6 +114,7 @@ struct GrowableBufferSet::Registered {
     std::shared_ptr<const GrowableRegistration> buffer;  // one of the two
     std::shared_ptr<const LatchRegistration> latch;
     std::weak_ptr<VersionedBuffer> versioned;
+    std::uint64_t key = 0;  // its backings' compatibility (process-unique)
     Registered* next = nullptr;
 };
 
@@ -117,6 +123,7 @@ struct GrowableBufferSet::Batch {
     enum : std::uint8_t { kPending, kReady, kFailed };
     std::vector<std::uint32_t> slots;                                 // by request
     std::vector<std::shared_ptr<const BufferVersion>> versions;       // by request
+    std::vector<BackingLease> leases;                                 // by request: each version's backing
     std::vector<std::optional<std::uint64_t>> stamps;                 // by request: Capture's (the producer of the growth writes them)
     std::string error;
     std::atomic<std::uint8_t> state = kPending;
@@ -141,9 +148,13 @@ GrowableHandle GrowableBufferSet::Register(GrowableRegistration registration) {
     if (!registration.extent.unitBytes) throw std::invalid_argument("GrowableBufferSet: " + registration.name + " has no unit size");
     if (registration.contents == GrowableContents::Capture && !registration.capture)
         throw std::invalid_argument("GrowableBufferSet: " + registration.name + " captures without a capture");
+    // Every version the set makes is pooled: no fresh buffers.
+    if (!registration.pool) registration.pool = m_hooks.pool;
+    if (!registration.pool) throw std::invalid_argument("GrowableBufferSet: " + registration.name + " has no pool (neither its own nor the set's)");
     auto* node = new Registered();
     node->index = m_nextHandle.fetch_add(1, std::memory_order_relaxed);
     node->versioned = registration.buffer;
+    node->key = NextSerial();
     registration.buffer.reset();  // the set holds it weakly
     node->buffer = std::make_shared<const GrowableRegistration>(std::move(registration));
     const GrowableHandle handle{node->index};
@@ -169,7 +180,8 @@ LatchHandle GrowableBufferSet::Register(LatchRegistration registration) {
     return handle;
 }
 
-NamedEntry GrowableBufferSet::EntryOf(const Slot& slot, std::shared_ptr<const BufferVersion> version, std::optional<std::uint64_t> stamp) const {
+NamedEntry GrowableBufferSet::EntryOf(const Slot& slot, std::shared_ptr<const BufferVersion> version, std::optional<std::uint64_t> stamp,
+    BackingLease lease) const {
     NamedEntry entry;
     if (!version || !version->buffer) return entry;
     const auto& registration = *slot.registration;
@@ -180,6 +192,7 @@ NamedEntry GrowableBufferSet::EntryOf(const Slot& slot, std::shared_ptr<const Bu
     entry.srvIndex = buffer.HasSRV() ? buffer.GetSRVInfo(0).slot.index : 0;
     entry.deviceAddress = registration.address && m_hooks.addressOf ? m_hooks.addressOf(buffer) : 0;
     entry.contentsStamp = stamp;
+    entry.lease = std::move(lease);
     entry.version = std::move(version);
     return entry;
 }
@@ -192,9 +205,10 @@ void GrowableBufferSet::TakeRegistered() {
             auto& slot = m_slots[taken->index];
             slot.registration = std::move(taken->buffer);
             slot.buffer = std::move(taken->versioned);
+            slot.key = taken->key;
             slot.made = false;
             if (const auto buffer = slot.buffer.lock()) {
-                slot.current = EntryOf(slot, buffer->Current(), std::nullopt);
+                slot.current = EntryOf(slot, buffer->Current(), std::nullopt, {});  // the owner's first version: not pooled
                 const std::pair<const void*, std::uint32_t> handle{buffer->Key(), taken->index};
                 m_handles.insert(std::lower_bound(m_handles.begin(), m_handles.end(), handle), handle);
             }
@@ -215,7 +229,7 @@ void GrowableBufferSet::Settle() {
         auto& slot = m_slots[m_batch->slots[i]];
         slot.asked = 0;
         if (state == Batch::kReady && slot.registration) {
-            slot.current = EntryOf(slot, m_batch->versions[i], m_batch->stamps[i]);
+            slot.current = EntryOf(slot, m_batch->versions[i], m_batch->stamps[i], m_batch->leases[i]);
             slot.made = true;
             ++m_stats.grown;
             m_changed = true;
@@ -261,6 +275,14 @@ bool GrowableBufferSet::Post(std::vector<std::uint32_t> unmet, const std::vector
         } else {
             request.bytes = registration.extent.BytesFor(units);
         }
+        // Pooled: a backing of the policy's class (the grown units' elements, or bytes), reused only by this registration's
+        // versions (its key: a backing is made like its buffer).
+        request.pool = registration.pool;
+        request.capacityClass = registration.extent.CapacityClassFor(units);
+        request.stride = registration.extent.structuredStride;
+        request.flags.deviceAddress = registration.address;
+        request.compatibility = slot.key;
+        request.name = registration.name;
         const std::size_t at = batch->slots.size();
         switch (registration.contents) {
         case GrowableContents::Fresh:
@@ -289,14 +311,15 @@ bool GrowableBufferSet::Post(std::vector<std::uint32_t> unmet, const std::vector
     batch->stamps.resize(batch->slots.size());
     async::VersionGrowthWork work;
     work.produce = [requests = std::move(requests)] {
-        auto grown = GrowVersions(requests);
-        return async::VersionGrowthWork::Produced{std::make_shared<const std::vector<std::shared_ptr<const BufferVersion>>>(std::move(grown.versions)),
-            std::move(grown.ready)};
+        auto grown = std::make_shared<GrownVersions>(GrowVersions(requests));
+        auto ready = grown->ready;
+        return async::VersionGrowthWork::Produced{std::shared_ptr<const void>(std::move(grown)), std::move(ready)};
     };
     work.done = [batch, wake = m_hooks.wake](std::shared_ptr<const void> value, std::string error) {
-        const auto* versions = static_cast<const std::vector<std::shared_ptr<const BufferVersion>>*>(value.get());
-        if (versions && versions->size() == batch->slots.size()) {
-            batch->versions = *versions;
+        const auto* grown = static_cast<const GrownVersions*>(value.get());
+        if (grown && grown->versions.size() == batch->slots.size() && grown->leases.size() == batch->slots.size()) {
+            batch->versions = grown->versions;
+            batch->leases = grown->leases;
             batch->state.store(Batch::kReady, std::memory_order_release);
         } else {
             batch->error = error.empty() ? std::string("a growth made the wrong versions") : std::move(error);

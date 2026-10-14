@@ -39,6 +39,10 @@ struct GrowableRegistration {
     GrowableContents contents = GrowableContents::Fresh;
     GrowableCapture capture;  // Capture's
     bool address = false;     // its entries carry the version's device address (the hooks' addressOf)
+    // The pool its versions are made into: a backing of the policy's class (BufferExtent::CapacityClassFor), made like its buffer
+    // (BackingRequest::like) and reused only by this registration's versions. Null: the set's (GrowableBufferSetHooks::pool);
+    // Register throws when both are (no fresh buffers). One acquirer at a time: a pool serves one set (its batches run in turn).
+    std::shared_ptr<BackingPool> pool;
 };
 
 /**
@@ -83,6 +87,17 @@ public:
     [[nodiscard]] std::shared_ptr<LatchBlock> Latch(LatchHandle handle) const noexcept;
     /** @brief Owner thread: makes every named version current (VersionedBuffer::Adopt). Returns how many were not already. */
     std::size_t AdoptAll() const;
+    /**
+     * @brief Any thread: binds every named pooled version's backing (BackingLease::Bind, max-merged): not reused before the
+     * pools' clock reaches `safeAt`, even once the last reference to its version is gone.
+     *
+     * The frame's contract: a frame that adopts or reads the set binds it after its last submission, with the point that retires
+     * once that submission is complete on the GPU (CS: DCLF::SubmittedRetirementPoint()), while it still holds the set. Binding at
+     * the frame's start would let a backing go back to the pool while that frame's GPU work still reads it. A set no frame bound
+     * holds versions no GPU work read: their backings are reusable as soon as their last reference goes. The growth's own fills
+     * need no bind: a version is named only once its copies completed.
+     */
+    void Bind(std::uint64_t safeAt) const noexcept;
     /** @brief Diagnostics: Find calls for a buffer this set does not name (a recording resolved an unnamed buffer). */
     [[nodiscard]] std::uint64_t Misses() const noexcept { return m_misses.load(std::memory_order_relaxed); }
 
@@ -109,6 +124,8 @@ struct GrowableBufferSetHooks {
     std::function<std::uint64_t(const Buffer&)> addressOf;
     // Producer thread, optional: a posted batch grows a buffer from `fromUnits` (its newest ready version's) to `toUnits` (`bytes`).
     std::function<void(const GrowableRegistration&, std::uint64_t fromUnits, std::uint64_t toUnits, std::uint64_t bytes)> grown;
+    // The set's pool, for every registration without its own (GrowableRegistration::pool); the set's acquirer (one batch at a time).
+    std::shared_ptr<BackingPool> pool;
 };
 
 /**
@@ -120,7 +137,9 @@ struct GrowableBufferSetHooks {
  *   every requirement, and returns the very same set (shared_ptr, serial and fragment) when nothing changed, so what was recorded
  *   against it stays reused. Otherwise it posts one batch for every unmet buffer (GrowVersions as graph work) and is pending until
  *   the batch settles (the hooks' wake). A requirement a set cannot meet is never sealed: no caps, no fallback.
- * - The frame adopts what it selects (NamedVersions::AdoptAll). Nothing flows from the frame to the producer.
+ * - Versions are pooled (GrowableRegistration::pool): each owns a lease of its backing, returned when the version is released.
+ * - The frame adopts what it selects (NamedVersions::AdoptAll) and binds it after its last submission (NamedVersions::Bind), so
+ *   no backing it read is reused before it retires. Nothing else flows from the frame to the producer.
  */
 class GrowableBufferSet {
 public:
@@ -193,6 +212,7 @@ private:
     struct Slot {
         std::shared_ptr<const GrowableRegistration> registration;  // weak buffer kept apart: the registration's is reset
         std::weak_ptr<VersionedBuffer> buffer;
+        std::uint64_t key = 0;    // its backings' compatibility (BackingRequest::compatibility)
         NamedEntry current;   // the newest ready version
         std::uint64_t asked = 0;  // units of the growth in flight
         bool made = false;        // `current` is the set's (a Zero registration's first version is not)
@@ -205,7 +225,7 @@ private:
 
     void TakeRegistered();
     void Settle();
-    NamedEntry EntryOf(const Slot& slot, std::shared_ptr<const BufferVersion> version, std::optional<std::uint64_t> stamp) const;
+    NamedEntry EntryOf(const Slot& slot, std::shared_ptr<const BufferVersion> version, std::optional<std::uint64_t> stamp, BackingLease lease) const;
     bool Post(std::vector<std::uint32_t> unmet, const std::vector<GrowableRequirement>& required);
 
     GrowableBufferSetHooks m_hooks;

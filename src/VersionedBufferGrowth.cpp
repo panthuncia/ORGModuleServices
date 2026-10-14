@@ -1,7 +1,8 @@
 #include <ORGModuleServices/VersionedBufferGrowth.h>
 
+#include <ORGModuleServices/GrowableBufferTypes.h>
+
 #include <algorithm>
-#include <array>
 #include <stdexcept>
 #include <string>
 
@@ -9,111 +10,58 @@ namespace org::services {
 
 namespace {
 
-// What a zero fill copies from: one static page, as many segments as the version needs.
-constexpr std::size_t kZeroPageBytes = 64 * 1024;
-const std::array<std::byte, kZeroPageBytes> kZeroPage{};
-
-} // namespace
-
-VersionFill ZeroFill(std::uint64_t bytes) {
-    VersionFill fill;
-    fill.segments.reserve(static_cast<std::size_t>((bytes + kZeroPageBytes - 1) / kZeroPageBytes));
-    for (std::uint64_t at = 0; at < bytes; at += kZeroPageBytes)
-        fill.segments.push_back({kZeroPage.data(), static_cast<std::size_t>(std::min<std::uint64_t>(kZeroPageBytes, bytes - at))});
-    return fill;
-}
-
-std::shared_ptr<const async::GpuSubmissionSet> TokenForTickets(std::vector<std::shared_ptr<TrackedUploadTicket>> tickets) {
-    std::erase(tickets, nullptr);
-    if (tickets.empty()) return {};
-    auto token = std::make_shared<async::GpuSubmissionSet>();
-    auto shared = std::make_shared<const std::vector<std::shared_ptr<TrackedUploadTicket>>>(std::move(tickets));
-    token->submissions.reserve(shared->size());
-    for (const auto& ticket : *shared) {
-        async::GpuQueueSubmission submission;
-        {
-            std::lock_guard lock(ticket->timelineMutex);
-            submission.timelineOwner = ticket->timelineOwner;
-            submission.value = ticket->timelineValue;
-        }
-        submission.currentTimelineOwner = [ticket] {
-            std::lock_guard lock(ticket->timelineMutex);
-            return ticket->timelineOwner;
-        };
-        submission.currentValue = [ticket] {
-            std::lock_guard lock(ticket->timelineMutex);
-            return ticket->timelineValue;
-        };
-        token->submissions.push_back(std::move(submission));
-    }
-    token->isComplete = [shared] {
-        return std::ranges::all_of(*shared, [](const auto& ticket) { return ticket->Complete(); });
-    };
-    token->isSubmitted = [shared] {
-        return std::ranges::all_of(*shared, [](const auto& ticket) {
-            const auto state = ticket->state.load(std::memory_order_acquire);
-            return state == TrackedUploadTicketState::Submitted || state == TrackedUploadTicketState::Completed;
-        });
-    };
-    token->isFailed = [shared] {
-        return std::ranges::any_of(*shared, [](const auto& ticket) {
-            return ticket->state.load(std::memory_order_acquire) == TrackedUploadTicketState::Cancelled;
-        });
-    };
-    token->failure = [] { return std::string("a version's upload was cancelled"); };
-    token->subscribe = [shared](std::function<void()> callback) {
-        for (const auto& ticket : *shared) ticket->SetChangeCallback(callback);
-        if (callback) callback();
-    };
-    token->cancel = [shared] {
-        bool cancelled = false;
-        for (const auto& ticket : *shared) cancelled = ticket->Cancel() || cancelled;
-        return cancelled;
-    };
-    token->describe = [shared] { return "version-upload-tickets=" + std::to_string(shared->size()); };
-    // Every transition notifies (the uploader's submitter completes its batches by their timeline value: Claimed, Submitted,
-    // Completed; Cancel likewise), so a graph waiting on this needs no recovery polling.
-    token->completionNotificationsAreAuthoritative = true;
-    return token;
-}
-
-namespace {
-
-// Makes the request's version and queues its fills, adding their tickets.
-std::shared_ptr<const BufferVersion> MakeAndFill(const VersionGrowthRequest& request, std::vector<std::shared_ptr<TrackedUploadTicket>>& tickets) {
+// Leases the request's backing, makes it the buffer's next version (owning the lease) and queues its fills, adding their tickets.
+GrownVersion MakeAndFill(const VersionGrowthRequest& request, std::vector<std::shared_ptr<TrackedUploadTicket>>& tickets) {
     if (!request.buffer) throw std::invalid_argument("GrowVersion: no buffer");
-    auto version = request.elements ? request.buffer->MakeStructured(request.elements) : request.buffer->MakeBytes(request.bytes);
-    std::vector<VersionFill> made;
+    if (!request.pool) throw std::invalid_argument("GrowVersion: " + request.name + " has no pool");
+    BackingRequest backing;
+    backing.capacityClass = request.capacityClass ? request.capacityClass : request.elements ? request.elements : request.bytes;
+    backing.stride = request.stride;
+    backing.flags = request.flags;
+    backing.compatibility = request.compatibility;
+    backing.name = request.name;
+    backing.like = request.buffer->Get();
+    if (!backing.capacityClass) throw std::invalid_argument("GrowVersion: " + request.name + " asks for an empty version");
+    if (request.elements && !request.stride) throw std::invalid_argument("GrowVersion: " + request.name + " is structured without a stride");
+    GrownVersion out;
+    out.lease = request.pool->Acquire(backing);
+    // Exhausted (Config::maxPerClass): the batch fails and the next seal that needs it posts it again; no smaller version.
+    if (!out.lease || !out.lease->buffer) throw std::runtime_error("GrowVersion: no backing for " + request.name);
+    // The version is the backing (the pool keeps the buffer; a reused one holds an older version's bytes) and owns a lease of it.
+    auto made = request.buffer->Make(out.lease->buffer);
+    out.version = LeasedVersion(BufferVersion(*made), out.lease);
+    const auto& version = out.version;
+    std::vector<VersionFill> fills;
     std::shared_ptr<const void> madeContents;
-    const auto* fills = &request.fills;
+    const auto* queued = &request.fills;
     if (request.contentsOf) {
-        request.contentsOf(*version, made, madeContents);
-        fills = &made;
+        request.contentsOf(*version, fills, madeContents);
+        queued = &fills;
     }
-    if (fills->empty()) return version;
+    if (queued->empty()) return out;
     if (!request.uploads) throw std::invalid_argument("GrowVersion: contents without an upload service");
     const auto size = version->buffer->GetBufferSize();
-    for (const auto& fill : *fills) {
+    for (const auto& fill : *queued) {
         std::size_t bytes = 0;
         for (const auto& segment : fill.segments) bytes += segment.size;
         if (!bytes) continue;
         if (fill.offset + bytes > size) throw std::out_of_range("GrowVersion: a fill past the new version");
-        // The version is pending: no queue uses it before its owner adopts it, after these copies complete.
+        // The version is pending: no queue uses it before its owner adopts it, after these copies complete (a reused backing: no
+        // frame reads it any more, its clock reached the point they bound).
         auto ticket = request.uploads->QueueTrackedStreamingUploadSegments(fill.segments, bytes,
             WorkerOwnedDestination{ version->buffer, WorkerOwnedDestination::Ownership::PendingVersion }, fill.offset);
         if (!ticket) throw std::runtime_error("GrowVersion: the uploader refused a fill");
         // The uploader copies the segments into its staging pages as it queues them: `madeContents` may go after this.
         tickets.push_back(std::move(ticket));
     }
-    return version;
+    return out;
 }
 
 } // namespace
 
 GrownVersion GrowVersion(const VersionGrowthRequest& request) {
     std::vector<std::shared_ptr<TrackedUploadTicket>> tickets;
-    GrownVersion out;
-    out.version = MakeAndFill(request, tickets);
+    auto out = MakeAndFill(request, tickets);
     out.ready = TokenForTickets(std::move(tickets));
     return out;
 }
@@ -122,7 +70,12 @@ GrownVersions GrowVersions(std::span<const VersionGrowthRequest> requests) {
     std::vector<std::shared_ptr<TrackedUploadTicket>> tickets;
     GrownVersions out;
     out.versions.reserve(requests.size());
-    for (const auto& request : requests) out.versions.push_back(MakeAndFill(request, tickets));
+    out.leases.reserve(requests.size());
+    for (const auto& request : requests) {
+        auto grown = MakeAndFill(request, tickets);
+        out.versions.push_back(std::move(grown.version));
+        out.leases.push_back(std::move(grown.lease));
+    }
     out.ready = TokenForTickets(std::move(tickets));
     return out;
 }

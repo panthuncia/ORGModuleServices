@@ -1,19 +1,30 @@
+#include <ORGModuleServices/BackingPool.h>
 #include <ORGModuleServices/GrowableBufferTypes.h>
 #include <ORGModuleServices/GrowthPolicy.h>
+#include <ORGModuleServices/VersionFill.h>
 
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 
 namespace {
 
+using org::services::BackingAllocation;
+using org::services::BackingLease;
+using org::services::BackingPool;
+using org::services::BackingPoolHooks;
+using org::services::BackingRequest;
 using org::services::BufferExtent;
 using org::services::FilledContents;
 using org::services::FilledVersion;
 using org::services::GrowableRequirement;
 using org::services::GrowthPolicy;
+using org::services::LeasedVersion;
 using org::services::NamedEntry;
+using org::services::RetirementClock;
 
 template <class F>
 bool Throws(F&& f) {
@@ -137,6 +148,148 @@ void TestFilledContents() {
     assert(journal.Since(3, Position{0, 4})->at == 4);
 }
 
+void TestCapacityClass() {
+    // A structured buffer's class is its elements, a raw one's its bytes: the size a growth's version is made at.
+    constexpr BufferExtent rows{0, 48, 48};
+    static_assert(rows.CapacityClassFor(16) == 16);
+    constexpr BufferExtent words{8, 12, 4};
+    static_assert(words.CapacityClassFor(3) == 11);
+    constexpr BufferExtent raw{16, 4, 0};
+    static_assert(raw.CapacityClassFor(10) == 56);
+    // A policy's classes repeat: growths to needs within one class ask the same class, so a retired backing of it is reusable.
+    const auto policy = GrowthPolicy::Doubling(4);
+    assert(rows.CapacityClassFor(GrowableRequirement{10, 0}.GrowTo(policy, 0)) == rows.CapacityClassFor(GrowableRequirement{9, 0}.GrowTo(policy, 3)));
+}
+
+// A pool like the set's: no caps, its backings without an org::Buffer (each allocation a distinct address).
+struct GrowthPool {
+    std::shared_ptr<RetirementClock> clock = std::make_shared<RetirementClock>();
+    std::shared_ptr<int> allocations = std::make_shared<int>(0);
+    std::shared_ptr<BackingPool> pool;
+    GrowthPool() {
+        BackingPoolHooks hooks;
+        hooks.allocate = [allocations = allocations](const BackingRequest&) {
+            BackingAllocation allocation;
+            allocation.address = 0x10000ull * static_cast<std::uint64_t>(++*allocations);
+            return allocation;
+        };
+        pool = BackingPool::Create(std::move(hooks), clock, {.name = "growth", .maxPerClass = 0});
+    }
+    BackingLease Acquire(const BackingRequest& request, bool& allocated) {
+        BackingPool::AcquireInfo info;
+        auto lease = pool->Acquire(request, BackingPool::kAnyEpoch, &info);
+        assert(lease);
+        allocated = info.allocated;
+        return lease;
+    }
+};
+
+// What the set makes a version of stands in here: LeasedVersion's lifetime is the subject.
+struct Version {
+    std::uint64_t number = 0;
+};
+
+void TestGrowthFromPool() {
+    GrowthPool growth;
+    constexpr BufferExtent rows{0, 48, 48};
+    BackingRequest request;
+    request.capacityClass = rows.CapacityClassFor(GrowableRequirement{10, 0}.GrowTo(GrowthPolicy::Doubling(4), 0));
+    request.stride = rows.structuredStride;
+    request.compatibility = 7;  // the registration's key
+    request.name = "rows";
+    assert(request.capacityClass == 16);
+    bool allocated = false;
+    auto lease = growth.Acquire(request, allocated);
+    assert(allocated && lease->byteCapacity == 16 * 48 && lease->capacityClass == 16);
+    const std::uint64_t first = lease->generation;
+    const std::uint64_t firstAddress = lease->address;
+
+    // The version owns a lease; the set's entry holds a copy (NamedEntry::lease); the growth's own goes.
+    auto version = LeasedVersion(Version{1}, lease);
+    NamedEntry entry;
+    entry.serial = 11;
+    entry.lease = lease;
+    lease.Reset();
+    const auto backing = entry.lease.Get();  // observes; not a lease
+    assert(backing->leases.load() == 2 && version->number == 1);
+    // The frame that read the set binds it after its last submission (NamedVersions::Bind): point 3, max-merged.
+    entry.lease.Bind(3);
+    entry.lease.Bind(1);
+    assert(backing->safeAt.load() == 3);
+
+    // The set moves on (the entry goes) while a recording still holds the version: not reusable.
+    entry = {};
+    auto held = growth.Acquire(request, allocated);
+    assert(allocated && held->generation != first);
+    // The version's last reference goes: its backing returns, but the frame that read it has not retired.
+    version.reset();
+    assert(backing->leases.load() == 0);
+    auto early = growth.Acquire(request, allocated);
+    assert(allocated && early->generation != first);
+    growth.clock->Advance(2);
+    auto stillEarly = growth.Acquire(request, allocated);
+    assert(allocated && stillEarly->generation != first);
+    // Retired: the next growth of the class reuses it, at its address (holding its older version's contents).
+    growth.clock->Advance(3);
+    auto reused = growth.Acquire(request, allocated);
+    assert(!allocated && reused->generation == first && reused->address == firstAddress);
+    assert(*growth.allocations == 4);
+
+    // Another registration's key never takes it, even free and retired.
+    reused.Reset();
+    BackingRequest other = request;
+    other.compatibility = 8;
+    auto foreign = growth.Acquire(other, allocated);
+    assert(allocated && foreign->generation != first);
+    // The same registration grown to the next class: a new backing of that class.
+    BackingRequest grown = request;
+    grown.capacityClass = 32;
+    auto bigger = growth.Acquire(grown, allocated);
+    assert(allocated && bigger->capacityClass == 32 && bigger->byteCapacity == 32 * 48);
+}
+
+void TestFillsIntoReusedBacking() {
+    GrowthPool growth;
+    BackingRequest request;
+    request.capacityClass = 200000;  // raw bytes: not a whole number of zero pages
+    request.compatibility = 1;
+    bool allocated = false;
+    auto lease = growth.Acquire(request, allocated);
+    const std::uint64_t first = lease->generation;
+    NamedEntry old;
+    old.serial = 20;
+    old.lease = lease;
+    // A writer filled the old version (the contents rule), up to its stamp 40.
+    FilledVersion filled;
+    filled.Filled(old);
+    FilledContents<> contents;
+    contents.Filled(old, 40);
+    lease.Bind(1);
+    lease.Reset();
+    old = {};
+    growth.clock->Advance(1);
+    auto again = growth.Acquire(request, allocated);
+    assert(!allocated && again->generation == first);
+    NamedEntry next;
+    next.serial = 21;  // another version, the same backing
+    next.lease = again;
+    // Keyed on the version's serial, not the backing: the reused backing's older bytes are never taken as this version's.
+    assert(!filled.Holds(next) && filled.Holds(20));
+    assert(!contents.Since(next));  // Fresh: written whole
+    next.contentsStamp = 37;        // Capture: what it laid out, not what the backing held
+    assert(contents.Since(next) == 37u);
+    // Zero: asked for the whole backing (its buffer's size), so none of the older bytes survive.
+    const auto fill = org::services::ZeroFill(again->byteCapacity);
+    std::uint64_t covered = 0;
+    for (const auto& segment : fill.segments) {
+        assert(segment.data && segment.size);
+        for (std::size_t i = 0; i < segment.size; ++i) assert(static_cast<const std::byte*>(segment.data)[i] == std::byte{0});
+        covered += segment.size;
+    }
+    assert(fill.offset == 0 && covered == again->byteCapacity);
+    assert(org::services::ZeroFill(0).segments.empty());
+}
+
 } // namespace
 
 int main() {
@@ -146,4 +299,7 @@ int main() {
     TestRequirements();
     TestFilledVersion();
     TestFilledContents();
+    TestCapacityClass();
+    TestGrowthFromPool();
+    TestFillsIntoReusedBacking();
 }

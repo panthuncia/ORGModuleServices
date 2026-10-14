@@ -1,5 +1,6 @@
 #pragma once
 
+#include <ORGModuleServices/BackingPool.h>
 #include <ORGModuleServices/GrowthPolicy.h>
 
 #include <cstdint>
@@ -32,11 +33,31 @@ struct BufferExtent {
     [[nodiscard]] constexpr std::uint64_t ElementsFor(std::uint64_t units) const noexcept {
         return structuredStride ? (BytesFor(units) + structuredStride - 1) / structuredStride : 0;
     }
+    /** @brief The pool class a version for `units` is made at (BackingRequest::capacityClass): its elements, or its bytes when raw. */
+    [[nodiscard]] constexpr std::uint64_t CapacityClassFor(std::uint64_t units) const noexcept {
+        return structuredStride ? ElementsFor(units) : BytesFor(units);
+    }
 };
 
 /**
+ * @brief `value` (a version) owning `lease`: the lease lives exactly as long as the last reference to the returned pointer (an
+ * aliasing shared_ptr over one allocation holding both), so the backing returns to its pool when the version is released, and
+ * not before. Any thread.
+ */
+template <class T>
+[[nodiscard]] std::shared_ptr<const T> LeasedVersion(T value, BackingLease lease) {
+    struct Held {
+        T value;
+        BackingLease lease;
+    };
+    auto held = std::make_shared<const Held>(Held{std::move(value), std::move(lease)});
+    return std::shared_ptr<const T>(held, &held->value);
+}
+
+/**
  * @brief What a new version holds when it turns ready.
- * - Fresh: nothing (its writers write it whole: the contents rule, FilledVersion).
+ * - Fresh: undefined (a pooled backing may hold an older version's contents): its writers write it whole (the contents rule,
+ *   FilledVersion, keyed on the version's serial, never on the backing).
  * - Zero: zeros, filled through the uploader.
  * - Capture: what the registration's capture lays out from immutable state, with that state's contents stamp.
  */
@@ -73,11 +94,16 @@ struct NamedEntry {
     std::uint64_t deviceAddress = 0;  // registrations with `address`, else 0
     std::uint32_t srvIndex = 0;       // 0: the buffer has no SRV
     std::optional<std::uint64_t> contentsStamp;  // a captured version's: the state it was laid out from
+    // The pooled backing the version was made into (empty: the buffer's own first version, not pooled). The version owns its own
+    // lease; this copy lets the frame bind it (NamedVersions::Bind) so it is not reused while frames that read it are in flight.
+    BackingLease lease;
 };
 
 /**
  * @brief A writer's record of the version it wrote into (the contents rule): before it writes, a named version it did not fill is
- * written whole, then recorded; one it filled takes only what changed. No adoption callback resets anything.
+ * written whole, then recorded; one it filled takes only what changed. No adoption callback resets anything. Keyed on the
+ * version's serial, not its backing: a version made into a reused backing (which still holds an older version's bytes) is another
+ * serial, so it is written whole.
  */
 struct FilledVersion {
     std::uint64_t serial = 0;  // 0: none filled
