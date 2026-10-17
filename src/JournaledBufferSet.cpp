@@ -36,6 +36,28 @@ void JournaledSink::Write(std::span<const StreamingUploadSegment> segments, std:
     ++m_runs;
 }
 
+void JournaledSink::Write(std::span<const StreamingUploadRange> ranges) {
+    const auto& target = *m_target;
+    std::size_t totalBytes = 0, runs = 0;
+    for (const auto& range : ranges) {
+        if (range.size == 0) continue;
+        if (range.dstOffset > target.byteCapacity || range.size > target.byteCapacity - range.dstOffset)
+            throw std::out_of_range("JournaledSink: a write past its backing (" + std::to_string(range.dstOffset) + "+" + std::to_string(range.size) +
+                " of " + std::to_string(target.byteCapacity) + " bytes)");
+        totalBytes += range.size;
+        ++runs;
+    }
+    if (totalBytes == 0) return;
+    if (!target.buffer) throw std::logic_error("JournaledSink: the backing has no buffer");
+    if (target.retired.load(std::memory_order_acquire)) throw std::logic_error("JournaledSink: the backing was retired before its write");
+    auto ticket = m_uploads->QueueTrackedStreamingUploadRanges(ranges, WorkerOwnedDestination{target.buffer, WorkerOwnedDestination::Ownership::PooledBackingLease});
+    if (!ticket || ticket->state.load(std::memory_order_acquire) == TrackedUploadTicketState::Cancelled)
+        throw std::runtime_error("JournaledSink: the uploader refused a write");
+    m_tickets->push_back(std::move(ticket));
+    m_bytes += totalBytes;
+    m_runs += runs;
+}
+
 JournaledBufferSet::JournaledBufferSet(
     std::vector<JournaledPartConfig> parts, BackingPoolHooks hooks, std::shared_ptr<RetirementClock> clock, BackingPool::Config config) {
     m_parts.reserve(parts.size());

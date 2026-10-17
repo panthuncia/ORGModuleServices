@@ -15,6 +15,7 @@
 
 namespace org {
 struct StreamingUploadSegment;
+struct StreamingUploadRange;
 struct TrackedUploadTicket;
 namespace runtime {
 class IUploadService;
@@ -55,6 +56,12 @@ public:
     void Write(const void* data, std::size_t bytes, std::uint64_t offset);
     /** @brief A gathered run (segments in order, `totalBytes` together) at byte `offset`. */
     void Write(std::span<const StreamingUploadSegment> segments, std::size_t totalBytes, std::uint64_t offset);
+    /**
+     * @brief Many runs at once (each `size` bytes from `data` at byte `dstOffset`), one batched upload
+     * (IUploadService::QueueTrackedStreamingUploadRanges: one ticket, the staging page mapped once). Each counts as a run. The data
+     * must live until the call returns (the uploader stages it before).
+     */
+    void Write(std::span<const StreamingUploadRange> ranges);
     [[nodiscard]] std::uint64_t Bytes() const noexcept { return m_bytes; }
     [[nodiscard]] std::uint64_t Runs() const noexcept { return m_runs; }
 
