@@ -575,6 +575,77 @@ void TestJournaledBufferSet() {
     Check(threw);
 }
 
+// JournaledPartRequest::appendInto: writes past the head's sealed mark land in it (published versions keep their bytes), one below
+// it is refused, and units past its capacity lease another as without it.
+void TestJournaledAppend() {
+    auto clock = std::make_shared<RetirementClock>();
+    auto uploads = std::make_shared<RecordingUploads>();
+    BackingPoolHooks hooks;
+    auto next = std::make_shared<std::uint64_t>(0);
+    hooks.allocate = [next](const BackingRequest&) {
+        const auto index = ++*next;
+        auto storage = std::shared_ptr<void>(::operator new(sizeof(org::Buffer)), [](void* block) { ::operator delete(block); });
+        BackingAllocation allocation;
+        allocation.buffer = std::shared_ptr<org::Buffer>(storage, static_cast<org::Buffer*>(storage.get()));
+        allocation.address = 0x100000ull * index;
+        allocation.srvIndex = static_cast<std::uint32_t>(index);
+        return allocation;
+    };
+    JournaledBufferSet set({{"rows", sizeof(SelfRow), {.deviceAddress = true}, GrowthPolicy::Doubling(16)}}, hooks, clock,
+        {.name = "", .maxPerClass = 0, .framesInFlight = 3, .spareFree = 4});
+
+    RowModel model;
+    for (std::uint32_t row = 0; row < 8; ++row) model.Set(row, 100 + row);
+    const auto publish = [&](const BackingLease& into) {
+        std::vector<JournaledPartRequest> requests{model.Request()};
+        requests[0].appendInto = into;
+        return set.Publish(requests, *uploads);
+    };
+
+    // 1: a lease, written whole; its units seal the backing.
+    auto first = std::make_unique<JournaledPublication>(publish({}));
+    const auto& head = first->parts[0];
+    Check(head.lease && head.allocated && !head.appended && head.capacityUnits == 16 && head.firstByte == 0);
+    Check(head.lease->sealedBytes.load() == 8 * sizeof(SelfRow));
+    const auto* headBacking = head.lease.Get().get();
+
+    // 2: rows 8..11 added: an append into the head, the rows past the mark only; the first publication names it still.
+    for (std::uint32_t row = 8; row < 12; ++row) model.Set(row, 100 + row);
+    const auto uploadsBefore = uploads->uploads.size();
+    auto second = std::make_unique<JournaledPublication>(publish(head.lease));
+    const auto& appended = second->parts[0];
+    Check(appended.appended && !appended.allocated && appended.lease.Get().get() == headBacking && appended.address == head.address);
+    Check(appended.sealedFrom == 8 * sizeof(SelfRow) && appended.firstByte == 8 * sizeof(SelfRow) && appended.runs == 4);
+    Check(appended.caughtUpFrom == head.contentEpoch && appended.contentEpoch == model.version && appended.units == 12);
+    Check(headBacking->sealedBytes.load() == 12 * sizeof(SelfRow) && headBacking->leases.load() == 2);
+    for (std::size_t u = uploadsBefore; u < uploads->uploads.size(); ++u) Check(uploads->uploads[u].offset >= 8 * sizeof(SelfRow));
+    CheckRows(*uploads, appended, model);
+
+    // 3: row 3 changes: below the mark, so the append is refused (nothing sent) and the publication throws; the head keeps its bytes.
+    model.Set(3, 333);
+    const auto uploadsRefused = uploads->uploads.size();
+    bool threw = false;
+    try {
+        (void)publish(appended.lease);
+    } catch (const std::logic_error&) {
+        threw = true;
+    }
+    Check(threw && uploads->uploads.size() == uploadsRefused && headBacking->leases.load() == 2);
+    SelfRow row3;
+    std::memcpy(&row3, uploads->memory.at(KeyOf(appended.lease->buffer)).data() + 3 * sizeof(SelfRow), sizeof(row3));
+    Check(row3.value == 103);
+    Check(headBacking->contentEpoch.load() == 0);  // the throw: it holds nothing a catch-up may build on
+
+    // 4: rows up to 20: past the head's 16, so another backing is leased and written whole.
+    for (std::uint32_t row = 12; row < 20; ++row) model.Set(row, 100 + row);
+    auto grown = publish(appended.lease);
+    const auto& fresh = grown.parts[0];
+    Check(!fresh.appended && fresh.lease.Get().get() != headBacking && fresh.capacityUnits == 32 && fresh.caughtUpFrom == 0 && fresh.runs == 20);
+    Check(fresh.sealedFrom == 0 && fresh.lease->sealedBytes.load() == 20 * sizeof(SelfRow));
+    CheckRows(*uploads, fresh, model);
+    Check(headBacking->sealedBytes.load() == 12 * sizeof(SelfRow));  // the head's mark only moves with what names it
+}
+
 // VersionedBufferFamily over the default graph binding, with a recording request service.
 struct RecordingRequests {
     using Types = org::async::DefaultStateGraphTypes;
@@ -650,6 +721,7 @@ int main() {
     TestCatchUpIntoReusedOlderBacking();
     TestExhaustionSuspends();
     TestJournaledBufferSet();
+    TestJournaledAppend();
     TestFamily();
     std::puts("ORGBufferBuildTests: all passed");
     return 0;

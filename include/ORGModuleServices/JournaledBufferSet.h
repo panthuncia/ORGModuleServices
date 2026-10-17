@@ -46,8 +46,10 @@ struct JournaledTarget {
 /**
  * @brief Where a part's emit sends its runs: each Write queues one upload into the target backing on the dedicated uploader (a
  * WorkerOwnedDestination of ownership PooledBackingLease: no queue reads a leased backing until the frame that binds it). The
- * uploader copies the data into its staging pages when the write is queued, so the caller's memory may go after the call.
- * Throws when the uploader refuses a write or it lies past the backing.
+ * uploader copies the data into its staging pages when the write is queued, so the caller's memory may go after the call. An
+ * append (JournaledPartRequest::appendInto) writes a backing published versions name: only at or past its sealed mark, which no
+ * reader reads.
+ * Throws when the uploader refuses a write, it lies past the backing, or (an append) it begins below the sealed mark.
  */
 class JournaledSink {
 public:
@@ -64,15 +66,21 @@ public:
     void Write(std::span<const StreamingUploadRange> ranges);
     [[nodiscard]] std::uint64_t Bytes() const noexcept { return m_bytes; }
     [[nodiscard]] std::uint64_t Runs() const noexcept { return m_runs; }
+    /** @brief The lowest byte written (~0: none). */
+    [[nodiscard]] std::uint64_t FirstByte() const noexcept { return m_firstByte; }
 
 private:
     friend class JournaledBufferSet;
-    JournaledSink(runtime::IUploadService& uploads, const Backing& target, std::vector<std::shared_ptr<TrackedUploadTicket>>& tickets) noexcept
-        : m_uploads(&uploads), m_target(&target), m_tickets(&tickets) {}
+    JournaledSink(runtime::IUploadService& uploads, const Backing& target, std::vector<std::shared_ptr<TrackedUploadTicket>>& tickets,
+        std::uint64_t floor = 0) noexcept
+        : m_uploads(&uploads), m_target(&target), m_tickets(&tickets), m_floor(floor) {}
+    void CheckRange(std::uint64_t offset, std::uint64_t bytes) const;
     runtime::IUploadService* m_uploads;
     const Backing* m_target;
     std::vector<std::shared_ptr<TrackedUploadTicket>>* m_tickets;
+    std::uint64_t m_floor = 0;  // an append's sealed mark: no write begins below it (0: a fresh fill, written anywhere)
     std::uint64_t m_bytes = 0, m_runs = 0;
+    std::uint64_t m_firstByte = ~std::uint64_t{0};
 };
 
 /** @brief What one publication asks of one part. */
@@ -87,6 +95,13 @@ struct JournaledPartRequest {
      * contentEpoch; 0 when what it wrote is not a journal position, so the next publication writes it whole). Throws on failure.
      */
     std::function<std::uint64_t(const JournaledTarget& target, JournaledSink& sink)> emit;
+    /**
+     * @brief Optional: a backing of this part's pool that published versions name (the part's head), to append into instead of
+     * leasing one. The emit is sent its contentEpoch, and every write must begin at or past its sealed mark (Backing::sealedBytes;
+     * the sink refuses one below, and the publication throws). The caller decides that the runs since its contentEpoch all lie
+     * there. Ignored (a lease as without it) when `units` outgrow its capacity.
+     */
+    BackingLease appendInto;
 };
 
 /** @brief One part of a publication: the leased backing and what was sent into it. */
@@ -100,6 +115,9 @@ struct JournaledPartVersion {
     std::uint64_t contentEpoch = 0;   // after (the emit's)
     std::uint64_t bytes = 0, runs = 0;
     bool allocated = false;
+    bool appended = false;              // written into the request's appendInto (published versions name it below sealedFrom)
+    std::uint64_t sealedFrom = 0;       // an append's sealed mark before it (bytes; 0 for a lease)
+    std::uint64_t firstByte = ~std::uint64_t{0};  // the lowest byte written (~0: none)
 };
 
 /** @brief A publication: every part's version, ready once all their uploads completed. Immutable once returned. */
@@ -120,7 +138,8 @@ struct JournaledPublication {
  * pool; a publication leases one backing per present part (preferring the one nearest the journal), lets the part's emit send what
  * changed since that backing's contentEpoch, sets the new contentEpoch, and returns the leases with a readiness token over the
  * uploads. Nothing waits on the GPU: a backing is reused only once its leases are gone and its clock reached what the frames that
- * used it bound.
+ * used it bound. A part may instead append into a backing published versions name (JournaledPartRequest::appendInto): only past
+ * its sealed mark, the most any of them names, so none sees a byte change.
  *
  * Single publisher: Publish, Discard and OldestContentEpoch run on one thread (the pools' single acquirer). The publication's
  * leases are released from any thread.

@@ -393,6 +393,7 @@ BackingLease BackingPool::Acquire(const BackingRequest& request, std::uint64_t p
             if (!chosen) {
                 if (detail::TryClaim(*backing)) {
                     backing->retired.store(false, std::memory_order_seq_cst);  // reused: back in circulation
+                    backing->sealedBytes.store(0, std::memory_order_relaxed);  // a fresh fill: no version names it
                     chosen = backing;
                 }
                 continue;

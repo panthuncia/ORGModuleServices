@@ -150,6 +150,10 @@ struct Backing {
 
     // The journal position its contents hold (0: nothing; written whole). Set by the lease holder after it queued the catch-up.
     std::atomic<std::uint64_t> contentEpoch{0};
+    // The sealed mark: the most bytes any published version names of it (monotonic while leased; 0 when the pool reuses it). A
+    // reader of a published version reads only below its own units, so writes at or past the mark (JournaledPartRequest::
+    // appendInto) reach nothing a frame may read. The lease holder's, like contentEpoch.
+    std::atomic<std::uint64_t> sealedBytes{0};
     // BasicRenderer: the image its contents are (journal catch-up needs the same byte size). The lease holder's.
     std::shared_ptr<const BufferImage> image;
     // Reusable once the clock reached it (max of every Bind).

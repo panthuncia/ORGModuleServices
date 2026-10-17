@@ -133,7 +133,18 @@ void TestAcquireReuseRules() {
     // Both free and reusable now; equal contentEpoch (0): either may come back, but nothing new is made.
     auto again = h.pool->Acquire(Request(4), BackingPool::kAnyEpoch, &info);
     Check(!info.allocated);
+    // A reused backing is a fresh fill: no published version names it, so its sealed mark is gone.
+    again->sealedBytes.store(48);
+    auto* sealed = again.Get().get();
     again.Reset();
+    {
+        // The two free backings come back (either order), nothing new made.
+        auto a = h.pool->Acquire(Request(4), BackingPool::kAnyEpoch, &info);
+        Check(!info.allocated);
+        auto b = h.pool->Acquire(Request(4), BackingPool::kAnyEpoch, &info);
+        Check(!info.allocated && (a.Get().get() == sealed || b.Get().get() == sealed));
+        Check((a.Get().get() == sealed ? a : b)->sealedBytes.load() == 0);
+    }
 
     // A readback pin and a binding consumer each keep a free backing from reuse.
     Harness pins({.name = "pins", .maxPerClass = 0, .framesInFlight = 3, .spareFree = 4});
