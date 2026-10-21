@@ -82,20 +82,24 @@ void PipelineService::PublishReady(uint64_t retirementFenceValue) {
         const auto& future = it->second->Future();
         if (future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) { ++it; continue; }
         auto artifact = future.get();
-        if (artifact) {
-			const auto id = idsByKey_[it->first];
-			if (auto priorKey = activeKeyById_.find(id); priorKey != activeKeyById_.end() && priorKey->second != it->first) {
+        const auto id = idsByKey_.find(it->first);
+        if (artifact && id != idsByKey_.end()) {
+			// The id's previous pipeline (another key: its shaders or state changed) is displaced, and retires.
+			if (auto priorKey = activeKeyById_.find(id->second); priorKey != activeKeyById_.end() && priorKey->second != it->first) {
 				if (auto prior = active_.find(priorKey->second); prior != active_.end()) {
 					if (prior->second.payload) retired_.push_back({ retirementFenceValue, std::move(prior->second.payload) });
 					active_.erase(prior);
 				}
+				idsByKey_.erase(priorKey->second);
 			}
             if (auto old = active_.find(it->first); old != active_.end() && old->second.payload)
                 retired_.push_back({ retirementFenceValue, std::move(old->second.payload) });
-            active_[it->first] = artifact;
-			activeKeyById_[id] = it->first;
-        }
-        ready_[it->first] = std::move(artifact);
+            active_[it->first] = std::move(artifact);
+			activeKeyById_[id->second] = it->first;
+        } else if (id != idsByKey_.end() && !active_.contains(it->first)) {
+			// A failure is not kept: a later request of the key builds again.
+			idsByKey_.erase(id);
+		}
         it = inFlight_.erase(it);
     }
 }

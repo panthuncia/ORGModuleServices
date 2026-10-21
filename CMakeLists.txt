@@ -23,6 +23,7 @@ add_library(ORGModuleServices STATIC
     src/BufferJournal.cpp
     src/GrowableBufferSet.cpp
     src/JournaledBufferSet.cpp
+    src/PipelineRegistry.cpp
     src/PipelineService.cpp
     src/VersionedBufferBuild.cpp
     src/VersionedBufferGrowth.cpp)

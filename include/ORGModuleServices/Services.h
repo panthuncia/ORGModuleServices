@@ -1,5 +1,6 @@
 #pragma once
 #include <ORGModuleServices/CompileFlightRegistry.h>
+#include <ORGModuleServices/PipelineRegistry.h>
 #include <ORGModuleServices/PipelineService.h>
 #if defined(ORG_MODULE_SERVICES_HAS_DXC)
 #include <ORGModuleServices/ShaderCompiler.h>
