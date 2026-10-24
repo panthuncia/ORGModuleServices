@@ -13,6 +13,7 @@
 #else
 #include <dlfcn.h>
 #include <dxcapi.h>
+#include <unistd.h>
 #endif
 
 #include <fstream>
@@ -110,7 +111,8 @@ struct CacheHeader { uint32_t magic{ 0x5347524f }; uint16_t version{ 1 }; uint8_
 
 class ShaderCompiler::Impl {
 public:
-    Impl(std::filesystem::path cacheDirectory, const std::filesystem::path& compilerDirectory) : cacheDirectory_(std::move(cacheDirectory)) {
+    Impl(std::filesystem::path cacheDirectory, const std::filesystem::path& compilerDirectory, RenameFile rename) :
+        cacheDirectory_(std::move(cacheDirectory)), rename_(std::move(rename)) {
         if (!compilerDirectory.empty()) {
             // The validator first: dxcompiler resolves it by basename.
             validatorModule_ = OpenLibrary(compilerDirectory / kValidatorLibrary);
@@ -225,20 +227,31 @@ public:
     }
     void Store(const ShaderArtifact& artifact) const {
         if (cacheDirectory_.empty() || !artifact) return;
-        // A temporary of its own: two compiles of one key (different requesters) must not write or rename one file.
+        // A temporary of its own: two compiles of one key (different requesters) must not write or rename one file, nor a later process
+        // reuse one a killed process left (the counter restarts; under usvfs the rename onto a left temporary's name faulted).
         static std::atomic<uint64_t> stores{ 0 };
+#if defined(_WIN32)
+        const auto process = static_cast<unsigned long>(GetCurrentProcessId());
+#else
+        const auto process = static_cast<unsigned long>(getpid());
+#endif
         const auto destination = CachePath(artifact.key); auto temporary = destination;
-        temporary += "." + std::to_string(stores.fetch_add(1, std::memory_order_relaxed)) + ".tmp";
+        temporary += "." + std::to_string(process) + "-" + std::to_string(stores.fetch_add(1, std::memory_order_relaxed)) + ".tmp";
         std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
         CacheHeader header{}; header.format = static_cast<uint8_t>(artifact.format); header.key = artifact.key; header.size = artifact.binary.size();
         stream.write(reinterpret_cast<const char*>(&header), sizeof(header));
         stream.write(reinterpret_cast<const char*>(artifact.binary.data()), static_cast<std::streamsize>(artifact.binary.size())); stream.close();
         // The publication, one at a time: a file system hook in the path (Mod Organizer's usvfs, which redirects Data/) is not safe
-        // under concurrent renames and faulted in MoveFileExW during a full recompile. A rename is rare and short.
-        static std::mutex publication;
-        std::scoped_lock lock(publication);
-        std::error_code ec; std::filesystem::rename(temporary, destination, ec);
-        if (ec) { std::filesystem::remove(destination, ec); ec.clear(); std::filesystem::rename(temporary, destination, ec); }
+        // under concurrent renames and faulted in MoveFileExW during a full recompile. The host's rename when it has one (its own
+        // renames are serialized with these), else among the compiler's. A rename is rare and short.
+        const auto rename = [&](std::error_code& a_ec) {
+            if (rename_) { rename_(temporary, destination, a_ec); return; }
+            static std::mutex publication;
+            std::scoped_lock lock(publication);
+            std::filesystem::rename(temporary, destination, a_ec);
+        };
+        std::error_code ec; rename(ec);
+        if (ec) { std::filesystem::remove(destination, ec); ec.clear(); rename(ec); }
         if (ec) std::filesystem::remove(temporary, ec);
     }
 
@@ -303,6 +316,7 @@ public:
     }
 
     std::filesystem::path cacheDirectory_;
+    RenameFile rename_;
     ModuleHandle module_{};
 	ModuleHandle validatorModule_{};
     ComPtr<IDxcUtils> utils_;
@@ -342,7 +356,8 @@ public:
 	mutable std::unordered_map<std::filesystem::path::string_type, DependencyEntry> dependencies_;
 };
 
-ShaderCompiler::ShaderCompiler(std::filesystem::path path, std::filesystem::path compilerDirectory) : impl_(std::make_shared<Impl>(std::move(path), compilerDirectory)) {}
+ShaderCompiler::ShaderCompiler(std::filesystem::path path, std::filesystem::path compilerDirectory, RenameFile rename) :
+    impl_(std::make_shared<Impl>(std::move(path), compilerDirectory, std::move(rename))) {}
 ShaderCompiler::~ShaderCompiler() = default;
 ShaderCompiler::ShaderCompiler(ShaderCompiler&&) noexcept = default;
 ShaderCompiler& ShaderCompiler::operator=(ShaderCompiler&&) noexcept = default;

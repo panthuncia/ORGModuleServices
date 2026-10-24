@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <system_error>
 #include <future>
 #include <memory>
 #include <span>
@@ -61,7 +62,12 @@ public:
     // order applies, then the directory of the module this library is linked into. In-process
     // hosts (game plugins) should pass it: another dxcompiler.dll, possibly without SPIR-V support,
     // may already be loaded by basename.
-    explicit ShaderCompiler(std::filesystem::path cacheDirectory = {}, std::filesystem::path compilerDirectory = {});
+    // Renames a written cache file onto its key's (replacing it). A host whose other code renames files too passes its own, so
+    // that a file system hook unsafe under concurrent renames (Mod Organizer's usvfs) sees one at a time across the process.
+    // Without one, the compiler's renames are serialized among themselves.
+    using RenameFile = std::function<void(const std::filesystem::path& from, const std::filesystem::path& to, std::error_code& ec)>;
+
+    explicit ShaderCompiler(std::filesystem::path cacheDirectory = {}, std::filesystem::path compilerDirectory = {}, RenameFile rename = {});
     ~ShaderCompiler();
     ShaderCompiler(ShaderCompiler&&) noexcept;
     ShaderCompiler& operator=(ShaderCompiler&&) noexcept;
