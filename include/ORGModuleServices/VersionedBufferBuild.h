@@ -3,11 +3,13 @@
 #include <ORGModuleServices/Async/ArtifactResources.h>
 #include <ORGModuleServices/BackingPool.h>
 #include <ORGModuleServices/BufferImage.h>
+#include <ORGModuleServices/GrowthPolicy.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -32,6 +34,12 @@ struct BufferWrite {
     std::uint64_t sequence = 0;
     std::uint64_t byteOffset = 0;
     std::uint64_t byteSize = 0;
+};
+
+/** @brief A byte range of a versioned buffer. */
+struct BufferByteRange {
+    std::uint64_t offset = 0;
+    std::uint64_t size = 0;
 };
 
 struct PublishedBufferVersion;
@@ -63,6 +71,26 @@ struct VersionedBufferBuildInput {
     std::uint64_t journalBaseSequence = 0;
     // Optional complete initial image. Successors normally use previous + writes.
     std::vector<std::byte> bytes;
+
+    // Predecessor copy (default off: the inputs above, BasicRenderer's). The version is `previous`'s contents plus this input's own
+    // writes: the build GPU-copies from previous's backing what the leased backing lacks of it - changedSince(its contentEpoch), or
+    // previous's used bytes whole when the backing is fresh, of another class, or changedSince returns nullopt - less the delta's
+    // ranges, then uploads only the delta (emitDelta). Without `previous` the delta is the whole version, uploaded alone. Needs an
+    // upload service that copies (IUploadService::QueueTrackedStreamingCopyRanges; null there: the build fails). The version's
+    // image is left null.
+    bool predecessorCopy = false;
+    // The byte ranges written after journal position `from` through previous->writeSequence (any order, may overlap). nullopt: the
+    // journal does not reach back to `from`, and previous is copied whole.
+    std::function<std::optional<std::vector<BufferByteRange>>(std::uint64_t from)> changedSince;
+    // This version's own writes since previous->writeSequence (everything without `previous`), each `bytes` from `data` at byte
+    // `offset`. The data stays valid until BuildVersionedBuffer returns.
+    std::function<void(const std::function<void(const void* data, std::size_t bytes, std::uint64_t offset)>& write)> emitDelta;
+    // Held by the version until its uploads and copies complete (the host's source of the delta's data, or anything else).
+    std::shared_ptr<const void> keep;
+    // predecessorCopy: a grown class (Replace) is growth->Next(previous's class, capacity) instead of the power of two at least 1.5x
+    // the predecessor's: a large buffer that changes every frame keeps a backing per frame in flight, so its headroom is paid that
+    // many times. nullopt: the power of two.
+    std::optional<GrowthPolicy> growth;
 };
 
 /**
@@ -86,6 +114,10 @@ struct PublishedBufferVersion {
     // The host's state seeded before visibility (BasicRenderer: org::experimental::PreparedBackingState, set by its decorate
     // hook). It owns no consumer pin, so journal retention cannot keep a backing from reuse.
     std::shared_ptr<const void> hostState;
+    // Input::predecessorCopy's build (diagnostics): the delta's bytes uploaded from the CPU, the bytes GPU-copied from the predecessor,
+    // and whether that copy was previous's used bytes whole (a fresh, grown or stale backing).
+    std::uint64_t uploadedBytes = 0, copiedBytes = 0;
+    bool copiedWhole = false;
 
     [[nodiscard]] std::shared_ptr<const std::vector<std::byte>> MaterializeCpuImage() const { return image ? image->Materialize() : nullptr; }
 };

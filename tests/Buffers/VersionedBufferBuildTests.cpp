@@ -16,9 +16,11 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <optional>
 #include <source_location>
 #include <span>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 using namespace org::services;
@@ -64,6 +66,45 @@ public:
         std::size_t total = 0;
         for (const auto& upload : uploads) total += upload.size;
         return total;
+    }
+
+    // GPU copies between the recorded images, applied in queue order (as the worker path orders them after earlier uploads).
+    struct Copy {
+        const org::Resource* source = nullptr;
+        const org::Resource* destination = nullptr;
+        std::size_t srcOffset = 0, dstOffset = 0, size = 0;
+    };
+    std::vector<Copy> copies;
+    std::size_t copyCalls = 0;
+    bool cannotCopy = false;
+
+    std::shared_ptr<org::TrackedUploadTicket> QueueTrackedStreamingCopyRanges(std::shared_ptr<org::Resource> source,
+        std::span<const org::StreamingCopyRange> ranges, org::WorkerOwnedDestination destination) override {
+        if (cannotCopy) return {};
+        Check(destination.ownership == org::WorkerOwnedDestination::Ownership::PooledBackingLease && destination.resource && source);
+        Check(source.get() != destination.resource.get());
+        ++copyCalls;
+        const auto& from = memory.at(source.get());
+        auto& to = memory[destination.resource.get()];
+        for (const auto& range : ranges) {
+            Check(range.size != 0u && from.size() >= range.srcOffset + range.size);
+            if (to.size() < range.dstOffset + range.size) to.resize(range.dstOffset + range.size);
+            std::memcpy(to.data() + range.dstOffset, from.data() + range.srcOffset, range.size);
+            copies.push_back({source.get(), destination.resource.get(), range.srcOffset, range.dstOffset, range.size});
+        }
+        auto ticket = std::make_shared<org::TrackedUploadTicket>();
+        ticket->state.store(org::TrackedUploadTicketState::Completed);
+        return ticket;
+    }
+    std::size_t CopiedBytes() const {
+        std::size_t total = 0;
+        for (const auto& copy : copies) total += copy.size;
+        return total;
+    }
+    void Clear() {
+        uploads.clear();
+        copies.clear();
+        copyCalls = 0;
     }
 
     void Initialize() override {}
@@ -394,6 +435,165 @@ void TestCatchUpIntoReusedOlderBacking() {
     Check(unpooled.CaptureDesired().journalBaseSequence == 2 && unpooled.CaptureDesired().writes.empty());
 }
 
+// Input::predecessorCopy: the leased backing GPU-copies what it lacks of the predecessor (changedSince its contentEpoch, or the
+// predecessor whole), less the delta, which is uploaded once.
+void TestPredecessorCopy() {
+    auto clock = std::make_shared<RetirementClock>();
+    auto pool = MakePool(clock);
+    auto uploads = std::make_shared<RecordingUploads>();
+    constexpr std::uint32_t kRows = 64;
+    constexpr std::uint32_t kRow = sizeof(std::uint32_t);
+
+    // The host: its rows, a log of (sequence, row) writes, and the rows written since the last version (the next delta).
+    std::vector<std::uint32_t> rows;
+    std::vector<std::pair<std::uint64_t, std::size_t>> log;
+    std::vector<std::size_t> pending;
+    std::uint64_t next = 1;
+    std::uint64_t capacity = kRows;
+    bool journalReaches = true;
+    const auto set = [&](std::size_t row, std::uint32_t value) {
+        if (row >= rows.size()) rows.resize(row + 1);
+        rows[row] = value;
+        log.emplace_back(next, row);
+        pending.push_back(row);
+    };
+    const auto build = [&](std::shared_ptr<const PublishedBufferVersion> previous, std::shared_ptr<const void> keep = {}) {
+        VersionedBufferBuildInput input;
+        input.uploadOwner = uploads;
+        input.uploadService = uploads.get();
+        input.debugName = "copy";
+        input.writeSequence = next;
+        input.elementStride = kRow;
+        input.elementCount = rows.size();
+        input.capacity = capacity;
+        input.backingPool = pool;
+        input.predecessorCopy = true;
+        const std::uint64_t through = previous ? previous->writeSequence : 0u;
+        input.previous = std::move(previous);
+        input.changedSince = [&, through](std::uint64_t from) -> std::optional<std::vector<BufferByteRange>> {
+            if (!journalReaches) return std::nullopt;
+            std::vector<BufferByteRange> ranges;
+            for (const auto& [sequence, row] : log)
+                if (sequence > from && sequence <= through) ranges.push_back({row * kRow, kRow});
+            return ranges;
+        };
+        input.emitDelta = [&](const auto& write) {
+            for (const auto row : pending) write(&rows[row], kRow, row * kRow);
+        };
+        input.keep = std::move(keep);
+        uploads->Clear();
+        auto outcome = BuildVersionedBuffer(input, Context(next));
+        if (outcome.kind == VersionedBufferBuildOutcome::Kind::Ready) {
+            ++next;
+            pending.clear();
+        }
+        return outcome;
+    };
+    const auto take = [](VersionedBufferBuildOutcome& outcome) {
+        Check(outcome.kind == VersionedBufferBuildOutcome::Kind::Ready && outcome.version);
+        return std::shared_ptr<const PublishedBufferVersion>(std::move(outcome.version));
+    };
+    const auto contents = [&] { return std::as_bytes(std::span(rows)); };
+
+    // v1, no predecessor: the delta is the whole version, uploaded alone; no image is kept.
+    for (std::uint32_t row = 0; row < kRows; ++row) set(row, row);
+    auto outcome = build(nullptr);
+    auto v1 = take(outcome);
+    Check(uploads->copyCalls == 0 && uploads->UploadedBytes() == kRows * kRow && !v1->image && !v1->lease->image);
+    Check(v1->writeSequence == 1 && v1->lease->contentEpoch.load() == 1);
+    CheckContents(*uploads, v1->lease, contents());
+    const auto* backingA = v1->lease.Get().get();
+
+    // v2 while v1 holds A: a fresh backing B, so v1 is copied whole less the delta (row 5), which is uploaded once.
+    set(5, 500);
+    outcome = build(v1);
+    auto v2 = take(outcome);
+    const auto* backingB = v2->lease.Get().get();
+    Check(backingB != backingA && v2->revisionMode == BufferRevisionMode::Patch && v2->lease->contentEpoch.load() == 2);
+    Check(uploads->copyCalls == 1 && uploads->copies.size() == 2 && uploads->CopiedBytes() == (kRows - 1) * kRow);
+    Check(uploads->copies[0].source == KeyOf(v1->resource) && uploads->copies[0].dstOffset == 0 && uploads->copies[0].size == 5 * kRow);
+    Check(uploads->uploads.size() == 1 && uploads->uploads[0].offset == 5 * kRow && uploads->UploadedBytes() == kRow);
+    CheckContents(*uploads, v2->lease, contents());
+
+    // v3 while v1 and v2 hold theirs: another fresh backing C, v2 whole less rows 9..11.
+    set(9, 900);
+    set(10, 1000);
+    set(11, 1100);
+    outcome = build(v2);
+    auto v3 = take(outcome);
+    Check(v3->lease.Get().get() != backingA && v3->lease.Get().get() != backingB);
+    Check(uploads->CopiedBytes() == (kRows - 3) * kRow && uploads->UploadedBytes() == 3 * kRow);
+    CheckContents(*uploads, v3->lease, contents());
+
+    // v4: v1 goes, so A (epoch 1, two versions behind v3) is reused. It copies only changedSince(1) - row 5 and rows 9..11 - less
+    // the delta (row 10, and row 20 written twice), and the delta is uploaded once.
+    v1.reset();
+    set(10, 1001);
+    set(20, 2000);
+    set(20, 2001);
+    outcome = build(v3);
+    auto v4 = take(outcome);
+    Check(v4->lease.Get().get() == backingA && v4->lease->contentEpoch.load() == 4);
+    Check(uploads->copyCalls == 1 && uploads->copies.size() == 3 && uploads->CopiedBytes() == 3 * kRow);
+    Check(uploads->copies[0].dstOffset == 5 * kRow && uploads->copies[1].dstOffset == 9 * kRow && uploads->copies[2].dstOffset == 11 * kRow);
+    Check(uploads->copies[0].source == KeyOf(v3->resource) && uploads->copies[0].srcOffset == 5 * kRow);
+    Check(uploads->uploads.size() == 2 && uploads->UploadedBytes() == 2 * kRow);
+    CheckContents(*uploads, v4->lease, contents());
+
+    // v5: v2 goes and B (epoch 2) is reused, but the journal no longer reaches back (changedSince is nullopt): v4 whole less row 30.
+    v2.reset();
+    journalReaches = false;
+    set(30, 3000);
+    outcome = build(v4);
+    auto v5 = take(outcome);
+    Check(v5->lease.Get().get() == backingB && v5->lease->contentEpoch.load() == 5);
+    Check(uploads->CopiedBytes() == (kRows - 1) * kRow && uploads->UploadedBytes() == kRow);
+    CheckContents(*uploads, v5->lease, contents());
+    journalReaches = true;
+
+    // v6, growth to 80 rows: a Replace into a bigger class copies v5's used bytes whole, less the delta (row 0 and the 16 new rows).
+    capacity = 128;
+    set(0, 7);
+    for (std::uint32_t row = kRows; row < kRows + 16; ++row) set(row, 10000 + row);
+    outcome = build(v5);
+    auto v6 = take(outcome);
+    Check(v6->revisionMode == BufferRevisionMode::Replace && v6->capacity == 128 && v6->elementCount == kRows + 16);
+    Check(uploads->copies.size() == 1 && uploads->copies[0].dstOffset == kRow && uploads->CopiedBytes() == (kRows - 1) * kRow);
+    Check(uploads->UploadedBytes() == 17 * kRow);
+    CheckContents(*uploads, v6->lease, contents());
+
+    // The ready token holds the predecessor (the copy's source) and the input's keep until it goes.
+    auto keep = std::make_shared<int>(1);
+    const std::weak_ptr<int> kept = keep;
+    const std::weak_ptr<const PublishedBufferVersion> predecessor = v6;
+    set(1, 11);
+    outcome = build(v6, std::move(keep));
+    auto v7 = take(outcome);
+    v6.reset();
+    Check(outcome.ready && outcome.ready->Complete() && !kept.expired() && !predecessor.expired());
+    CheckContents(*uploads, v7->lease, contents());
+    outcome.ready.reset();
+    Check(kept.expired() && predecessor.expired());
+
+    // An upload service that cannot copy: v6's freed backing (epoch 6) would catch up with a copy, so the build fails, nothing is
+    // uploaded, and the backing holds nothing a successor may catch up from.
+    uploads->cannotCopy = true;
+    set(2, 22);
+    outcome = build(v7);
+    Check(outcome.kind == VersionedBufferBuildOutcome::Kind::Failed && !outcome.error.empty() && uploads->uploads.empty());
+    std::uint64_t holdingSix = 0;
+    pool->Visit([&](const Backing& backing) { holdingSix += backing.contentEpoch.load() == 6; });
+    Check(holdingSix == 0);
+    uploads->cannotCopy = false;
+
+    // Without a predecessor the delta must cover the version.
+    rows.assign(4, 1);
+    pending = {0};
+    capacity = 4;
+    outcome = build(nullptr);
+    Check(outcome.kind == VersionedBufferBuildOutcome::Kind::Failed && uploads->uploads.empty());
+}
+
 void TestExhaustionSuspends() {
     auto clock = std::make_shared<RetirementClock>();
     auto pool = MakePool(clock, 1);
@@ -700,6 +900,20 @@ void TestFamily() {
     family.Acknowledge(first);  // older: ignored
     Check(second->lease->safeAt.load() == 0);
 
+    // Config::supersededWindow overrides that window; 0 binds nothing (the frames hold what they read).
+    for (const std::uint32_t window : {0u, 5u}) {
+        auto windowed = config;
+        windowed.supersededWindow = window;
+        Family other(windowed);
+        auto older = BuildVersionedBuffer(*input, Context(firstRevision));
+        auto newer = BuildVersionedBuffer(*input, Context(firstRevision + 1));
+        Check(older.kind == VersionedBufferBuildOutcome::Kind::Ready && newer.kind == VersionedBufferBuildOutcome::Kind::Ready);
+        std::shared_ptr<const PublishedBufferVersion> superseded = std::move(older.version), current = std::move(newer.version);
+        other.Acknowledge(superseded);
+        other.Acknowledge(current);
+        Check(superseded->lease->safeAt.load() == (window == 0u ? 0u : 10u + window));
+    }
+
     // Journal captures: the input carries the capture; a successor's predecessor is the acknowledged version.
     BufferJournal journal(4);
     journal.Initialize(bytes, 3, 4);
@@ -719,6 +933,7 @@ int main() {
     TestReplay();
     TestBuildAndCatchUp();
     TestCatchUpIntoReusedOlderBacking();
+    TestPredecessorCopy();
     TestExhaustionSuspends();
     TestJournaledBufferSet();
     TestJournaledAppend();

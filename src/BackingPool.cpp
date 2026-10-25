@@ -420,7 +420,30 @@ BackingLease BackingPool::Acquire(const BackingRequest& request, std::uint64_t p
             const auto classCount = static_cast<std::uint64_t>(std::ranges::count_if(state.all, [&](const auto& backing) {
                 return State::KeyOf(*backing) == key && backing->capacityClass == request.capacityClass;
             }));
-            if (m_config.maxPerClass != 0 && classCount >= m_config.maxPerClass) {
+            // reuseBound: the class's free backing bound longest ago, still bound to a frame in flight; the caller's writes wait for it.
+            std::shared_ptr<Backing> bound;
+            if (m_config.maxPerClass != 0 && classCount >= m_config.maxPerClass && m_config.reuseBound) {
+                for (const auto& backing : state.free) {
+                    if (State::KeyOf(*backing) != key || backing->capacityClass != request.capacityClass ||
+                        backing->leases.load(std::memory_order_acquire) != 0 || backing->readbackPins.load(std::memory_order_acquire) != 0 ||
+                        backing->bindingConsumers.load(std::memory_order_acquire) != 0)
+                        continue;
+                    if (!bound || backing->safeAt.load(std::memory_order_acquire) < bound->safeAt.load(std::memory_order_acquire))
+                        bound = backing;
+                }
+                if (bound && !detail::TryClaim(*bound))
+                    bound.reset();
+            }
+            if (bound) {
+                local.writeAfter = bound->safeAt.load(std::memory_order_acquire);
+                bound->retired.store(false, std::memory_order_seq_cst);
+                bound->sealedBytes.store(0, std::memory_order_relaxed);
+                std::erase(state.free, bound);
+                home.free.fetch_sub(1, std::memory_order_relaxed);
+                home.reused.fetch_add(1, std::memory_order_relaxed);
+                home.Emit(BackingPoolEvent::Reused, 1);
+                lease = BackingLease(std::move(bound));
+            } else if (m_config.maxPerClass != 0 && classCount >= m_config.maxPerClass) {
                 home.exhausted.fetch_add(1, std::memory_order_relaxed);
                 home.Emit(BackingPoolEvent::Exhausted, 1);
                 ArmAvailability(request);

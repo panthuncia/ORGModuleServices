@@ -225,6 +225,10 @@ public:
         std::uint32_t maxPerClass = 0;    // backings of one class at most (0: none)
         std::uint32_t framesInFlight = 3; // the host's, for callers' safety windows (BasicRenderer: Bind(Completed() + 2·FIF + 1))
         std::uint32_t spareFree = 1;      // free backings of the asked class kept warm; free ones past it are released
+        // With maxPerClass reached and no backing reusable: Acquire takes the free one a frame in flight still binds (no lease, pin
+        // or consumer; the lowest safeAt) instead of returning none, and AcquireInfo::writeAfter names the clock point the caller's
+        // writes into it must wait for (on the GPU: a host's async uploads queue that wait). A fixed number of copies per class.
+        bool reuseBound = false;
     };
     /** @brief Acquire's preferEpoch default: any free backing. */
     static constexpr std::uint64_t kAnyEpoch = (std::numeric_limits<std::uint64_t>::max)();
@@ -238,12 +242,15 @@ public:
     struct AcquireInfo {
         bool allocated = false;     // a new backing (holds nothing: written whole)
         std::uint32_t released = 0; // free backings released by this call (other classes, spares)
+        // Config::reuseBound's: the clock point the backing is still bound to (its safeAt; writes into it wait for it); 0: reusable now.
+        std::uint64_t writeAfter = 0;
     };
     /**
      * @brief Acquirer: a lease on a backing for `request`. Among the reusable ones (no lease, no binding consumer, no readback pin,
      * the clock at safeAt, the same class/stride/flags/compatibility) it prefers the highest contentEpoch <= preferEpoch, which
-     * minimises the catch-up; else a new one. Releases free backings of other classes. Empty only when Config::maxPerClass is
-     * reached. Throws when an allocation fails.
+     * minimises the catch-up; else a new one. Releases free backings of other classes. At Config::maxPerClass, with
+     * Config::reuseBound the free backing bound longest ago (AcquireInfo::writeAfter), else empty; empty too when every one of the
+     * class is leased. Throws when an allocation fails.
      */
     [[nodiscard]] BackingLease Acquire(const BackingRequest& request, std::uint64_t preferEpoch = kAnyEpoch, AcquireInfo* info = nullptr);
     /**

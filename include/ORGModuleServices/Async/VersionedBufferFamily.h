@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -47,6 +48,9 @@ public:
         // The host's frames in flight (replaces BasicRenderer's hardcoded 3): Acknowledge binds the superseded version's backing
         // to Completed() + 2·framesInFlight + 1 of the pool's clock (BasicRenderer's safety window, D3).
         std::uint32_t framesInFlight = 3;
+        // Overrides that window (frames past Completed()): nullopt keeps 2·framesInFlight + 1; 0 binds nothing extra (the frames
+        // that read the superseded version hold it themselves).
+        std::optional<std::uint32_t> supersededWindow;
         std::shared_ptr<BackingPool> pool;  // required
     };
 
@@ -266,9 +270,12 @@ void VersionedBufferFamily<Binding>::Acknowledge(std::shared_ptr<const Published
     // The GPU's safety window starts when the old backing stops being the published one, not when it first became so: a table
     // may stay current for thousands of frames, and frames still in flight read the one it replaces.
     if (m_previous && m_previous->lease && m_previous->backingEpoch != version->backingEpoch) {
-        const auto& clock = m_config.pool->Clock();
-        const auto window = 2ull * (std::max)(m_config.framesInFlight, 1u) + 1ull;
-        m_previous->lease.Bind(clock->Completed() + window);
+        const auto window = m_config.supersededWindow ? std::uint64_t{*m_config.supersededWindow}
+                                                      : 2ull * (std::max)(m_config.framesInFlight, 1u) + 1ull;
+        if (window != 0u) {
+            const auto& clock = m_config.pool->Clock();
+            m_previous->lease.Bind(clock->Completed() + window);
+        }
     }
     m_previous = std::move(version);
 }
