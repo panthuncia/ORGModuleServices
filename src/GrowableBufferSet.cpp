@@ -255,16 +255,16 @@ GrowableBufferSet::Build GrowableBufferSet::Begin() {
     return Build(*this);
 }
 
-bool GrowableBufferSet::Post(std::vector<std::uint32_t> unmet, const std::vector<GrowableRequirement>& required) {
+bool GrowableBufferSet::Post(const std::vector<std::pair<std::uint32_t, std::uint64_t>>& asks) {
     auto batch = std::make_shared<Batch>();
     const auto uploader = m_hooks.uploads ? m_hooks.uploads() : nullptr;
     std::vector<VersionGrowthRequest> requests;
-    for (const std::uint32_t index : unmet) {
+    for (const auto& [index, units] : asks) {
         auto& slot = m_slots[index];
         auto buffer = slot.buffer.lock();
         if (!buffer) continue;
         const auto& registration = *slot.registration;
-        const std::uint64_t units = required[index].GrowTo(registration.policy, slot.current.units);
+        if (units < slot.current.units) ++m_stats.shrunk;
         if (m_hooks.grown) m_hooks.grown(registration, slot.current.units, units, registration.extent.BytesFor(units));
         auto& request = requests.emplace_back();
         request.buffer = std::move(buffer);
@@ -363,7 +363,13 @@ GrowableBufferSet::Sealed GrowableBufferSet::Seal(Build&& build) {
             return out;
         }
         out.error = std::exchange(m_failure, {});
-        if (!Post(std::move(unmet), build.m_required)) {
+        std::vector<std::pair<std::uint32_t, std::uint64_t>> asks;
+        asks.reserve(unmet.size());
+        for (const std::uint32_t index : unmet) {
+            m_slots[index].window.Reset();
+            asks.emplace_back(index, build.m_required[index].GrowTo(m_slots[index].registration->policy, m_slots[index].current.units));
+        }
+        if (!Post(asks)) {
             out.error = "the growth batch was refused";
             return out;
         }
@@ -371,6 +377,21 @@ GrowableBufferSet::Sealed GrowableBufferSet::Seal(Build&& build) {
             out.pending = true;
             return out;
         }
+    }
+    // Every requirement met: a buffer asked little enough of for its window gets a smaller version (GrowableRegistration::shrink), in
+    // a batch that does not hold this seal (the set keeps naming what it holds until the smaller version is ready; Settle). Only
+    // asked buffers are observed: one no build requires keeps its size. Nothing is observed while a batch is in flight.
+    if (!m_batch) {
+        const auto now = ShrinkWindow::Clock::now();
+        std::vector<std::pair<std::uint32_t, std::uint64_t>> shrinks;
+        for (std::uint32_t i = 0; i < build.m_required.size() && i < m_slots.size(); ++i) {
+            auto& slot = m_slots[i];
+            const std::uint64_t units = build.m_required[i].units;
+            if (!units || !slot.registration || !slot.current.version || !slot.registration->shrink.Shrinks()) continue;
+            if (const auto target = slot.window.Observe(slot.registration->shrink, slot.registration->policy, slot.current.units, units, now))
+                shrinks.emplace_back(i, *target);
+        }
+        if (!shrinks.empty() && !Post(shrinks)) m_failure = "the shrink batch was refused";
     }
     for (std::uint32_t i = 0; i < build.m_latches.size(); ++i) {
         const auto& ask = build.m_latches[i];
@@ -411,6 +432,14 @@ GrowableBufferSet::Sealed GrowableBufferSet::Seal(Build&& build) {
     m_changed = false;
     ++m_stats.sealed;
     return m_last;
+}
+
+bool GrowableBufferSet::ShrinkPending(ShrinkWindow::Clock::time_point now) const {
+    if (m_changed) return true;
+    if (m_batch) return m_batch->state.load(std::memory_order_acquire) != Batch::kPending;
+    for (const auto& slot : m_slots)
+        if (slot.registration && slot.window.Due(slot.registration->shrink, now)) return true;
+    return false;
 }
 
 GrowableBufferSet::Stats GrowableBufferSet::TakeStats() { return std::exchange(m_stats, {}); }

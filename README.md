@@ -98,6 +98,11 @@ state-graph work -> the next sealed set. A recording made against a sealed set b
   that frame's GPU work still reads it. The growth's own fills need no bind: a version is named only once its copies completed.
 - **Policies.** `GrowthPolicy.h`: `Doubling(min)` and `Headroom(pct, min)`; `Next` never clamps and throws past 64 bits or the
   capacity's type.
+- **Shrinking.** `ElasticCapacity.h`: `ShrinkPolicy` (`Never` by default; `WhenBelow(pct, settle, observations)`) and its
+  `ShrinkWindow`. A capacity asked at most `pct` of for at least `settle` and `observations` asks shrinks to the growth policy's fresh
+  size for the window's peak. `GrowableRegistration::shrink` (a smaller version in a batch that does not hold the seal) and
+  `VersionedBufferBuildInput::shrink` (a Replace into a smaller class; a predecessor copy reaches only the version's used bytes, and a
+  backing smaller than them fails the build) apply it; `FitCapacity`/`ElasticCapacity` apply it to a host's own capacities.
 
 The CPU tests (the policies, extents, requirements, the contents rule and growth's use of the pool) are in `tests/Growth`. They build
 `BackingPool` from source and need only OpenRenderGraph's header-only `StreamingUploadTypes.h` (`ORG_GROWTH_TESTS_ORG_INCLUDE`):

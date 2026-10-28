@@ -29,6 +29,36 @@ std::uint64_t ReplacementCapacity(const VersionedBufferBuildInput& input) {
     return (std::max)(rounded, grown);
 }
 
+// The mode and class a version is made at: previous's class while the capacity fits it (Patch), unless the shrink window says to give
+// memory back (a Replace at the fresh class for the window's peak); a grown class otherwise (Replace). `window` goes to the version.
+struct ClassChoice {
+    BufferRevisionMode mode = BufferRevisionMode::Replace;
+    std::uint64_t capacityClass = 0;
+    ShrinkWindow window;
+    bool shrunk = false;
+};
+ClassChoice ChooseClass(const VersionedBufferBuildInput& input) {
+    ClassChoice choice;
+    const auto& previous = input.previous;
+    const auto required = (std::max<std::uint64_t>)(input.capacity, 1u);
+    if (previous) choice.window = previous->shrinkWindow;
+    if (previous && previous->resource && input.capacity <= previous->capacity) {
+        // A fresh class for the peak: what this chain grows to from nothing (the plain path's power of two).
+        const GrowthPolicy fresh = input.predecessorCopy && input.growth ? *input.growth : GrowthPolicy::Doubling();
+        if (const auto target = choice.window.Observe(input.shrink, fresh, previous->capacity, required, ShrinkWindow::Clock::now())) {
+            choice.capacityClass = (std::max)(*target, required);
+            choice.shrunk = choice.capacityClass < previous->capacity;
+            if (choice.shrunk) return choice;
+        }
+        choice.mode = BufferRevisionMode::Patch;
+        choice.capacityClass = previous->capacity;
+        return choice;
+    }
+    choice.window.Reset();
+    choice.capacityClass = input.predecessorCopy && input.growth ? input.growth->Next(previous ? previous->capacity : 0, required) : ReplacementCapacity(input);
+    return choice;
+}
+
 VersionedBufferBuildOutcome Fail(std::string error) {
     VersionedBufferBuildOutcome outcome;
     outcome.kind = VersionedBufferBuildOutcome::Kind::Failed;
@@ -53,9 +83,9 @@ VersionedBufferBuildOutcome Build(const VersionedBufferBuildInput& input, const 
     if (!input.uploadService || input.elementStride == 0u) return Fail("versioned buffer input/upload service/stride missing");
     if (!input.backingPool) return Fail("versioned buffer input has no backing pool");
     if (stopped()) return Cancel();
-    const bool fitsBacking = input.previous && input.previous->resource && input.capacity <= input.previous->capacity;
-    const auto mode = fitsBacking ? BufferRevisionMode::Patch : BufferRevisionMode::Replace;
-    const auto capacityClass = mode == BufferRevisionMode::Replace ? ReplacementCapacity(input) : input.previous->capacity;
+    const auto choice = ChooseClass(input);
+    const auto mode = choice.mode;
+    const auto capacityClass = choice.capacityClass;
     auto& pool = *input.backingPool;
 
     BackingRequest request;
@@ -76,6 +106,7 @@ VersionedBufferBuildOutcome Build(const VersionedBufferBuildInput& input, const 
         return outcome;
     }
     auto& backing = *lease;
+    if (input.elementCount * input.elementStride > backing.byteCapacity) return Fail("versioned buffer backing smaller than the version's elements");
 
     // The journal is replayed only once a backing is in hand: exhaustion is an expected transient state, and replaying on every
     // retry multiplied host work while waiting for retirement.
@@ -166,6 +197,8 @@ VersionedBufferBuildOutcome Build(const VersionedBufferBuildInput& input, const 
     version->contentEpoch = input.writeSequence;
     version->backingEpoch = backing.generation;
     version->resource = resource;
+    version->shrinkWindow = choice.window;
+    version->shrunk = choice.shrunk;
     version->image = input.gpuWritten ? nullptr : std::move(image);
     version->tag = input.tag;
     version->lease = std::move(lease);
@@ -242,11 +275,9 @@ VersionedBufferBuildOutcome BuildFromPredecessor(const VersionedBufferBuildInput
         return Fail("versioned buffer predecessor copy needs a predecessor with a buffer and the same stride");
     if (stopped()) return Cancel();
     const auto usedBytes = input.elementCount * input.elementStride;
-    const bool fitsBacking = previous && input.capacity <= previous->capacity;
-    const auto mode = fitsBacking ? BufferRevisionMode::Patch : BufferRevisionMode::Replace;
-    const auto capacityClass = mode == BufferRevisionMode::Patch ? previous->capacity
-        : input.growth ? input.growth->Next(previous ? previous->capacity : 0, (std::max<std::uint64_t>)(input.capacity, 1u))
-                       : ReplacementCapacity(input);
+    const auto choice = ChooseClass(input);
+    const auto mode = choice.mode;
+    const auto capacityClass = choice.capacityClass;
     auto& pool = *input.backingPool;
 
     BackingRequest request;
@@ -271,6 +302,9 @@ VersionedBufferBuildOutcome BuildFromPredecessor(const VersionedBufferBuildInput
     const auto& resource = backing.buffer;
     if (!resource) return Fail("versioned buffer backing has no buffer");
     if (previous && resource == previous->resource) return Fail("versioned buffer predecessor copy leased its predecessor's backing");
+    // Everything below writes [0, usedBytes): the delta is checked against it, and the predecessor's copy is clipped to it (copyLimit),
+    // so a smaller class than previous's (a shrink) is written only within what it holds.
+    if (usedBytes > backing.byteCapacity) return Fail("versioned buffer backing smaller than the version's used bytes");
 
     // The delta, overlaps resolved (the later write wins), so no two of the batch's writes to the backing touch the same byte.
     struct DeltaWrite {
@@ -370,6 +404,8 @@ VersionedBufferBuildOutcome BuildFromPredecessor(const VersionedBufferBuildInput
     for (const auto& upload : uploads) version->uploadedBytes += upload.size;
     for (const auto& copy : copies) version->copiedBytes += copy.size;
     version->copiedWhole = copiedWhole;
+    version->shrinkWindow = choice.window;
+    version->shrunk = choice.shrunk;
 
     VersionedBufferBuildOutcome outcome;
     outcome.kind = VersionedBufferBuildOutcome::Kind::Ready;

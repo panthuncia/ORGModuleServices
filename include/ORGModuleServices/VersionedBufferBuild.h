@@ -3,6 +3,7 @@
 #include <ORGModuleServices/Async/ArtifactResources.h>
 #include <ORGModuleServices/BackingPool.h>
 #include <ORGModuleServices/BufferImage.h>
+#include <ORGModuleServices/ElasticCapacity.h>
 #include <ORGModuleServices/GrowthPolicy.h>
 
 #include <cstddef>
@@ -91,6 +92,11 @@ struct VersionedBufferBuildInput {
     // the predecessor's: a large buffer that changes every frame keeps a backing per frame in flight, so its headroom is paid that
     // many times. nullopt: the power of two.
     std::optional<GrowthPolicy> growth;
+    // When the chain gives memory back (Never: a class only grows). A version that would Patch while its capacity stayed at most the
+    // policy's share of previous's class for the window (carried by the versions: PublishedBufferVersion::shrinkWindow) is made a
+    // Replace at the fresh class for the window's peak instead: `growth`'s Next(0, peak), else the power of two at least the peak.
+    // With predecessorCopy the copy is previous's contents up to this version's used bytes, which the smaller class holds.
+    ShrinkPolicy shrink = ShrinkPolicy::Never();
 };
 
 /**
@@ -118,6 +124,9 @@ struct PublishedBufferVersion {
     // and whether that copy was previous's used bytes whole (a fresh, grown or stale backing).
     std::uint64_t uploadedBytes = 0, copiedBytes = 0;
     bool copiedWhole = false;
+    // The chain's run of low capacities (VersionedBufferBuildInput::shrink), handed to the next version's build.
+    ShrinkWindow shrinkWindow;
+    bool shrunk = false;  // a Replace at a smaller class than previous's
 
     [[nodiscard]] std::shared_ptr<const std::vector<std::byte>> MaterializeCpuImage() const { return image ? image->Materialize() : nullptr; }
 };

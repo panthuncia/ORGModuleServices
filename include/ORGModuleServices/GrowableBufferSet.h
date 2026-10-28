@@ -2,6 +2,7 @@
 
 #include <ORGModuleServices/Async/RevisionAssembly.h>
 #include <ORGModuleServices/Async/VersionGrowthArtifact.h>
+#include <ORGModuleServices/ElasticCapacity.h>
 #include <ORGModuleServices/GrowableBufferTypes.h>
 #include <ORGModuleServices/GrowthPolicy.h>
 #include <ORGModuleServices/VersionedBufferGrowth.h>
@@ -36,6 +37,11 @@ struct GrowableRegistration {
     std::shared_ptr<VersionedBuffer> buffer;  // held weakly: an expired buffer leaves the set
     BufferExtent extent;
     GrowthPolicy policy = GrowthPolicy::Doubling();
+    // When a version gives memory back (ShrinkPolicy; Never: grow-only): a buffer asked at most the policy's share of what it holds
+    // for its window gets a version at `policy`'s fresh size for the window's peak ask. Made like a growth (its contents as below,
+    // nothing copied from the predecessor), in a batch of its own that does not hold the seal: the set names the smaller version
+    // once it is ready.
+    ShrinkPolicy shrink = ShrinkPolicy::Never();
     GrowableContents contents = GrowableContents::Fresh;
     GrowableCapture capture;  // Capture's
     bool address = false;     // its entries carry the version's device address (the hooks' addressOf)
@@ -122,7 +128,8 @@ struct GrowableBufferSetHooks {
     std::function<std::shared_ptr<runtime::IUploadService>()> uploads;
     // Producer thread: a version's device address, for registrations with `address`.
     std::function<std::uint64_t(const Buffer&)> addressOf;
-    // Producer thread, optional: a posted batch grows a buffer from `fromUnits` (its newest ready version's) to `toUnits` (`bytes`).
+    // Producer thread, optional: a posted batch grows a buffer from `fromUnits` (its newest ready version's) to `toUnits` (`bytes`);
+    // toUnits < fromUnits: a shrink (GrowableRegistration::shrink).
     std::function<void(const GrowableRegistration&, std::uint64_t fromUnits, std::uint64_t toUnits, std::uint64_t bytes)> grown;
     // The set's pool, for every registration without its own (GrowableRegistration::pool); the set's acquirer (one batch at a time).
     std::shared_ptr<BackingPool> pool;
@@ -200,9 +207,17 @@ public:
     /** @brief Producer: names the build's versions, or posts what they lack (pending). */
     Sealed Seal(Build&& build);
 
+    /**
+     * @brief Producer: whether a seal now would name other versions without any requirement moving: a batch settled (a shrink's
+     * smaller versions wait to be named), or a buffer's shrink is due (GrowableRegistration::shrink; a seal observes it). A producer
+     * that skips its seals while its requirements stand (a kept revision) seals again for this, or a quiet scene keeps its sizes.
+     */
+    [[nodiscard]] bool ShrinkPending(ShrinkWindow::Clock::time_point now = ShrinkWindow::Clock::now()) const;
+
     /** @brief Producer: counters since the last call (batches posted, buffers grown, failures, latch blocks made, seals). */
     struct Stats {
         std::uint64_t batches = 0, grown = 0, failed = 0, latches = 0, sealed = 0, kept = 0;
+        std::uint64_t shrunk = 0;  // of `grown`: versions made smaller
     };
     Stats TakeStats();
 
@@ -216,6 +231,7 @@ private:
         NamedEntry current;   // the newest ready version
         std::uint64_t asked = 0;  // units of the growth in flight
         bool made = false;        // `current` is the set's (a Zero registration's first version is not)
+        ShrinkWindow window;      // its asks while they fit (GrowableRegistration::shrink)
     };
     struct LatchSlot {
         std::shared_ptr<const LatchRegistration> registration;
@@ -226,7 +242,8 @@ private:
     void TakeRegistered();
     void Settle();
     NamedEntry EntryOf(const Slot& slot, std::shared_ptr<const BufferVersion> version, std::optional<std::uint64_t> stamp, BackingLease lease) const;
-    bool Post(std::vector<std::uint32_t> unmet, const std::vector<GrowableRequirement>& required);
+    // One batch: each (slot, units) a version of exactly those units.
+    bool Post(const std::vector<std::pair<std::uint32_t, std::uint64_t>>& asks);
 
     GrowableBufferSetHooks m_hooks;
     // Any thread: registrations not yet taken (Treiber stack) and the handles handed out.

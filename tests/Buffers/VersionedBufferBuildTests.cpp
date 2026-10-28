@@ -1,6 +1,7 @@
 // BuildVersionedBuffer, ReplayVersionedBuffer, JournaledBufferSet and VersionedBufferFamily through a recording upload service.
 // Compiled against OpenRenderGraph's headers (nothing of it is linked): backings carry stand-in org::Buffer pointers that only the
 // recording service sees, as keys of their CPU-side contents.
+#include <chrono>
 #include <ORGModuleServices/Async/VersionedBufferFamily.h>
 #include <ORGModuleServices/Async/VersionedBufferProducer.h>
 #include <ORGModuleServices/BackingPool.h>
@@ -929,11 +930,89 @@ void TestFamily() {
 
 } // namespace
 
+// Input::shrink: a chain whose capacity stayed at most the policy's share of its class for the window is made a Replace at the fresh
+// class for the window's peak; the predecessor's copy is clipped to the smaller version's used bytes.
+void TestPredecessorShrink() {
+    auto clock = std::make_shared<RetirementClock>();
+    auto pool = MakePool(clock);
+    auto uploads = std::make_shared<RecordingUploads>();
+    constexpr std::uint32_t kRow = sizeof(std::uint32_t);
+    std::vector<std::uint32_t> rows;
+    std::vector<std::size_t> pending;
+    std::uint64_t next = 1;
+    const auto build = [&](std::shared_ptr<const PublishedBufferVersion> previous) {
+        VersionedBufferBuildInput input;
+        input.uploadOwner = uploads;
+        input.uploadService = uploads.get();
+        input.debugName = "shrink";
+        input.writeSequence = next;
+        input.elementStride = kRow;
+        input.elementCount = rows.size();
+        input.capacity = (std::max<std::uint64_t>)(rows.size(), 1);
+        input.backingPool = pool;
+        input.predecessorCopy = true;
+        input.shrink = org::services::ShrinkPolicy::WhenBelow(25, std::chrono::milliseconds(0), 2);
+        input.previous = std::move(previous);
+        input.changedSince = [](std::uint64_t) -> std::optional<std::vector<BufferByteRange>> { return std::nullopt; };
+        input.emitDelta = [&](const auto& write) {
+            for (const auto row : pending) write(&rows[row], kRow, row * kRow);
+        };
+        uploads->Clear();
+        auto outcome = BuildVersionedBuffer(input, Context(next));
+        Check(outcome.kind == VersionedBufferBuildOutcome::Kind::Ready && outcome.version);
+        ++next;
+        pending.clear();
+        return std::shared_ptr<const PublishedBufferVersion>(std::move(outcome.version));
+    };
+    const auto contents = [&] { return std::as_bytes(std::span(rows)); };
+
+    // v1: 256 rows, class 256 (a power of two).
+    for (std::uint32_t row = 0; row < 256; ++row) {
+        rows.push_back(row);
+        pending.push_back(row);
+    }
+    auto v1 = build(nullptr);
+    Check(v1->capacity == 256 && v1->shrinkWindow.seen == 0);
+
+    // v2: the scene falls to 20 rows (row 3 changed): the first low ask opens the window, still a Patch at 256.
+    rows.resize(20);
+    rows[3] = 333;
+    pending = {3};
+    auto v2 = build(v1);
+    Check(v2->revisionMode == BufferRevisionMode::Patch && v2->capacity == 256 && v2->shrinkWindow.seen == 1 && !v2->shrunk);
+    Check(uploads->CopiedBytes() + uploads->UploadedBytes() == 20 * kRow);
+    CheckContents(*uploads, v2->lease, contents());
+
+    // v3: the window's second low ask: a Replace at the fresh class for the peak (32), v2 copied whole up to the 20 rows it holds.
+    rows[7] = 777;
+    pending = {7};
+    auto v3 = build(v2);
+    Check(v3->revisionMode == BufferRevisionMode::Replace && v3->capacity == 32 && v3->shrunk && v3->shrinkWindow.seen == 0);
+    Check(uploads->CopiedBytes() == 19 * kRow && uploads->UploadedBytes() == kRow && v3->copiedWhole);
+    for (const auto& copy : uploads->copies) Check(copy.dstOffset + copy.size <= 20 * kRow);
+    CheckContents(*uploads, v3->lease, contents());
+
+    // v4, v5: 20 of 32 is not low: Patches at 32, the window stays closed.
+    auto v4 = build(v3);
+    auto v5 = build(v4);
+    Check(v5->revisionMode == BufferRevisionMode::Patch && v5->capacity == 32 && v5->shrinkWindow.seen == 0);
+
+    // v6: growth past the class again: a Replace grown from 32, the window reset.
+    for (std::uint32_t row = 20; row < 40; ++row) {
+        rows.push_back(row);
+        pending.push_back(row);
+    }
+    auto v6 = build(v5);
+    Check(v6->revisionMode == BufferRevisionMode::Replace && v6->capacity >= 40 && !v6->shrunk);
+    CheckContents(*uploads, v6->lease, contents());
+}
+
 int main() {
     TestReplay();
     TestBuildAndCatchUp();
     TestCatchUpIntoReusedOlderBacking();
     TestPredecessorCopy();
+    TestPredecessorShrink();
     TestExhaustionSuspends();
     TestJournaledBufferSet();
     TestJournaledAppend();

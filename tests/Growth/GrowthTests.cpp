@@ -1,9 +1,11 @@
 #include <ORGModuleServices/BackingPool.h>
+#include <ORGModuleServices/ElasticCapacity.h>
 #include <ORGModuleServices/GrowableBufferTypes.h>
 #include <ORGModuleServices/GrowthPolicy.h>
 #include <ORGModuleServices/VersionFill.h>
 
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -290,6 +292,53 @@ void TestFillsIntoReusedBacking() {
     assert(org::services::ZeroFill(0).segments.empty());
 }
 
+// ShrinkPolicy and its window: a capacity follows its need down only after a sustained run of low asks, to the fresh size for their
+// peak; FitCapacity grows as GrowthPolicy::Next does.
+void TestShrink() {
+    using org::services::FitCapacity;
+    using org::services::ShrinkPolicy;
+    using org::services::ShrinkWindow;
+    const auto t0 = ShrinkWindow::Clock::now();
+    const auto at = [&](int ms) { return t0 + std::chrono::milliseconds(ms); };
+    const auto doubling = GrowthPolicy::Doubling(64);
+    const auto policy = ShrinkPolicy::WhenBelow(25, std::chrono::milliseconds(100), 3);
+
+    // Never: grow-only.
+    ShrinkWindow never;
+    for (int i = 0; i < 10; ++i) assert(!never.Observe(ShrinkPolicy::Never(), doubling, 1024, 1, at(i * 1000)));
+
+    // Three low asks, but not yet 100 ms: no shrink; the fourth, past it: the fresh class for the peak (the most asked, 200).
+    ShrinkWindow window;
+    assert(!window.Observe(policy, doubling, 1024, 100, at(0)));
+    assert(!window.Observe(policy, doubling, 1024, 200, at(10)));
+    assert(!window.Observe(policy, doubling, 1024, 150, at(20)));
+    const auto target = window.Observe(policy, doubling, 1024, 120, at(150));
+    assert(target && *target == 256 && window.seen == 0);
+
+    // An ask above the share restarts the window.
+    assert(!window.Observe(policy, doubling, 1024, 100, at(200)));
+    assert(!window.Observe(policy, doubling, 1024, 300, at(210)));
+    assert(window.seen == 0);
+    assert(!window.Observe(policy, doubling, 1024, 100, at(220)));
+    assert(!window.Observe(policy, doubling, 1024, 100, at(230)));
+    assert(!window.Observe(policy, doubling, 1024, 100, at(240)));
+    assert(window.Observe(policy, doubling, 1024, 100, at(400)) == 128);
+
+    // A target that is not smaller (the minimum) is no shrink.
+    ShrinkWindow floor;
+    const auto eager = ShrinkPolicy::WhenBelow(25, std::chrono::milliseconds(0), 1);
+    assert(!floor.Observe(eager, doubling, 64, 1, at(0)));
+
+    // FitCapacity: grows past the need, shrinks when due, and a fresh capacity is at least half used (no shrink again at a quarter).
+    std::uint32_t capacity = 0;
+    ShrinkWindow fit;
+    assert(FitCapacity(capacity, fit, 1000, doubling, eager, at(0)) && capacity == 1024);
+    assert(!FitCapacity(capacity, fit, 900, doubling, eager, at(1)) && capacity == 1024);
+    assert(FitCapacity(capacity, fit, 200, doubling, eager, at(2)) && capacity == 256);
+    assert(!FitCapacity(capacity, fit, 130, doubling, eager, at(3)) && capacity == 256);
+    assert(FitCapacity(capacity, fit, 300, doubling, eager, at(4)) && capacity == 512);
+}
+
 } // namespace
 
 int main() {
@@ -302,4 +351,5 @@ int main() {
     TestCapacityClass();
     TestGrowthFromPool();
     TestFillsIntoReusedBacking();
+    TestShrink();
 }
