@@ -407,8 +407,9 @@ void TestPoolOutlivedAndHooks() {
         Check(exclusive.load() == 4 && allocated.load() == 2);
         Check(retired.load() == 0);  // the backings have no buffer: nothing to hand over
     }
-    // The pool went first: the last lease still releases safely.
-    Check(survivor->retired.load());
+    // The pool went first: a leased backing is not claimed (nothing can reuse it, and its holder may still publish it), and the
+    // last lease still releases safely.
+    Check(!survivor->retired.load());
     survivor.Reset();
 }
 

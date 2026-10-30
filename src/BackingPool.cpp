@@ -306,9 +306,10 @@ BackingPool::~BackingPool() {
     m_home->closed.store(true, std::memory_order_seq_cst);
     m_home->returned.exchange(nullptr, std::memory_order_acq_rel);
     for (auto& backing : m_state->all) {
-        backing->retired.store(true, std::memory_order_seq_cst);
-        if (m_hooks.retire && backing->buffer && backing->leases.load(std::memory_order_acquire) == 0 &&
-            backing->bindingConsumers.load(std::memory_order_acquire) == 0) {
+        // Only a backing the pool retires here is claimed. A leased one stays pinnable: with the pool gone nothing can reuse
+        // it, and a version that outlives its pool (one pool per version) is still published and captured by bindings.
+        if (backing->leases.load(std::memory_order_acquire) != 0 || !detail::TryClaim(*backing)) continue;
+        if (m_hooks.retire && backing->buffer) {
             try {
                 m_hooks.retire(std::move(backing->buffer));
             } catch (...) {
