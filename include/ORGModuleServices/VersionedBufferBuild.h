@@ -117,7 +117,7 @@ struct PublishedBufferVersion {
     std::shared_ptr<Buffer> resource;  // lease->buffer
     std::shared_ptr<const BufferImage> image;
     std::shared_ptr<const void> tag;   // the input's
-    // The host's state seeded before visibility (BasicRenderer: org::experimental::PreparedBackingState, set by its decorate
+    // The host's state seeded before visibility (BasicRenderer: org::compiler::PreparedBackingState, set by its decorate
     // hook). It owns no consumer pin, so journal retention cannot keep a backing from reuse.
     std::shared_ptr<const void> hostState;
     // Input::predecessorCopy's build (diagnostics): the delta's bytes uploaded from the CPU, the bytes GPU-copied from the predecessor,

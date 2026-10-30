@@ -111,15 +111,9 @@ public:
     void Initialize() override {}
     void SetUploadResolveContext(org::runtime::UploadResolveContext) override {}
     std::shared_ptr<org::RenderPass> GetUploadPass() const override { return {}; }
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
     void UploadData(const void*, size_t, org::runtime::UploadTarget, size_t, const char*, int) override {}
     void UploadTextureSubresources(org::runtime::UploadTarget, rhi::Format, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
         const rhi::helpers::SubresourceData*, uint32_t, const char*, int) override {}
-#else
-    void UploadData(const void*, size_t, org::runtime::UploadTarget, size_t) override {}
-    void UploadTextureSubresources(
-        org::runtime::UploadTarget, rhi::Format, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, const rhi::helpers::SubresourceData*, uint32_t) override {}
-#endif
     void QueueResourceCopy(const std::shared_ptr<org::Resource>&, const std::shared_ptr<org::Resource>&, size_t) override {}
     void ProcessDeferredReleases(uint8_t) override {}
     void Cleanup() override {}
