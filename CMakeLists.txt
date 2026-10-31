@@ -21,6 +21,7 @@ add_library(ORGModuleServices STATIC
     src/BackingPoolBinding.cpp
     src/BufferImage.cpp
     src/BufferJournal.cpp
+    src/GraphJob.cpp
     src/GrowableBufferSet.cpp
     src/JournaledBufferSet.cpp
     src/PipelineRegistry.cpp
