@@ -87,11 +87,15 @@ struct ArtifactRequirement {
     // Non-zero for handle-based requirements. This prevents an exact revision
     // from accidentally binding to a different internal incarnation (ABA).
     std::uint64_t requiredGeneration = 0;
+    // Address-level ReadyGate only (ReadyGateAtLeast): the lowest revision the
+    // gate may latch to. Zero latches to any revision.
+    std::uint64_t minimumLatchRevision = 0;
     bool operator==(const ArtifactRequirement<Kind>& other) const noexcept {
         return key == other.key && minimumRevision == other.minimumRevision &&
             requiredReadiness == other.requiredReadiness && policy == other.policy &&
             alternativeGroup == other.alternativeGroup && invalidation == other.invalidation &&
-            requiredGeneration == other.requiredGeneration;
+            requiredGeneration == other.requiredGeneration &&
+            minimumLatchRevision == other.minimumLatchRevision;
     }
 };
 
@@ -150,6 +154,22 @@ template <class Kind>
     ArtifactReadiness readiness = ArtifactReadiness::CpuReady) {
     return { address, 0, readiness, DependencyPolicy::AllOf, 0,
         DependencyInvalidationPolicy::ReadyGate };
+}
+
+// Address-level readiness latch with a floor: waits for the first immutable
+// version at or above `minimumRevision` to reach the milestone, then holds that
+// exact version as ReadyGate(address) does, never invalidated by later versions.
+// For a consumer that needs a version containing its own earlier write (a row of
+// a journaled table published as successive roots) without following every
+// later root.
+template <class Kind>
+[[nodiscard]] inline ArtifactRequirement<Kind> ReadyGateAtLeast(ArtifactAddress<Kind> address,
+    std::uint64_t minimumRevision,
+    ArtifactReadiness readiness = ArtifactReadiness::CpuReady) {
+    ArtifactRequirement<Kind> requirement{ address, 0, readiness, DependencyPolicy::AllOf, 0,
+        DependencyInvalidationPolicy::ReadyGate };
+    requirement.minimumLatchRevision = minimumRevision;
+    return requirement;
 }
 
 template <class Kind>

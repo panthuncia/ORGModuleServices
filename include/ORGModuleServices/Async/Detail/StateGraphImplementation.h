@@ -91,6 +91,7 @@ std::uint64_t CanonicalRequestFingerprint(const ArtifactKey<Kind>& key,
         HashRequestValue(hash, requirement.alternativeGroup);
         HashRequestValue(hash, static_cast<std::uint64_t>(requirement.invalidation));
         HashRequestValue(hash, requirement.requiredGeneration);
+        HashRequestValue(hash, requirement.minimumLatchRevision);
     }
     return hash == 0 ? 1u : hash;
 }
@@ -1599,8 +1600,10 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
         // address to a blocked successor must not make an already-satisfied
         // minimum false for consumers that can safely use that ready version.
         const ArtifactSnapshot* selected = nullptr;
+        // An unlatched ReadyGateAtLeast selects as LatestAtLeast of its floor.
+        const auto minimumRevision = (std::max)(requirement.minimumRevision, requirement.minimumLatchRevision);
         if (const auto current = nodes.find(requirement.key); current != nodes.end() &&
-            current->second.producedRevision >= requirement.minimumRevision) {
+            current->second.producedRevision >= minimumRevision) {
             currentSnapshot = MakeSnapshot(current->second);
             if (Satisfies(currentSnapshot.readiness, requirement.requiredReadiness)) {
                 selected = &currentSnapshot;
@@ -1610,7 +1613,7 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
             address != versionsByAddress.end()) {
             for (auto candidate = address->second.rbegin(); candidate != address->second.rend();
                 ++candidate) {
-                if (candidate->first.first < requirement.minimumRevision) break;
+                if (candidate->first.first < minimumRevision) break;
                 const auto archived = versions.find(candidate->second);
                 if (archived == versions.end() || !Satisfies(
                     archived->second.readiness, requirement.requiredReadiness)) continue;
@@ -1862,8 +1865,8 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
     }
 
     // Address-level ReadyGate is a one-shot synchronization edge. Once any
-    // immutable version has reached the requested milestone, bind the consumer
-    // to that exact version. Leaving minimumRevision at zero made the edge
+    // immutable version (at or above minimumLatchRevision) has reached the
+    // requested milestone, bind the consumer to that exact version. Leaving minimumRevision at zero made the edge
     // follow the mutable address cursor: requesting a blocked successor could
     // therefore make an already-satisfied gate false again and strand an
     // unrelated consumer (most visibly indirect state behind material tables).
@@ -1877,6 +1880,7 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
             if (const auto current = nodes.find(requirement.key); current != nodes.end()) {
                 currentSnapshot = MakeSnapshot(current->second);
                 if (currentSnapshot.revision != 0 &&
+                    currentSnapshot.revision >= requirement.minimumLatchRevision &&
                     Satisfies(currentSnapshot.readiness, requirement.requiredReadiness)) {
                     selected = &currentSnapshot;
                 }
@@ -1885,6 +1889,7 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
                 address != versionsByAddress.end()) {
                 for (auto candidate = address->second.rbegin(); candidate != address->second.rend();
                     ++candidate) {
+                    if (candidate->first.first < requirement.minimumLatchRevision) break;
                     const auto archived = versions.find(candidate->second);
                     if (archived == versions.end() || !Satisfies(
                         archived->second.readiness, requirement.requiredReadiness)) continue;
