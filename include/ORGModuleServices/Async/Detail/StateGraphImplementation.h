@@ -260,6 +260,7 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
     org::async::GraphScheduler& scheduler;
     org::async::Scope scope;
     const StateGraphHooks<Binding> hooks;
+    const std::string graphName;
     [[nodiscard]] org::async::ArtifactKindPolicy KindPolicy(ArtifactKind kind) const noexcept {
         const auto index = static_cast<std::size_t>(kind);
         return index < hooks.artifactPolicies.size() ? hooks.artifactPolicies[index]
@@ -757,8 +758,15 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
 		ArtifactKey dependency{};
 		std::vector<ArtifactKey> consumers;
 		std::size_t next = 0;
+		// Queued by a transition made inside the wake loop itself (a consumer
+		// that QueueNode just failed terminally). Its consumers may already have
+		// been evaluated in this slice, before that transition, so the
+		// once-per-slice evaluation shortcut must not skip them.
+		bool afterEvaluation = false;
 	};
 	std::deque<PendingWaiterWake> pendingWaiterWakes;
+	bool wakingWaiters = false;
+	std::chrono::steady_clock::time_point nextStallDump{};
 	std::vector<ArtifactSnapshot> propagatedReady;
 	tbb::concurrent_queue<Completion> completions;
 	std::atomic<std::uint64_t> completionCount{ 0 };
@@ -930,7 +938,7 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
 
     Impl(std::shared_ptr<org::async::GraphScheduler> schedulerIn, std::string_view name, StateGraphHooks<Binding> hooksIn)
         : schedulerOwner(std::move(schedulerIn)), scheduler(*schedulerOwner), scope(scheduler.CreateScope(name)), hooks(std::move(hooksIn)),
-          acceptanceMailboxes(hooks.scheduling.MailboxCount()), acceptanceMailboxScheduled(hooks.scheduling.MailboxCount()) {
+          graphName(name), acceptanceMailboxes(hooks.scheduling.MailboxCount()), acceptanceMailboxScheduled(hooks.scheduling.MailboxCount()) {
         if (!scope) throw std::invalid_argument("graph scheduler returned an empty scope");
     }
 
@@ -1116,18 +1124,23 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
         return found == versionGenerations.end() ? 0 : found->second;
     }
 
-    ArtifactSnapshot MakeSnapshot(const Node& node) const {
-        // A node that terminates before producing anything still has
-        // producedRevision 0. Reporting version 0 would describe a version
-        // nobody holds: consumers hold handles to the revision they requested,
-        // and the exact-waiter loop matches on that identity, so such a node
-        // would fail silently and never dispatch its awaiters. Terminal
-        // notifications are therefore keyed by the version that terminated.
+    // A node that terminates before producing anything still has
+    // producedRevision 0. Reporting version 0 would describe a version
+    // nobody holds: consumers hold handles to the revision they requested,
+    // and the exact-waiter loop and exact dependency selection match on that
+    // identity, so such a node would fail silently and never dispatch its
+    // awaiters or fail its dependents. Terminal states are therefore keyed by
+    // the version that terminated.
+    static std::uint64_t SnapshotRevision(const Node& node) {
         const bool terminal = node.state == ArtifactReadiness::Failed ||
             node.state == ArtifactReadiness::Cancelled ||
             node.state == ArtifactReadiness::Superseded;
-        const auto revision = (terminal && node.producedRevision == 0)
+        return (terminal && node.producedRevision == 0)
             ? node.desiredRevision : node.producedRevision;
+    }
+
+    ArtifactSnapshot MakeSnapshot(const Node& node) const {
+        const auto revision = SnapshotRevision(node);
         return { node.key, revision,
             node.versionGeneration, node.state, node.payload,
             node.gpuSubmissions, node.lease };
@@ -1585,9 +1598,13 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
                 }
                 if (newest) return newest;
             }
+            // Match the cursor by its snapshot identity: a version that
+            // terminated before producing has no archive entry, and without
+            // this its exact dependents never observe the terminal state, so
+            // they stay Blocked instead of propagating the failure.
             const auto current = nodes.find(requirement.key);
             if (current != nodes.end() &&
-                current->second.producedRevision == requirement.minimumRevision &&
+                SnapshotRevision(current->second) == requirement.minimumRevision &&
                 (requirement.requiredGeneration == 0 ||
                     current->second.versionGeneration == requirement.requiredGeneration)) {
                 currentSnapshot = MakeSnapshot(current->second);
@@ -1987,6 +2004,91 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
         visited.erase(key);
     }
 
+    // ORG_STATEGRAPH_STALL_DUMP=1: every 5 s, log each desired node that has been
+    // outstanding for over 5 s with its full requirement set as the drain resolves
+    // it now, the dependency cursor it would select, and whether the reverse wake
+    // edge is installed. A node whose dependencies are all satisfied while it is
+    // still Blocked is flagged: it missed a wake. Diagnostic only; no state changes.
+    void DumpStalledNodes(std::chrono::steady_clock::time_point now) {
+        static const bool enabled = [] {
+#ifdef _WIN32
+            char* value = nullptr;
+            size_t length = 0;
+            const bool on = _dupenv_s(&value, &length, "ORG_STATEGRAPH_STALL_DUMP") == 0 &&
+                value && value[0] && value[0] != '0';
+            std::free(value);
+            return on;
+#else
+            const char* value = std::getenv("ORG_STATEGRAPH_STALL_DUMP");
+            return value && value[0] && value[0] != '0';
+#endif
+        }();
+        if (!enabled || now < nextStallDump) return;
+        constexpr auto stallAge = std::chrono::seconds(5);
+        nextStallDump = now + stallAge;
+        constexpr std::size_t maxNodes = 64;
+        std::size_t stalled = 0;
+        std::size_t lostWakes = 0;
+        for (const auto& [key, node] : nodes) {
+            if (!node.desired || !IsOutstandingState(node.state) || now - node.stateSince < stallAge)
+                continue;
+            ++stalled;
+            const bool satisfied = DependenciesSatisfied(node);
+            const bool lostWake = satisfied && node.state == ArtifactReadiness::Blocked &&
+                !node.buildInFlight && !node.suspension && !node.retryAt;
+            if (lostWake) ++lostWakes;
+            if (stalled > maxNodes) continue;
+            const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - node.stateSince).count();
+            std::string line = std::format(
+                "StateGraph stall [{}]: {} state={} age={}ms rev={}/{} versionGen={} gen={} "
+                "inFlight={} attempted={} suspension={} retry={} terminal={} successors={} "
+                "edges={} requested={} satisfied={}{}",
+                graphName, KeyString(key), ReadinessName(node.state), age, node.producedRevision,
+                node.desiredRevision, node.versionGeneration, node.generation, node.buildInFlight,
+                node.buildAttempted, node.suspension ? node.suspension->identity : 0,
+                node.retryAt.has_value(), node.terminalFailure, node.successors.size(),
+                node.installedWaiterKeys.size(), node.requestedRequirements.size(), satisfied,
+                lostWake ? " LOST-WAKE" : "");
+            if (!node.error.empty()) line += " error=" + node.error;
+            for (const auto& requirement : node.requirements) {
+                ArtifactSnapshot currentSnapshot;
+                const auto* selected = SelectSnapshot(requirement, currentSnapshot);
+                const auto dependency = nodes.find(requirement.key);
+                const auto edges = waiters.find(requirement.key);
+                const bool edge = edges != waiters.end() && edges->second.contains(key);
+                line += std::format(
+                    "\n    <- {} policy={} invalidation={} needs={} minRev={} latchRev={} gen={} "
+                    "satisfied={} selected={} edge={}",
+                    KeyString(requirement.key), static_cast<unsigned>(requirement.policy),
+                    static_cast<unsigned>(requirement.invalidation),
+                    ReadinessName(requirement.requiredReadiness), requirement.minimumRevision,
+                    requirement.minimumLatchRevision, requirement.requiredGeneration,
+                    RequirementSatisfied(requirement),
+                    selected ? std::format("{}:{}:{}", selected->revision, selected->generation,
+                        ReadinessName(selected->readiness)) : std::string("none"),
+                    edge);
+                if (dependency == nodes.end()) {
+                    line += " node=absent";
+                } else {
+                    const auto& value = dependency->second;
+                    line += std::format(" node={} rev={}/{} versionGen={} desired={} age={}ms",
+                        ReadinessName(value.state), value.producedRevision, value.desiredRevision,
+                        value.versionGeneration, value.desired,
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - value.stateSince).count());
+                }
+            }
+            spdlog::warn("{}", line);
+        }
+        if (stalled != 0) {
+            spdlog::warn("StateGraph stall [{}]: stalled={} lostWakes={} nodes={} pending={} "
+                "pendingWaiterWakes={} suspended={} completions={}", graphName, stalled, lostWakes,
+                nodes.size(), pending.size(), pendingWaiterWakes.size(), suspendedByIdentity.size(),
+                completionCount.load(std::memory_order_relaxed));
+        }
+    }
+
     std::vector<ArtifactSnapshot> DependencySnapshots(const Node& node) const {
         std::vector<ArtifactSnapshot> result;
         result.reserve(node.requirements.size());
@@ -2246,6 +2348,7 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
         if (found == waiters.end() || found->second.empty()) return;
 		PendingWaiterWake wake;
 		wake.dependency = key;
+		wake.afterEvaluation = wakingWaiters;
 		wake.consumers.reserve(found->second.size());
 		wake.consumers.insert(wake.consumers.end(),
 			found->second.begin(), found->second.end());
@@ -3136,6 +3239,7 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
 			std::size_t waiterWakeSteps = 0;
 			std::unordered_set<ArtifactKey, typename ArtifactKey::Hasher> evaluatedWaiters;
 			evaluatedWaiters.reserve(16);
+			wakingWaiters = true;
 			while (!pendingWaiterWakes.empty() && waiterWakeSteps < 16 &&
 				std::chrono::steady_clock::now() - started < maxDuration) {
 				auto& wake = pendingWaiterWakes.front();
@@ -3148,7 +3252,7 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
 					// mutation slice, evaluating that consumer once observes all of them.
 					// Re-running QueueNode for every edge made scene/manifests repeatedly
 					// scan the same closure while holding the graph mutex.
-					if (!evaluatedWaiters.insert(consumer).second) continue;
+					if (!evaluatedWaiters.insert(consumer).second && !wake.afterEvaluation) continue;
 					const auto wakeStarted = drainTrace
 						? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 					WakeWaiter(wake.dependency, consumer);
@@ -3165,6 +3269,7 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
 				deferredWaiterWakeRelease.push_back(std::move(wake.consumers));
 				pendingWaiterWakes.pop_front();
 			}
+			wakingWaiters = false;
 			recordApplyPhase("apply_waiter_wakes");
 			if (!propagatedReady.empty()) {
 				ready.insert(ready.end(),
@@ -3259,6 +3364,7 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
 				if (registered.empty()) exactWaiters.erase(found);
 			}
 			recordApplyPhase("apply_exact_waiters");
+			DumpStalledNodes(now);
             callbacks.reserve(readyCallbacks.size());
             for (const auto& [_, callback] : readyCallbacks) callbacks.push_back(callback);
 			hasImmediateWork = !postedAwaits.empty() || !postedIntents.empty() ||
