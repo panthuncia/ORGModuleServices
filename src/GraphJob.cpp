@@ -2,7 +2,7 @@
 
 namespace org::services {
 
-std::shared_ptr<const async::GpuSubmissionSet> MakeGpuSubmissionSet(std::shared_ptr<CompiledGraph> graph,
+std::shared_ptr<const async::GpuSubmissionSet> MakeGpuSubmissionSet(std::shared_ptr<JobGraph> graph,
     ExecutionHandle execution) {
     auto set = std::make_shared<async::GpuSubmissionSet>();
     for (const auto& signal : execution.Signals()) {

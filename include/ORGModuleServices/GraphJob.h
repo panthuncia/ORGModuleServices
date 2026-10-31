@@ -11,13 +11,13 @@
 namespace org::services {
 
 /**
- * @brief The GPU submission set of one compiled-graph execution, for a StateGraph artifact.
+ * @brief The GPU submission set of one job-graph execution, for a StateGraph artifact.
  *
  * Submitted once the execution is on its queues. Complete once the GPU finished it: polling it retires the graph's
- * finished work without blocking (CompiledGraph::TryRetire). Failed when the execution was poisoned. Each signal of
+ * finished work without blocking (JobGraph::TryRetire). Failed when the execution was poisoned. Each signal of
  * the execution is one submission, owned by the graph.
  */
-std::shared_ptr<const async::GpuSubmissionSet> MakeGpuSubmissionSet(std::shared_ptr<CompiledGraph> graph,
+std::shared_ptr<const async::GpuSubmissionSet> MakeGpuSubmissionSet(std::shared_ptr<JobGraph> graph,
     ExecutionHandle execution);
 
 /**
@@ -29,7 +29,7 @@ std::shared_ptr<const async::GpuSubmissionSet> MakeGpuSubmissionSet(std::shared_
  * UploadSubmitted may start, and execute their own graphs, while the GPU still runs this one.
  */
 template <class Result>
-Result RunGraphJob(const std::shared_ptr<CompiledGraph>& graph, std::span<const CompiledGraph::Binding> bindings,
+Result RunGraphJob(const std::shared_ptr<JobGraph>& graph, std::span<const JobGraph::Binding> bindings,
     async::ArtifactPayload payload, const IHostExecutionData* hostData = nullptr) {
     ExecutionHandle execution;
     try {
