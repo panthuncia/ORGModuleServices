@@ -17,6 +17,7 @@
 #endif
 
 #include <fstream>
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstring>
@@ -81,38 +82,108 @@ std::filesystem::path OwnModulePath(const void* address) {
     return path;
 }
 #endif
-uint64_t HashBytes(uint64_t hash, const void* data, size_t size) noexcept {
-    const auto* bytes = static_cast<const unsigned char*>(data);
-    for (size_t i = 0; i < size; ++i) { hash ^= bytes[i]; hash *= 1099511628211ULL; }
-    return hash;
-}
-template<class T> uint64_t HashValue(uint64_t hash, const T& value) noexcept { return HashBytes(hash, &value, sizeof(value)); }
-uint64_t HashWide(uint64_t hash, std::wstring_view value) noexcept { return HashBytes(hash, value.data(), value.size() * sizeof(wchar_t)); }
-uint64_t HashPath(uint64_t hash, const std::filesystem::path& value) noexcept {
-    const auto& native = value.native();
-    return HashBytes(hash, native.data(), native.size() * sizeof(native[0]));
-}
-
-uint64_t HashFileContents(const std::filesystem::path& path) noexcept {
-	uint64_t hash = 1469598103934665603ULL;
-	std::ifstream stream(path, std::ios::binary);
-	if (!stream) return 0;
-	std::array<char, 4096> bytes{};
-	while (stream) {
-		stream.read(bytes.data(), bytes.size());
-		const auto count = stream.gcount();
-		if (count > 0) hash = HashBytes(hash, bytes.data(), static_cast<std::size_t>(count));
-	}
-	return hash;
+// The compiler's identity, without reading its whole file. Paths and write times are left out: copying the
+// same compiler somewhere else must not invalidate anything.
+std::string LibraryIdentity(ModuleHandle module) {
+    if (!module) return {};
+#if defined(_WIN32)
+    const auto* base = reinterpret_cast<const std::byte*>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return {};
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return {};
+    char text[64]{};
+    std::snprintf(text, sizeof(text), "%08lx:%08lx:%08lx", static_cast<unsigned long>(nt->FileHeader.TimeDateStamp),
+        static_cast<unsigned long>(nt->OptionalHeader.SizeOfImage), static_cast<unsigned long>(nt->OptionalHeader.CheckSum));
+    return text;
+#else
+    // ELF has no such header fields, so this hashes the file. It runs once per compiler.
+    std::ifstream stream(LibraryPath(module), std::ios::binary);
+    std::string bytes((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+    return HashShaderText(bytes).ToHex();
+#endif
 }
 
-struct CacheHeader { uint32_t magic{ 0x5347524f }; uint16_t version{ 1 }; uint8_t format{}; uint8_t reserved{}; uint64_t key{}; uint64_t size{}; };
+// Reads includes through the store, so every path DXC asks for is recorded, including those that do not exist.
+// DXC tries the including file's folder and then each -I folder, and moves on when this returns a failure.
+class StoreIncludeHandler final : public IDxcIncludeHandler {
+public:
+    StoreIncludeHandler(IDxcUtils& utils, ShaderIncludeTracker& includes) : utils_(utils), includes_(includes) {}
+    virtual ~StoreIncludeHandler() = default;
+    // This object lives on the stack for one Compile call.
+    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** object) override {
+        if (!object) return E_POINTER;
+        if (id == __uuidof(IDxcIncludeHandler) || id == __uuidof(IUnknown)) { *object = static_cast<IDxcIncludeHandler*>(this); return S_OK; }
+        *object = nullptr;
+        return E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE LoadSource(LPCWSTR fileName, IDxcBlob** source) override {
+        if (!source) return E_POINTER;
+        *source = nullptr;
+        const auto* bytes = includes_.Open(std::filesystem::path(fileName));
+        if (!bytes) return E_FAIL;
+        ComPtr<IDxcBlobEncoding> blob;
+        const HRESULT result = utils_.CreateBlob(bytes->data(), static_cast<UINT32>(bytes->size()), DXC_CP_UTF8, &blob);
+        if (FAILED(result)) return result;
+        *source = blob.Detach();
+        return S_OK;
+    }
+private:
+    IDxcUtils& utils_;
+    ShaderIncludeTracker& includes_;
+};
+
+// A compile's arguments, in the order DXC receives them. Only "shared" and "extra" must match for two variants to
+// share an artifact: defines and include folders have already done their work once the text is preprocessed.
+struct CompileArguments {
+    std::vector<std::wstring> shared;
+    std::vector<std::wstring> perVariant;
+    std::vector<std::wstring> extra;
+    std::wstring rootName;
+};
+
+CompileArguments BuildArguments(const ShaderCompileRequest& request) {
+    CompileArguments arguments;
+    auto& shared = arguments.shared;
+    shared.emplace_back(L"-E"); shared.push_back(request.entryPoint); shared.emplace_back(L"-T"); shared.push_back(request.target);
+    shared.emplace_back(L"-HV"); shared.push_back(request.languageVersion.empty() ? std::wstring(L"2021") : request.languageVersion);
+    if (request.warningsAsErrors) shared.emplace_back(L"-WX");
+    // SPIR-V gets -Zi's OpSource (every file's text embedded) and OpLine, which Nsight and RenderDoc
+    // read; -Qembed_debug is the DXIL container's equivalent. Not -fspv-debug=vulkan[-with-source]:
+    // its DebugValues keep dead loads alive, which changes the resources a stage uses, and DXC 1.9's
+    // validator rejects some of its scopes against the embedded text.
+    if (request.debugInfo) {
+        shared.emplace_back(L"-Zi");
+        if (request.format == ShaderBinaryFormat::Dxil) shared.emplace_back(L"-Qembed_debug");
+    }
+    // Same SPIR-V ABI as BasicRHI's Vulkan backend expects (descriptor-heap bindings, DX layout).
+    if (request.format == ShaderBinaryFormat::Spirv) rhi::AppendVulkanDxcSpirvArguments(shared);
+    for (const auto& define : request.defines) arguments.perVariant.push_back(L"-D" + define.name + (define.value.empty() ? L"" : L"=" + define.value));
+    for (const auto& directory : request.includeDirectories) { arguments.perVariant.emplace_back(L"-I"); arguments.perVariant.push_back(directory.wstring()); }
+    arguments.extra = request.arguments;
+    // The positional argument names the main file for diagnostics, debug info and relative includes.
+    arguments.rootName.assign(request.sourceName.begin(), request.sourceName.end());
+    return arguments;
+}
+
+void AddList(ShaderKeyBuilder& key, const std::vector<std::wstring>& list) {
+    key.Add(static_cast<uint64_t>(list.size()));
+    for (const auto& item : list) key.Add(std::wstring_view(item));
+}
 }
 
 class ShaderCompiler::Impl {
 public:
-    Impl(std::filesystem::path cacheDirectory, const std::filesystem::path& compilerDirectory, RenameFile rename) :
-        cacheDirectory_(std::move(cacheDirectory)), rename_(std::move(rename)) {
+    Impl(const std::filesystem::path& cacheDirectory, const std::filesystem::path& compilerDirectory, std::shared_ptr<ShaderStore> store) : store_(std::move(store)) {
+        if (!store_) {
+            ShaderStoreOptions options;
+            options.sourceRoot = ".";
+            options.cacheDirectory = cacheDirectory;
+            options.persistent = !cacheDirectory.empty();
+            store_ = std::make_shared<ShaderStore>(std::move(options));
+        }
         if (!compilerDirectory.empty()) {
             // The validator first: dxcompiler resolves it by basename.
             validatorModule_ = OpenLibrary(compilerDirectory / kValidatorLibrary);
@@ -121,7 +192,7 @@ public:
         }
         if (!module_) module_ = OpenLibrary(kCompilerLibrary);
         if (!module_) {
-            if (const auto ownPath = OwnModulePath(reinterpret_cast<const void*>(&HashBytes)); !ownPath.empty()) {
+            if (const auto ownPath = OwnModulePath(reinterpret_cast<const void*>(&LibraryIdentity)); !ownPath.empty()) {
                 const auto directory = ownPath.parent_path();
                 validatorModule_ = OpenLibrary(directory / kValidatorLibrary);
                 module_ = OpenLibrary(directory / kCompilerLibrary);
@@ -140,14 +211,7 @@ public:
             FAILED(create(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler_)))) {
             compiler_.Reset(); utils_.Reset(); CloseLibrary(module_); module_ = nullptr;
         }
-        if (!cacheDirectory_.empty()) { std::error_code ec; std::filesystem::create_directories(cacheDirectory_, ec); }
-		if (const auto path = module_ ? LibraryPath(module_) : std::filesystem::path{}; !path.empty()) {
-			compilerFingerprint_ = HashPath(compilerFingerprint_, path);
-			std::error_code ec; const auto size = std::filesystem::file_size(path, ec);
-			if (!ec) compilerFingerprint_ = HashValue(compilerFingerprint_, size);
-			ec.clear(); const auto stamp = std::filesystem::last_write_time(path, ec);
-			if (!ec) { const auto ticks = stamp.time_since_epoch().count(); compilerFingerprint_ = HashValue(compilerFingerprint_, ticks); }
-		}
+        compilerIdentity_ = LibraryIdentity(module_) + "|" + LibraryIdentity(validatorModule_);
     }
     ~Impl() {
 		compiler_.Reset();
@@ -156,167 +220,155 @@ public:
 		CloseLibrary(validatorModule_);
 	}
 
+    ShaderStoreHash VariantKey(const CompileArguments& arguments, ShaderBinaryFormat format) const noexcept {
+        ShaderKeyBuilder key;
+        key.Add(std::string_view("dxc")).Add(std::string_view(compilerIdentity_)).Add(static_cast<uint64_t>(format));
+        AddList(key, arguments.shared);
+        AddList(key, arguments.perVariant);
+        AddList(key, arguments.extra);
+        key.Add(std::wstring_view(arguments.rootName));
+        return key.Finish();
+    }
+
+    ShaderStoreHash CompileConfigKey(const CompileArguments& arguments, ShaderBinaryFormat format) const noexcept {
+        ShaderKeyBuilder key;
+        key.Add(std::string_view("dxc")).Add(std::string_view(compilerIdentity_)).Add(static_cast<uint64_t>(format));
+        AddList(key, arguments.shared);
+        AddList(key, arguments.extra);
+        return key.Finish();
+    }
+
+    // The in-memory key. It also covers the source bytes and the generation, because a shader reload
+    // can change either one for the same arguments, and the old result must not be returned then.
     uint64_t Key(const ShaderCompileRequest& request) const noexcept {
         BT_ZONE_SCOPE("ORG.ShaderCompiler.BuildKey");
-        uint64_t hash = request.inputsFingerprint
-            ? HashValue(1469598103934665603ULL, request.inputsFingerprint)
-            : HashBytes(1469598103934665603ULL, request.source.data(), request.source.size());
-        hash = HashBytes(hash, request.sourceName.data(), request.sourceName.size());
-        hash = HashWide(hash, request.entryPoint); hash = HashWide(hash, request.target); hash = HashWide(hash, request.languageVersion);
-        hash = HashValue(hash, request.format); hash = HashValue(hash, request.debugInfo); hash = HashValue(hash, request.warningsAsErrors);
-        for (const auto& define : request.defines) { hash = HashWide(hash, define.name); hash = HashWide(hash, define.value); }
-        for (const auto& argument : request.arguments) hash = HashWide(hash, argument);
-		for (const auto& directory : request.includeDirectories) hash = HashPath(hash, directory);
-		if (!request.inputsFingerprint) {
-            BT_ZONE_SCOPE("ORG.ShaderCompiler.DependencyKeys");
-		    for (const auto& dependency : request.dependencyFiles) { hash = HashPath(hash, dependency); hash = HashValue(hash, DependencyHash(dependency)); }
-        }
-		constexpr uint32_t compilerArgumentsVersion = 6; hash = HashValue(hash, compilerArgumentsVersion);
-		return HashValue(hash, compilerFingerprint_);
+        ShaderKeyBuilder key;
+        key.Add(VariantKey(BuildArguments(request), request.format)).Add(HashShaderBytes(request.source)).Add(store_->Generation());
+        return key.Finish().low;
     }
 
-    // Content hash of a dependency, re-read only when its size or write time changes: a permutation
-    // set shares one include tree, and every key would otherwise re-hash all of it.
-    uint64_t DependencyHash(const std::filesystem::path& path) const noexcept {
-#if defined(_WIN32)
-        // Both witnesses in one filesystem/VFS lookup, without changing cache invalidation.
-        WIN32_FILE_ATTRIBUTE_DATA attributes{};
-        if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attributes) ||
-            (attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) return 0;
-        uint64_t size = (uint64_t(attributes.nFileSizeHigh) << 32) | attributes.nFileSizeLow;
-        int64_t stamp = static_cast<int64_t>((uint64_t(attributes.ftLastWriteTime.dwHighDateTime) << 32) |
-            attributes.ftLastWriteTime.dwLowDateTime);
-        if (attributes.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
-            // filesystem follows symlinks; attribute queries describe the link itself.
-            std::error_code ec;
-            size = std::filesystem::file_size(path, ec);
-            if (ec) return 0;
-            stamp = std::filesystem::last_write_time(path, ec).time_since_epoch().count();
-            if (ec) return 0;
+    // Runs DXC. preprocess gives the -P text in output.text; otherwise the object in output.binary.
+    struct Invocation {
+        bool started{};  // False means DXC itself failed, not the shader.
+        bool succeeded{};
+        std::string text;
+        std::vector<std::byte> binary;
+        std::string diagnostics;
+    };
+
+    Invocation Invoke(const CompileArguments& arguments, const std::string* root, ShaderIncludeTracker& includes, bool preprocess) {
+        Invocation invocation;
+        const std::string_view source = root ? std::string_view(*root) : std::string_view{};
+        ComPtr<IDxcBlobEncoding> sourceBlob;
+        if (FAILED(utils_->CreateBlob(source.data(), static_cast<UINT32>(source.size()), DXC_CP_UTF8, &sourceBlob))) {
+            invocation.diagnostics = "DXC failed to create the source blob";
+            return invocation;
         }
-#else
-        std::error_code ec;
-        if (!std::filesystem::is_regular_file(path, ec)) return 0;
-        const uint64_t size = std::filesystem::file_size(path, ec);
-        if (ec) return 0;
-        const int64_t stamp = static_cast<int64_t>(std::filesystem::last_write_time(path, ec).time_since_epoch().count());
-        if (ec) return 0;
-#endif
-        {
-            std::scoped_lock lock(dependencyMutex_);
-            if (const auto found = dependencies_.find(path.native()); found != dependencies_.end() && found->second.size == size && found->second.stamp == stamp)
-                return found->second.hash;
+        DxcBuffer buffer{ sourceBlob->GetBufferPointer(), sourceBlob->GetBufferSize(), DXC_CP_UTF8 };
+        std::vector<const wchar_t*> raw;
+        if (preprocess) raw.push_back(L"-P");
+        for (const auto* list : { &arguments.shared, &arguments.perVariant, &arguments.extra })
+            for (const auto& value : *list) raw.push_back(value.c_str());
+        if (!arguments.rootName.empty()) raw.push_back(arguments.rootName.c_str());
+        StoreIncludeHandler handler(*utils_.Get(), includes);
+        ComPtr<IDxcResult> compileResult;
+        if (FAILED(compiler_->Compile(&buffer, raw.data(), static_cast<UINT32>(raw.size()), &handler, IID_PPV_ARGS(&compileResult)))) {
+            invocation.diagnostics = "DXC invocation failed";
+            return invocation;
         }
-        const uint64_t hash = HashFileContents(path);
-        std::scoped_lock lock(dependencyMutex_);
-        dependencies_[path.native()] = { static_cast<uint64_t>(size), static_cast<int64_t>(stamp), hash };
-        return hash;
+        invocation.started = true;
+        ComPtr<IDxcBlobUtf8> errors; compileResult->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
+        if (errors && errors->GetStringLength()) invocation.diagnostics.assign(errors->GetStringPointer(), errors->GetStringLength());
+        HRESULT status{}; compileResult->GetStatus(&status);
+        if (FAILED(status)) return invocation;
+        if (preprocess) {
+            ComPtr<IDxcBlobUtf8> text; compileResult->GetOutput(DXC_OUT_HLSL, IID_PPV_ARGS(&text), nullptr);
+            if (text) invocation.text.assign(text->GetStringPointer(), text->GetStringLength());
+            invocation.succeeded = !invocation.text.empty();
+            return invocation;
+        }
+        ComPtr<IDxcBlob> object; compileResult->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&object), nullptr);
+        if (!object) { invocation.diagnostics += "\nDXC produced no object"; return invocation; }
+        const auto* first = static_cast<const std::byte*>(object->GetBufferPointer());
+        invocation.binary.assign(first, first + object->GetBufferSize());
+        invocation.succeeded = true;
+        return invocation;
     }
 
-    std::filesystem::path CachePath(uint64_t key) const {
-        char name[32]{}; std::snprintf(name, sizeof(name), "%016llx.orgshader", static_cast<unsigned long long>(key)); return cacheDirectory_ / name;
-    }
-    bool Load(uint64_t key, ShaderBinaryFormat format, ShaderArtifact& artifact) const {
-        if (cacheDirectory_.empty()) return false;
-        std::ifstream stream(CachePath(key), std::ios::binary); CacheHeader header{};
-        if (!stream.read(reinterpret_cast<char*>(&header), sizeof(header)) || header.magic != CacheHeader{}.magic ||
-            header.version != 1 || header.key != key || header.format != static_cast<uint8_t>(format) || header.size > (1ull << 32)) return false;
-        artifact.binary.resize(static_cast<size_t>(header.size));
-        if (!stream.read(reinterpret_cast<char*>(artifact.binary.data()), static_cast<std::streamsize>(artifact.binary.size()))) return false;
-        artifact.key = key; artifact.format = format; artifact.fromCache = true; return true;
-    }
-    void Store(const ShaderArtifact& artifact) const {
-        if (cacheDirectory_.empty() || !artifact) return;
-        // A temporary of its own: two compiles of one key (different requesters) must not write or rename one file, nor a later process
-        // reuse one a killed process left (the counter restarts; under usvfs the rename onto a left temporary's name faulted).
-        static std::atomic<uint64_t> stores{ 0 };
-#if defined(_WIN32)
-        const auto process = static_cast<unsigned long>(GetCurrentProcessId());
-#else
-        const auto process = static_cast<unsigned long>(getpid());
-#endif
-        const auto destination = CachePath(artifact.key); auto temporary = destination;
-        temporary += "." + std::to_string(process) + "-" + std::to_string(stores.fetch_add(1, std::memory_order_relaxed)) + ".tmp";
-        std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
-        CacheHeader header{}; header.format = static_cast<uint8_t>(artifact.format); header.key = artifact.key; header.size = artifact.binary.size();
-        stream.write(reinterpret_cast<const char*>(&header), sizeof(header));
-        stream.write(reinterpret_cast<const char*>(artifact.binary.data()), static_cast<std::streamsize>(artifact.binary.size())); stream.close();
-        // The publication, one at a time: a file system hook in the path (Mod Organizer's usvfs, which redirects Data/) is not safe
-        // under concurrent renames and faulted in MoveFileExW during a full recompile. The host's rename when it has one (its own
-        // renames are serialized with these), else among the compiler's. A rename is rare and short.
-        const auto rename = [&](std::error_code& a_ec) {
-            if (rename_) { rename_(temporary, destination, a_ec); return; }
-            static std::mutex publication;
-            std::scoped_lock lock(publication);
-            std::filesystem::rename(temporary, destination, a_ec);
-        };
-        std::error_code ec; rename(ec);
-        if (ec) { std::filesystem::remove(destination, ec); ec.clear(); rename(ec); }
-        if (ec) std::filesystem::remove(temporary, ec);
-    }
+    // What the store runs when it cannot use a saved artifact.
+    class Build final : public ShaderVariantBuild {
+    public:
+        Build(Impl& impl, const CompileArguments& arguments, ShaderBinaryFormat format) : impl_(impl), arguments_(arguments), format_(format) {}
+
+        ShaderPreprocessOutput Preprocess(const std::string* root, ShaderIncludeTracker& includes) override {
+            auto invocation = impl_.Invoke(arguments_, root, includes, true);
+            ShaderPreprocessOutput output;
+            output.succeeded = invocation.succeeded;
+            // Nothing from DXC means something is wrong with DXC, and may not happen next time. An error message is about the shader.
+            output.transientFailure = !invocation.succeeded && (!invocation.started || invocation.diagnostics.empty());
+            output.text = std::move(invocation.text);
+            output.diagnostics = std::move(invocation.diagnostics);
+            return output;
+        }
+
+        ShaderCompileOutput Compile(const std::string* root, const ShaderPreprocessOutput&, ShaderIncludeTracker& includes) override {
+            auto invocation = impl_.Invoke(arguments_, root, includes, false);
+            ShaderCompileOutput output;
+            output.succeeded = invocation.succeeded;
+            output.transientFailure = !invocation.succeeded && (!invocation.started || invocation.diagnostics.empty());
+            output.binary = std::move(invocation.binary);
+            output.diagnostics = std::move(invocation.diagnostics);
+            if (output.succeeded && format_ == ShaderBinaryFormat::Dxil && output.binary.size() >= 20 && std::memcmp(output.binary.data(), "DXBC", 4) == 0) {
+                bool unsignedContainer = true;
+                for (size_t index = 4; index < 20; ++index)
+                    unsignedContainer &= output.binary[index] == std::byte{};
+                if (unsignedContainer) {
+                    // A missing DLL, not a problem with the shader: installing dxil.dll must not need the cache cleared.
+                    output.succeeded = false;
+                    output.transientFailure = true;
+                    output.binary.clear();
+                    output.diagnostics += "\nDXC produced unsigned DXIL; ensure the matching dxil.dll validator is available beside dxcompiler.dll";
+                }
+            }
+            return output;
+        }
+
+    private:
+        Impl& impl_;
+        const CompileArguments& arguments_;
+        ShaderBinaryFormat format_;
+    };
 
     ShaderArtifact CompileOwned(ShaderCompileRequest request, std::vector<std::byte> source, uint64_t key) {
         request.source = source;
         ShaderArtifact result{ key, request.format };
         { std::scoped_lock lock(mutex_); if (auto found = memory_.find(key); found != memory_.end()) { result = found->second; result.fromCache = true; return result; } }
-        if (Load(key, request.format, result)) { std::scoped_lock lock(mutex_); memory_[key] = result; return result; }
         if (!compiler_ || !utils_) { result.diagnostics = "dxcompiler.dll is unavailable"; return result; }
 #if !defined(ORG_MODULE_SERVICES_HAS_SPIRV)
         if (request.format == ShaderBinaryFormat::Spirv) { result.diagnostics = "SPIR-V support was not compiled into ORGModuleServices"; return result; }
 #endif
-        ComPtr<IDxcBlobEncoding> sourceBlob;
-        if (FAILED(utils_->CreateBlob(source.data(), static_cast<UINT32>(source.size()), DXC_CP_UTF8, &sourceBlob))) {
-            result.diagnostics = "DXC failed to create the source blob"; return result;
-        }
-        DxcBuffer buffer{ sourceBlob->GetBufferPointer(), sourceBlob->GetBufferSize(), DXC_CP_UTF8 };
-        std::vector<std::wstring> owned;
-        owned.emplace_back(L"-E"); owned.push_back(request.entryPoint); owned.emplace_back(L"-T"); owned.push_back(request.target);
-        owned.emplace_back(L"-HV"); owned.push_back(request.languageVersion.empty() ? std::wstring(L"2021") : request.languageVersion);
-        if (request.warningsAsErrors) owned.emplace_back(L"-WX");
-        // SPIR-V gets -Zi's OpSource (every file's text embedded) and OpLine, which Nsight and RenderDoc
-        // read; -Qembed_debug is the DXIL container's equivalent. Not -fspv-debug=vulkan[-with-source]:
-        // its DebugValues keep dead loads alive, which changes the resources a stage uses, and DXC 1.9's
-        // validator rejects some of its scopes against the embedded text.
-        if (request.debugInfo) {
-            owned.emplace_back(L"-Zi");
-            if (request.format == ShaderBinaryFormat::Dxil) owned.emplace_back(L"-Qembed_debug");
-        }
-        // Same SPIR-V ABI as BasicRHI's Vulkan backend expects (descriptor-heap bindings, DX layout).
-        if (request.format == ShaderBinaryFormat::Spirv) rhi::AppendVulkanDxcSpirvArguments(owned);
-        for (const auto& define : request.defines) owned.push_back(L"-D" + define.name + (define.value.empty() ? L"" : L"=" + define.value));
-		for (const auto& directory : request.includeDirectories) { owned.emplace_back(L"-I"); owned.push_back(directory.wstring()); }
-        owned.insert(owned.end(), request.arguments.begin(), request.arguments.end());
-        // The positional argument names the main file for diagnostics, debug info and relative includes.
-        if (!request.sourceName.empty()) owned.emplace_back(request.sourceName.begin(), request.sourceName.end());
-        std::vector<const wchar_t*> arguments; arguments.reserve(owned.size()); for (const auto& value : owned) arguments.push_back(value.c_str());
-        ComPtr<IDxcResult> compileResult;
-		ComPtr<IDxcIncludeHandler> includeHandler;
-		if ((!request.includeDirectories.empty() && FAILED(utils_->CreateDefaultIncludeHandler(&includeHandler))) ||
-			FAILED(compiler_->Compile(&buffer, arguments.data(), static_cast<UINT32>(arguments.size()), includeHandler.Get(), IID_PPV_ARGS(&compileResult)))) {
-            result.diagnostics = "DXC invocation failed"; return result;
-        }
-        ComPtr<IDxcBlobUtf8> errors; compileResult->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
-        if (errors && errors->GetStringLength()) result.diagnostics.assign(errors->GetStringPointer(), errors->GetStringLength());
-        HRESULT status{}; compileResult->GetStatus(&status); if (FAILED(status)) return result;
-        ComPtr<IDxcBlob> object; compileResult->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&object), nullptr);
-        if (!object) { result.diagnostics += "\nDXC produced no object"; return result; }
-		const auto* first = static_cast<const std::byte*>(object->GetBufferPointer());
-		if (request.format == ShaderBinaryFormat::Dxil && object->GetBufferSize() >= 20 &&
-			std::memcmp(first, "DXBC", 4) == 0) {
-			bool unsignedContainer = true;
-			for (size_t index = 4; index < 20; ++index)
-				unsignedContainer &= first[index] == std::byte{};
-			if (unsignedContainer) {
-				result.diagnostics += "\nDXC produced unsigned DXIL; ensure the matching dxil.dll validator is available beside dxcompiler.dll";
-				return result;
-			}
-		}
-		result.binary.assign(first, first + object->GetBufferSize());
-        Store(result); { std::scoped_lock lock(mutex_); memory_[key] = result; } return result;
+        const auto arguments = BuildArguments(request);
+        Build build(*this, arguments, request.format);
+        ShaderVariantRequest variant;
+        variant.variantKey = VariantKey(arguments, request.format);
+        variant.compileConfigKey = CompileConfigKey(arguments, request.format);
+        variant.debug = request.debugInfo;
+        variant.format = static_cast<uint8_t>(request.format);
+        variant.rootPath = request.sourceName;
+        variant.rootBytes = source;
+        variant.hasRootBytes = true;
+        variant.build = &build;
+        auto resolved = store_->Resolve(variant);
+        result.diagnostics = std::move(resolved.diagnostics);
+        if (resolved.outcome == ShaderStoreOutcome::Failed) return result;
+        result.binary = std::move(resolved.binary);
+        result.fromCache = resolved.outcome != ShaderStoreOutcome::Compiled;
+        { std::scoped_lock lock(mutex_); memory_[key] = result; }
+        return result;
     }
 
-    std::filesystem::path cacheDirectory_;
-    RenameFile rename_;
+    std::shared_ptr<ShaderStore> store_;
+    std::string compilerIdentity_;
     ModuleHandle module_{};
 	ModuleHandle validatorModule_{};
     ComPtr<IDxcUtils> utils_;
@@ -350,26 +402,16 @@ public:
     std::unordered_map<uint64_t, ShaderArtifact> memory_;
     std::unordered_map<uint64_t, std::shared_ptr<Flight>> flights_;
     Submit submit_;
-	uint64_t compilerFingerprint_{ 1469598103934665603ULL };
-	struct DependencyEntry { uint64_t size{}; int64_t stamp{}; uint64_t hash{}; };
-	mutable std::mutex dependencyMutex_;
-	mutable std::unordered_map<std::filesystem::path::string_type, DependencyEntry> dependencies_;
 };
 
-ShaderCompiler::ShaderCompiler(std::filesystem::path path, std::filesystem::path compilerDirectory, RenameFile rename) :
-    impl_(std::make_shared<Impl>(std::move(path), compilerDirectory, std::move(rename))) {}
+ShaderCompiler::ShaderCompiler(std::filesystem::path cacheDirectory, std::filesystem::path compilerDirectory, std::shared_ptr<ShaderStore> store) :
+    impl_(std::make_shared<Impl>(cacheDirectory, compilerDirectory, std::move(store))) {}
 ShaderCompiler::~ShaderCompiler() = default;
 ShaderCompiler::ShaderCompiler(ShaderCompiler&&) noexcept = default;
 ShaderCompiler& ShaderCompiler::operator=(ShaderCompiler&&) noexcept = default;
 bool ShaderCompiler::Available() const noexcept { return impl_ && impl_->compiler_; }
 uint64_t ShaderCompiler::BuildKey(const ShaderCompileRequest& request) const noexcept { return impl_->Key(request); }
-uint64_t ShaderCompiler::FingerprintInputs(std::span<const std::byte> source, const std::vector<std::filesystem::path>& dependencyFiles) const noexcept {
-    BT_ZONE_SCOPE("ORG.ShaderCompiler.FingerprintInputs");
-    uint64_t hash = HashBytes(1469598103934665603ULL, source.data(), source.size());
-    for (const auto& dependency : dependencyFiles) { hash = HashPath(hash, dependency); hash = HashValue(hash, impl_->DependencyHash(dependency)); }
-    // Never zero, which means "none" in a request.
-    return hash ? hash : 1;
-}
+ShaderStore& ShaderCompiler::Store() const noexcept { return *impl_->store_; }
 
 std::shared_future<ShaderArtifact> ShaderCompiler::CompileAsync(ShaderCompileRequest request) { return CompileAsync(std::move(request), {}); }
 

@@ -12,6 +12,7 @@ option(ORG_MODULE_SERVICES_ENABLE_ASYNC_STATE_GRAPH "Build the shared CPU depend
 # Backend-independent coordination and immutable slot ownership. Kept separate
 # from shader/RHI services so CPU-only consumers and tests need no device.
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/AsyncRuntime.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/ShaderStore.cmake)
 if(ORG_MODULE_SERVICES_ENABLE_ASYNC_STATE_GRAPH)
     include(${CMAKE_CURRENT_LIST_DIR}/cmake/AsyncStateGraph.cmake)
 endif()
@@ -33,7 +34,7 @@ target_compile_features(ORGModuleServices PUBLIC cxx_std_20)
 target_include_directories(ORGModuleServices PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
-target_link_libraries(ORGModuleServices PUBLIC BasicRHI::BasicRHI OpenRenderGraph::OpenRenderGraph)
+target_link_libraries(ORGModuleServices PUBLIC BasicRHI::BasicRHI OpenRenderGraph::OpenRenderGraph ORGModuleServices::ShaderStore)
 target_compile_definitions(ORGModuleServices PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 
 if(ORG_MODULE_SERVICES_ENABLE_DXC)
@@ -60,12 +61,13 @@ if(ORG_MODULE_SERVICES_BUILD_TESTS)
     add_subdirectory(tests/Services)
     add_subdirectory(tests/Growth)
     add_subdirectory(tests/Buffers)
+    add_subdirectory(tests/ShaderStore)
     add_executable(ORGModuleServicesTests tests/ServicesTests.cpp)
     target_link_libraries(ORGModuleServicesTests PRIVATE ORGModuleServices::ORGModuleServices)
     add_test(NAME ORGModuleServicesTests COMMAND ORGModuleServicesTests)
 endif()
 
-install(TARGETS ORGModuleServices EXPORT ORGModuleServicesTargets
+install(TARGETS ORGModuleServices ORGShaderStore EXPORT ORGModuleServicesTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})

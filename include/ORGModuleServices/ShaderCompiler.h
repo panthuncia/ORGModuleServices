@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <ORGModuleServices/ServiceExecutor.h>
+#include <ORGModuleServices/ShaderStore.h>
 
 namespace org::services {
 
@@ -27,7 +28,6 @@ struct ShaderCompileRequest {
     std::vector<ShaderDefine> defines;
     std::vector<std::wstring> arguments;
 	std::vector<std::filesystem::path> includeDirectories;
-	std::vector<std::filesystem::path> dependencyFiles;
     ShaderBinaryFormat format{ ShaderBinaryFormat::Dxil };
     // DXC -HV: 2018 keeps the pre-2021 semantics (vector ternaries, ...) that FXC-era sources rely on.
     std::wstring languageVersion{ L"2021" };
@@ -35,11 +35,6 @@ struct ShaderCompileRequest {
     // every source file's text embedded. sourceName is the file name the debug info and diagnostics refer to.
     bool debugInfo{};
     bool warningsAsErrors{ true };
-    // When nonzero: ShaderCompiler::FingerprintInputs of this source and these dependency files, taken by the caller while
-    // they were current. The key uses it instead of hashing the source and checking every dependency file again: a
-    // permutation set shares both, and a key otherwise costs a read of every dependency's attributes (slow through a
-    // virtual file system), per permutation.
-    uint64_t inputsFingerprint{};
 };
 
 struct ShaderArtifact {
@@ -62,12 +57,9 @@ public:
     // order applies, then the directory of the module this library is linked into. In-process
     // hosts (game plugins) should pass it: another dxcompiler.dll, possibly without SPIR-V support,
     // may already be loaded by basename.
-    // Renames a written cache file onto its key's (replacing it). A host whose other code renames files too passes its own, so
-    // that a file system hook unsafe under concurrent renames (Mod Organizer's usvfs) sees one at a time across the process.
-    // Without one, the compiler's renames are serialized among themselves.
-    using RenameFile = std::function<void(const std::filesystem::path& from, const std::filesystem::path& to, std::error_code& ec)>;
-
-    explicit ShaderCompiler(std::filesystem::path cacheDirectory = {}, std::filesystem::path compilerDirectory = {}, RenameFile rename = {});
+    // store: the persistent cache, for a host that shares one with other compilers. Without one the compiler makes its own in
+    // cacheDirectory, with source paths relative to the working directory. An empty cacheDirectory means nothing is saved.
+    explicit ShaderCompiler(std::filesystem::path cacheDirectory = {}, std::filesystem::path compilerDirectory = {}, std::shared_ptr<ShaderStore> store = {});
     ~ShaderCompiler();
     ShaderCompiler(ShaderCompiler&&) noexcept;
     ShaderCompiler& operator=(ShaderCompiler&&) noexcept;
@@ -75,10 +67,10 @@ public:
     ShaderCompiler& operator=(const ShaderCompiler&) = delete;
 
     bool Available() const noexcept;
+    // Identifies this request's result in memory. Only good for the store's current generation.
     uint64_t BuildKey(const ShaderCompileRequest& request) const noexcept;
-    // The source's contents and every dependency's, for ShaderCompileRequest::inputsFingerprint. A dependency's contents are
-    // re-read only when its size or write time changed since the compiler last hashed it.
-    uint64_t FingerprintInputs(std::span<const std::byte> source, const std::vector<std::filesystem::path>& dependencyFiles) const noexcept;
+    // The persistent cache, for its statistics and for starting a new generation when source files may have changed.
+    ShaderStore& Store() const noexcept;
     std::shared_future<ShaderArtifact> CompileAsync(ShaderCompileRequest request);
     // As above, and invokes onComplete exactly once with the artifact, after it is available through the returned
     // future, never while the compiler holds a lock of its own (it may call back into the compiler):

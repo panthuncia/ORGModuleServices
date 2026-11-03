@@ -56,6 +56,13 @@ Renderer-free graph tests live in `tests/StateGraph`. They accept
 A publication exchange does not validate GPU readiness or reserve execution slots; its consumer
 must do that in its nonblocking acceptance predicate before claiming native work.
 
+## Shader store
+
+`ORGModuleServices::ShaderStore` is a persistent shader cache that needs no renderer, RHI or compiler. A saved shader
+is used only when every file it read last time still has the same contents, so file times do not matter and a
+rebuild has a stated reason. `ShaderCompiler` uses it for DXC, and a host can give it other compilers through
+`ShaderVariantBuild`. Tests: `tests/ShaderStore` (engine, with a fake compiler) and `tests/Services` (real DXC).
+
 ## Growable buffer sets
 
 `GrowableBufferSet.h` holds growable GPU buffers that one sealed set names (a host's snapshot): requirement -> one growth batch as

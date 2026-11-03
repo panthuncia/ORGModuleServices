@@ -11,9 +11,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -443,6 +447,243 @@ void ShaderCompilerOutlivedByQueuedWork() {
     }
     CHECK(executor.Drain() == 1); CHECK(calls == 1); CHECK(IsReady(future));
 }
+
+// The cache as the compiler uses it: real DXC, real files, and a new compiler for each "boot".
+namespace cache {
+
+namespace fs = std::filesystem;
+
+struct Folder {
+    Folder() {
+        static std::atomic<int> counter{};
+        root = fs::temp_directory_path() / ("org_compiler_cache_test_" + std::to_string(++counter));
+        fs::remove_all(root);
+        Write("Shaders/Root.hlsl", "#include \"Common/Value.hlsli\"\nfloat4 main() : SV_Target { return Value(); }\n");
+        Write("Shaders/Common/Value.hlsli", "float4 Value() { return float4(1, 2, 3, 4); }\n");
+    }
+    ~Folder() { std::error_code ec; fs::remove_all(root, ec); }
+    fs::path root;
+    void Write(const std::string& relative, const std::string& text) const {
+        fs::create_directories((root / relative).parent_path());
+        std::ofstream(root / relative, std::ios::binary | std::ios::trunc) << text;
+    }
+    std::shared_ptr<org::services::ShaderStore> Store(bool persistent = true) const {
+        org::services::ShaderStoreOptions options;
+        options.sourceRoot = root;
+        options.cacheDirectory = root / "Cache";
+        options.saveInterval = std::chrono::milliseconds(0);
+        options.persistent = persistent;
+        return std::make_shared<org::services::ShaderStore>(std::move(options));
+    }
+    org::services::ShaderCompileRequest Request(const std::string& source, std::vector<org::services::ShaderDefine> defines = {}, bool debug = false) const {
+        org::services::ShaderCompileRequest request;
+        request.sourceName = (root / "Shaders" / "Root.hlsl").generic_string();
+        request.source = std::as_bytes(std::span(source));
+        request.entryPoint = L"main";
+        request.target = L"ps_6_0";
+        request.warningsAsErrors = false;
+        request.includeDirectories = { root / "Shaders" };
+        request.defines = std::move(defines);
+        request.debugInfo = debug;
+        return request;
+    }
+    std::string RootSource() const {
+        std::ifstream stream(root / "Shaders/Root.hlsl", std::ios::binary);
+        return { std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>() };
+    }
+};
+
+struct Boot {
+    explicit Boot(const Folder& folder, bool persistent = true) : store(folder.Store(persistent)), compiler({}, CompilerDirectory(), store) {}
+    uint64_t Stat(uint64_t org::services::ShaderStoreStats::*field) const { return store->Stats().*field; }
+    std::shared_ptr<org::services::ShaderStore> store;
+    org::services::ShaderCompiler compiler;
+};
+
+}  // namespace cache
+
+void CacheSecondBootDoesNoWork() {
+    if (!shaderCompilesSucceed) return;
+    cache::Folder folder;
+    const auto source = folder.RootSource();
+    org::services::ShaderArtifact first;
+    {
+        cache::Boot boot(folder);
+        first = boot.compiler.Compile(folder.Request(source));
+        CHECK(first); CHECK(!first.fromCache);
+        CHECK(boot.store->Stats().compiled == 1);
+    }
+    cache::Boot boot(folder);
+    const auto second = boot.compiler.Compile(folder.Request(source));
+    CHECK(second); CHECK(second.fromCache);
+    CHECK(second.binary == first.binary);
+    const auto stats = boot.store->Stats();
+    CHECK(stats.hits == 1); CHECK(stats.compiled == 0); CHECK(stats.preprocessed == 0);
+}
+
+void CacheIncludeEditsThroughRealCompiler() {
+    if (!shaderCompilesSucceed) return;
+    cache::Folder folder;
+    const auto source = folder.RootSource();
+    org::services::ShaderArtifact original;
+    { cache::Boot boot(folder); original = boot.compiler.Compile(folder.Request(source)); CHECK(original); }
+    // A comment is a real file change that does not change the code: preprocess, no compile, the same bytes.
+    folder.Write("Shaders/Common/Value.hlsli", "// a comment\n\nfloat4 Value() { return float4(1, 2, 3, 4); }\n");
+    {
+        cache::Boot boot(folder);
+        const auto artifact = boot.compiler.Compile(folder.Request(source));
+        CHECK(artifact.binary == original.binary);
+        const auto stats = boot.store->Stats();
+        CHECK(stats.absorbed == 1); CHECK(stats.compiled == 0); CHECK(stats.preprocessed == 1);
+    }
+    // A real edit compiles and the output changes.
+    folder.Write("Shaders/Common/Value.hlsli", "float4 Value() { return float4(5, 6, 7, 8); }\n");
+    {
+        cache::Boot boot(folder);
+        const auto artifact = boot.compiler.Compile(folder.Request(source));
+        CHECK(artifact); CHECK(artifact.binary != original.binary);
+        CHECK(boot.store->Stats().compiled == 1);
+    }
+    // Reverting finds the first artifact without a compile.
+    folder.Write("Shaders/Common/Value.hlsli", "float4 Value() { return float4(1, 2, 3, 4); }\n");
+    {
+        cache::Boot boot(folder);
+        CHECK(boot.compiler.Compile(folder.Request(source)).binary == original.binary);
+        CHECK(boot.store->Stats().compiled == 0);
+    }
+}
+
+void CacheRecordsMissingIncludePaths() {
+    if (!shaderCompilesSucceed) return;
+    // DXC tries the including file's folder first. A new file there must take over, and only the recorded miss can show it.
+    cache::Folder folder;
+    folder.Write("Shaders/Root.hlsl", "#include \"Common/Outer.hlsli\"\nfloat4 main() : SV_Target { return Outer(); }\n");
+    folder.Write("Shaders/Common/Outer.hlsli", "#include \"Value.hlsli\"\nfloat4 Outer() { return Value(); }\n");
+    folder.Write("Shaders/Value.hlsli", "float4 Value() { return float4(1, 1, 1, 1); }\n");
+    cache::fs::remove(folder.root / "Shaders/Common/Value.hlsli");
+    const auto source = folder.RootSource();
+    org::services::ShaderArtifact original;
+    { cache::Boot boot(folder); original = boot.compiler.Compile(folder.Request(source)); CHECK(original); }
+    folder.Write("Shaders/Common/Value.hlsli", "float4 Value() { return float4(9, 9, 9, 9); }\n");
+    cache::Boot boot(folder);
+    const auto artifact = boot.compiler.Compile(folder.Request(source));
+    CHECK(artifact); CHECK(artifact.binary != original.binary);
+    CHECK(boot.store->Stats().misses[static_cast<size_t>(org::services::ShaderStoreMiss::DependencyChanged)] == 1);
+}
+
+void CacheSeparatesVariantsAndSharesEqualOutput() {
+    if (!shaderCompilesSucceed) return;
+    cache::Folder folder;
+    folder.Write("Shaders/Root.hlsl", "#include \"Common/Value.hlsli\"\nfloat4 main() : SV_Target {\n#ifdef DOUBLE\n return Value() * 2;\n#else\n return Value();\n#endif\n}\n");
+    const auto source = folder.RootSource();
+    cache::Boot boot(folder);
+    const auto plain = boot.compiler.Compile(folder.Request(source));
+    const auto doubled = boot.compiler.Compile(folder.Request(source, { { L"DOUBLE", L"" } }));
+    CHECK(plain); CHECK(doubled); CHECK(plain.binary != doubled.binary);
+    // A define the shader never reads gives the same text, so it shares the artifact.
+    const auto unused = boot.compiler.Compile(folder.Request(source, { { L"UNUSED", L"1" } }));
+    CHECK(unused.binary == plain.binary);
+    const auto stats = boot.store->Stats();
+    CHECK(stats.compiled == 2); CHECK(stats.absorbed == 1);
+}
+
+void CacheDebugBuildsRebuildOnCommentEdits() {
+    if (!shaderCompilesSucceed) return;
+    cache::Folder folder;
+    const auto source = folder.RootSource();
+    { cache::Boot boot(folder); CHECK(boot.compiler.Compile(folder.Request(source, {}, true))); }
+    folder.Write("Shaders/Common/Value.hlsli", "// comment\nfloat4 Value() { return float4(1, 2, 3, 4); }\n");
+    cache::Boot boot(folder);
+    CHECK(boot.compiler.Compile(folder.Request(source, {}, true)));
+    CHECK(boot.store->Stats().compiled == 1);
+}
+
+void CacheRememberedFailureKeepsItsMessage() {
+    if (!shaderCompilesSucceed) return;
+    cache::Folder folder;
+    folder.Write("Shaders/Common/Value.hlsli", "float4 Value() { return not_a_thing; }\n");
+    const auto source = folder.RootSource();
+    std::string message;
+    {
+        cache::Boot boot(folder);
+        const auto artifact = boot.compiler.Compile(folder.Request(source));
+        CHECK(!artifact); CHECK(!artifact.diagnostics.empty());
+        message = artifact.diagnostics;
+        CHECK(boot.store->Stats().failed == 1);
+    }
+    {
+        cache::Boot boot(folder);
+        const auto artifact = boot.compiler.Compile(folder.Request(source));
+        CHECK(!artifact); CHECK(artifact.diagnostics == message);
+        const auto stats = boot.store->Stats();
+        CHECK(stats.failuresFromCache == 1); CHECK(stats.preprocessed == 0);
+    }
+    // A missing include fails in preprocessing, and is remembered the same way.
+    folder.Write("Shaders/Root.hlsl", "#include \"Common/Missing.hlsli\"\nfloat4 main() : SV_Target { return 0; }\n");
+    const auto broken = folder.RootSource();
+    { cache::Boot boot(folder); CHECK(!boot.compiler.Compile(folder.Request(broken))); }
+    {
+        cache::Boot boot(folder);
+        CHECK(!boot.compiler.Compile(folder.Request(broken)));
+        CHECK(boot.store->Stats().failuresFromCache == 1);
+    }
+    folder.Write("Shaders/Common/Missing.hlsli", "\n");
+    {
+        cache::Boot boot(folder);
+        CHECK(boot.compiler.Compile(folder.Request(broken)));
+        CHECK(boot.store->Stats().compiled == 1);
+    }
+}
+
+void CacheGenerationEndsMemoryResults() {
+    if (!shaderCompilesSucceed) return;
+    // A hot reload: the same compiler and the same request must see an edited include after a new generation, and not before.
+    cache::Folder folder;
+    const auto source = folder.RootSource();
+    cache::Boot boot(folder);
+    const auto first = boot.compiler.Compile(folder.Request(source));
+    folder.Write("Shaders/Common/Value.hlsli", "float4 Value() { return float4(5, 6, 7, 8); }\n");
+    CHECK(boot.compiler.Compile(folder.Request(source)).binary == first.binary);
+    boot.store->BeginGeneration();
+    const auto second = boot.compiler.Compile(folder.Request(source));
+    CHECK(second); CHECK(second.binary != first.binary);
+}
+
+void CacheChangedRootBytesAreNotAHit() {
+    if (!shaderCompilesSucceed) return;
+    // Generated sources: same name and arguments, different bytes.
+    cache::Folder folder;
+    const std::string one = "float4 main() : SV_Target { return 1; }\n", two = "float4 main() : SV_Target { return 2; }\n";
+    org::services::ShaderArtifact first;
+    { cache::Boot boot(folder); first = boot.compiler.Compile(folder.Request(one)); CHECK(first); }
+    cache::Boot boot(folder);
+    const auto second = boot.compiler.Compile(folder.Request(two));
+    CHECK(second); CHECK(second.binary != first.binary);
+    CHECK(boot.store->Stats().misses[static_cast<size_t>(org::services::ShaderStoreMiss::RootChanged)] == 1);
+}
+
+void CacheConcurrentVariantsThroughThePool() {
+    if (!shaderCompilesSucceed) return;
+    cache::Folder folder;
+    const auto source = folder.RootSource();
+    cache::Boot boot(folder);
+    std::vector<std::shared_future<org::services::ShaderArtifact>> futures;
+    for (int i = 0; i < 16; ++i)
+        futures.push_back(boot.compiler.CompileAsync(folder.Request(source, { { L"UNUSED", std::to_wstring(i) } })));
+    for (auto& future : futures) CHECK(future.get());
+    // All have the same text, so one compile serves them.
+    const auto stats = boot.store->Stats();
+    CHECK(stats.compiled == 1); CHECK(stats.absorbed == 15);
+    for (auto& future : futures) CHECK(future.get().binary == futures[0].get().binary);
+}
+
+void CacheNotPersistentSavesNothing() {
+    if (!shaderCompilesSucceed) return;
+    cache::Folder folder;
+    const auto source = folder.RootSource();
+    { cache::Boot boot(folder, false); CHECK(boot.compiler.Compile(folder.Request(source))); }
+    CHECK(!cache::fs::exists(folder.root / "Cache"));
+}
 #endif
 
 struct Test { const char* name; void (*run)(); };
@@ -465,6 +706,16 @@ int main() {
         { "ShaderFixedPoolAndNoLibraryThreads", ShaderFixedPoolAndNoLibraryThreads },
         { "ShaderConcurrentJoiners", ShaderConcurrentJoiners },
         { "ShaderCompilerOutlivedByQueuedWork", ShaderCompilerOutlivedByQueuedWork },
+        { "CacheSecondBootDoesNoWork", CacheSecondBootDoesNoWork },
+        { "CacheIncludeEditsThroughRealCompiler", CacheIncludeEditsThroughRealCompiler },
+        { "CacheRecordsMissingIncludePaths", CacheRecordsMissingIncludePaths },
+        { "CacheSeparatesVariantsAndSharesEqualOutput", CacheSeparatesVariantsAndSharesEqualOutput },
+        { "CacheDebugBuildsRebuildOnCommentEdits", CacheDebugBuildsRebuildOnCommentEdits },
+        { "CacheRememberedFailureKeepsItsMessage", CacheRememberedFailureKeepsItsMessage },
+        { "CacheGenerationEndsMemoryResults", CacheGenerationEndsMemoryResults },
+        { "CacheChangedRootBytesAreNotAHit", CacheChangedRootBytesAreNotAHit },
+        { "CacheConcurrentVariantsThroughThePool", CacheConcurrentVariantsThroughThePool },
+        { "CacheNotPersistentSavesNothing", CacheNotPersistentSavesNothing },
 #endif
     };
 #if !defined(ORG_MODULE_SERVICES_HAS_DXC)
