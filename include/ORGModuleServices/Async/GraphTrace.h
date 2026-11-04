@@ -26,6 +26,8 @@ struct AsyncStateGraphTraceConfig {
 	AsyncStateGraphTraceDetail detail = AsyncStateGraphTraceDetail::Lifecycle;
     bool includeDependencyEvents = true;
     bool includeRetentionEvents = true;
+    // Adds several events per scheduler task. Off by default: a Tracy capture shows the same work.
+    bool includeSchedulerEvents = false;
 	// Empty/unfiltered traces retain the existing all-artifact behavior. Focused
 	// captures can select kinds without adding work to the trace-off path.
 	bool filterArtifactKinds = false;

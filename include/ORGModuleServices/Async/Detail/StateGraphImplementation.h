@@ -45,21 +45,7 @@ using TaskTraceEvent = org::async::TaskTraceEvent;
 namespace state_graph_detail {
 
 inline std::uint64_t CurrentThreadCpuMicros() noexcept {
-#ifdef _WIN32
-	FILETIME created{}, exited{}, kernel{}, user{};
-	if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) return 0;
-	ULARGE_INTEGER kernelTicks{}, userTicks{};
-	kernelTicks.LowPart = kernel.dwLowDateTime;
-	kernelTicks.HighPart = kernel.dwHighDateTime;
-	userTicks.LowPart = user.dwLowDateTime;
-	userTicks.HighPart = user.dwHighDateTime;
-	return (kernelTicks.QuadPart + userTicks.QuadPart) / 10u;
-#else
-	timespec value{};
-	if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) return 0;
-	return static_cast<std::uint64_t>(value.tv_sec) * 1'000'000u +
-		static_cast<std::uint64_t>(value.tv_nsec / 1'000u);
-#endif
+	return basic_telemetry::CurrentThreadCpuTimeNs() / 1'000u;
 }
 }
 
@@ -644,12 +630,24 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
                 view->desired = value.desired;
                 view->error = value.error;
                 view->stateSince = value.stateSince;
-                view->requirements = std::make_shared<const std::vector<ArtifactRequirement>>(
-                    value.requirements);
-                view->blockers.reserve(value.requirements.size());
-                for (const auto& requirement : value.requirements) {
-                    view->blockers.emplace_back(requirement.key,
-                        DiagnosticRequirementSatisfied(value, requirement));
+                // Only Diagnose reads these, and a node past its dependency check has
+                // no blockers to report (a missing entry reads as satisfied). Most
+                // publishes are such transitions, so resolving every requirement
+                // here would dominate the drain.
+                const bool dependenciesResolved = value.state == ArtifactReadiness::Queued ||
+                    value.state == ArtifactReadiness::Preparing ||
+                    value.state == ArtifactReadiness::CpuReady ||
+                    value.state == ArtifactReadiness::UploadSubmitted ||
+                    value.state == ArtifactReadiness::GpuReady ||
+                    value.state == ArtifactReadiness::Published;
+                if (!dependenciesResolved) {
+                    view->requirements = std::make_shared<const std::vector<ArtifactRequirement>>(
+                        value.requirements);
+                    view->blockers.reserve(value.requirements.size());
+                    for (const auto& requirement : value.requirements) {
+                        view->blockers.emplace_back(requirement.key,
+                            DiagnosticRequirementSatisfied(value, requirement));
+                    }
                 }
                 view->pendingSuccessors.reserve(value.successors.size());
                 for (const auto& successor : value.successors)
@@ -668,9 +666,9 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
                         std::move(snapshot) });
                 }
             }
-            for (const auto& [predicted, canonical] : generationAliases) {
-                if (predicted.address == key)
-                    view->aliases.emplace_back(predicted.generation, canonical.generation);
+            if (const auto aliases = generationAliasesByAddress.find(key);
+                aliases != generationAliasesByAddress.end()) {
+                view->aliases = aliases->second;
             }
             typename decltype(readModel)::accessor accessor;
             readModel.insert(accessor, key);
@@ -679,6 +677,7 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
         dirtyViews.clear();
     }
 
+    std::chrono::steady_clock::time_point lastStatsPublish{};
     void PublishStats() {
         auto snapshot = std::make_shared<AsyncStateGraphStats>(stats);
         snapshot->controlQueueWaitMicros = controlQueueWaitMicros.load(std::memory_order_relaxed);
@@ -708,6 +707,9 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
     // an ordinary version in a terminal state (see StoreRefusedVersion).
     std::unordered_map<StoredVersionKey, StoredVersionKey, typename StoredVersionKey::Hasher>
         generationAliases;
+    // The same aliases per address (predicted, canonical generation), for views.
+    std::unordered_map<ArtifactKey, std::vector<std::pair<std::uint64_t, std::uint64_t>>,
+        typename ArtifactKey::Hasher> generationAliasesByAddress;
     std::unordered_map<StoredVersionKey, ArtifactRequestStatus, typename StoredVersionKey::Hasher>
         refusalReasons;
     std::unordered_map<ArtifactKey, std::unordered_set<ArtifactKey, typename ArtifactKey::Hasher>, typename ArtifactKey::Hasher> waiters;
@@ -765,6 +767,12 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
 		bool afterEvaluation = false;
 	};
 	std::deque<PendingWaiterWake> pendingWaiterWakes;
+	// Wakes whose fan-out has not started. Consumers evaluate current state, so a queued
+	// wake already covers later transitions of its dependency. Without this, a dependency
+	// with thousands of waiters queues its whole fan-out once per transition, and every
+	// other edge in the graph waits behind them. Deque references survive push_back and
+	// pop_front, and an entry leaves this map before its wake can be popped.
+	std::unordered_map<ArtifactKey, PendingWaiterWake*, typename ArtifactKey::Hasher> queuedWaiterWakes;
 	bool wakingWaiters = false;
 	std::chrono::steady_clock::time_point nextStallDump{};
 	std::vector<ArtifactSnapshot> propagatedReady;
@@ -1864,6 +1872,21 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
         ++stats.cycles;
     }
 
+    // A Latest edge selects only versions that reached its milestone, so a failed
+    // cursor selects nothing and looks like a dependency still in progress. It is
+    // final once that cursor is the version the edge waits for, is still wanted, and
+    // has no successor that could satisfy the edge later.
+    bool LatestDependencyFailed(const ArtifactRequirement& requirement) const {
+        if (requirement.invalidation != DependencyInvalidationPolicy::Latest) return false;
+        const auto found = nodes.find(requirement.key);
+        if (found == nodes.end()) return false;
+        const auto& dependency = found->second;
+        return dependency.desired && dependency.terminalFailure &&
+            dependency.state == ArtifactReadiness::Failed &&
+            dependency.desiredRevision >= requirement.minimumRevision &&
+            dependency.successors.empty();
+    }
+
     bool RequirementSatisfied(const ArtifactRequirement& requirement) const {
         ++const_cast<Impl*>(this)->stats.dependencyEvaluations;
         ArtifactSnapshot currentSnapshot;
@@ -2151,11 +2174,17 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
 					continue;
 				ArtifactSnapshot currentSnapshot;
 				const auto* dependency = SelectSnapshot(requirement, currentSnapshot);
-				if (!dependency || (dependency->readiness != ArtifactReadiness::Failed &&
-					dependency->readiness != ArtifactReadiness::Cancelled &&
-					dependency->readiness != ArtifactReadiness::Superseded)) continue;
+				ArtifactReadiness terminal = ArtifactReadiness::Failed;
+				if (dependency) {
+					terminal = dependency->readiness;
+					if (terminal != ArtifactReadiness::Failed &&
+						terminal != ArtifactReadiness::Cancelled &&
+						terminal != ArtifactReadiness::Superseded) continue;
+				} else if (!LatestDependencyFailed(requirement)) {
+					continue;
+				}
 				node.error = std::format("required dependency {} terminated in state {}",
-					KeyString(requirement.key), ReadinessName(dependency->readiness));
+					KeyString(requirement.key), ReadinessName(terminal));
 				node.terminalFailure = true;
 				SetState(node, ArtifactReadiness::Failed);
 				++stats.failed;
@@ -2346,6 +2375,10 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
     void WakeWaiters(const ArtifactKey& key) {
         const auto found = waiters.find(key);
         if (found == waiters.end() || found->second.empty()) return;
+		if (const auto queued = queuedWaiterWakes.find(key); queued != queuedWaiterWakes.end()) {
+			queued->second->afterEvaluation = queued->second->afterEvaluation || wakingWaiters;
+			return;
+		}
 		PendingWaiterWake wake;
 		wake.dependency = key;
 		wake.afterEvaluation = wakingWaiters;
@@ -2353,6 +2386,7 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
 		wake.consumers.insert(wake.consumers.end(),
 			found->second.begin(), found->second.end());
 		pendingWaiterWakes.push_back(std::move(wake));
+		queuedWaiterWakes.insert_or_assign(key, std::addressof(pendingWaiterWakes.back()));
         }
 
     bool DependenciesStillMatch(const Completion& completion) const {
@@ -3067,10 +3101,13 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
 			publishedReady.push_back(std::move(publishedVersion));
 			if (std::chrono::steady_clock::now() - started >= maxDuration) break;
 		}
+		// Per-pass costs (views, reclaim, rescheduling) dwarf applying one completion,
+		// so a small batch spends the drain on bookkeeping. The time budget bounds the pass.
+		constexpr std::size_t kMaxCompletionsPerPass = 64;
 		std::vector<Completion> readyCompletions;
-		readyCompletions.reserve(16);
+		readyCompletions.reserve(kMaxCompletionsPerPass);
 		Completion readyCompletion;
-		while (readyCompletions.size() < 16 && completions.try_pop(readyCompletion)) {
+		while (readyCompletions.size() < kMaxCompletionsPerPass && completions.try_pop(readyCompletion)) {
 			completionCount.fetch_sub(1, std::memory_order_acq_rel);
 			if (readyCompletion.result.outcome == ArtifactBuildResult::Outcome::Ready &&
 				readyCompletion.result.gpuSubmissions) {
@@ -3236,15 +3273,26 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
 			// that made the dependency ready. Process it cooperatively so one
 			// aggregate buffer cannot hold the graph mutex while waking hundreds
 			// of manifests or shards.
+			// The time budget bounds the pass. The minimum keeps wakes moving when applying
+			// completions used the budget: a wake delayed is a dependency edge delayed.
+			constexpr std::size_t kMinWaiterWakeSteps = 16;
 			std::size_t waiterWakeSteps = 0;
+			const auto mayWake = [&] {
+				return waiterWakeSteps < kMinWaiterWakeSteps ||
+					std::chrono::steady_clock::now() - started < maxDuration;
+			};
 			std::unordered_set<ArtifactKey, typename ArtifactKey::Hasher> evaluatedWaiters;
 			evaluatedWaiters.reserve(16);
 			wakingWaiters = true;
-			while (!pendingWaiterWakes.empty() && waiterWakeSteps < 16 &&
-				std::chrono::steady_clock::now() - started < maxDuration) {
+			while (!pendingWaiterWakes.empty() && mayWake()) {
 				auto& wake = pendingWaiterWakes.front();
-				while (wake.next < wake.consumers.size() && waiterWakeSteps < 16 &&
-					std::chrono::steady_clock::now() - started < maxDuration) {
+				if (wake.next == 0) {
+					if (const auto queued = queuedWaiterWakes.find(wake.dependency);
+						queued != queuedWaiterWakes.end() && queued->second == std::addressof(wake)) {
+						queuedWaiterWakes.erase(queued);
+					}
+				}
+				while (wake.next < wake.consumers.size() && mayWake()) {
 					const auto consumer = wake.consumers[wake.next++];
 					++waiterWakeSteps;
 					// A dependency transition is already visible in the graph state. If
@@ -3407,8 +3455,11 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
         }
 		{
 			auto reclaimLock = LockMutex(GraphMutexPhase::Reclaim);
-			ReclaimUnreferencedVersions(std::chrono::steady_clock::now() +
-				std::chrono::milliseconds(1));
+			{
+				BASIC_TELEMETRY_SCOPE("AsyncStateGraph::Drain::ReclaimVersions");
+				ReclaimUnreferencedVersions(std::chrono::steady_clock::now() +
+					std::chrono::milliseconds(1));
+			}
 			while (!pendingRetirement.empty()) {
 				retiredVersions.push_back(std::move(pendingRetirement.front()));
 				pendingRetirement.pop_front();
@@ -3419,8 +3470,18 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
 			// Publish after reclamation, which also dirties addresses, and before
 			// the callbacks below dispatch: a reader woken by one of them already
 			// observes the state that woke it.
-			PublishDirtyViews();
-			PublishStats();
+			{
+				BASIC_TELEMETRY_SCOPE("AsyncStateGraph::Drain::PublishViews");
+				PublishDirtyViews();
+			}
+			// While more passes are coming only the rate matters to readers of
+			// these counters; the last pass before idle always publishes.
+			const auto statsNow = std::chrono::steady_clock::now();
+			if (!hasImmediateWork || statsNow - lastStatsPublish >= std::chrono::milliseconds(5)) {
+				BASIC_TELEMETRY_SCOPE("AsyncStateGraph::Drain::PublishStats");
+				lastStatsPublish = statsNow;
+				PublishStats();
+			}
 		}
 		FlushDeferredReplies();
 		if (diagnosticSnapshot) {
@@ -3984,6 +4045,11 @@ auto StateGraph<Binding>::RequestInternal(ArtifactKey key, std::uint64_t desired
             const typename Impl::StoredVersionKey canonicalVersion{ key, desiredRevision,
                 versionGeneration->second };
             m_impl->generationAliases.insert_or_assign(predictedVersion, canonicalVersion);
+            auto& addressAliases = m_impl->generationAliasesByAddress[predictedVersion.address];
+            const auto existingAlias = std::ranges::find(addressAliases, predictedVersion.generation,
+                &std::pair<std::uint64_t, std::uint64_t>::first);
+            if (existingAlias != addressAliases.end()) existingAlias->second = canonicalVersion.generation;
+            else addressAliases.emplace_back(predictedVersion.generation, canonicalVersion.generation);
             m_impl->MarkViewDirty(key);
             m_impl->MigrateAliasedVersion(predictedVersion, canonicalVersion);
             basic_telemetry::AddCounter("SARP.AsyncStateGraph.PostedRequestAliased");
@@ -4137,8 +4203,12 @@ auto StateGraph<Binding>::RequestInternal(ArtifactKey key, std::uint64_t desired
             // trigger the normal successor handoff. If nobody pins it, replace
             // it immediately; otherwise a superseded exact dependency can
             // strand the address forever while newer mailbox state accumulates.
-            if (obsoleteBeforeBuild ||
-                (node.state == ArtifactReadiness::UploadSubmitted && !node.buildInFlight)) {
+            // A terminal version has no later transition to hand off from.
+            const bool activeVersionTerminal = node.state == ArtifactReadiness::Failed ||
+                node.state == ArtifactReadiness::Cancelled ||
+                node.state == ArtifactReadiness::Superseded;
+            if (obsoleteBeforeBuild || (!node.buildInFlight &&
+                (node.state == ArtifactReadiness::UploadSubmitted || activeVersionTerminal))) {
                 m_impl->PromoteSuccessor(node);
             }
             result = { ArtifactRequestStatus::Accepted, node.generation,
@@ -4625,10 +4695,12 @@ auto StateGraph<Binding>::StartTrace(AsyncStateGraphTraceConfig config) -> void 
     session->Record(AsyncStateGraphTraceEventID::TraceStarted, {});
     m_impl->traceOwner = std::move(session);
     m_impl->trace.store(m_impl->traceOwner.get(), std::memory_order_release);
-    (void)m_impl->scheduler.InstallTaskTraceSink(m_impl->traceOwner.get(),
-        [](void* context, const TaskTraceEvent& event) noexcept {
-            static_cast<GraphTraceSession*>(context)->RecordSchedulerEvent(event);
-        });
+    if (config.includeSchedulerEvents) {
+        (void)m_impl->scheduler.InstallTaskTraceSink(m_impl->traceOwner.get(),
+            [](void* context, const TaskTraceEvent& event) noexcept {
+                static_cast<GraphTraceSession*>(context)->RecordSchedulerEvent(event);
+            });
+    }
 }
 
 template <class Binding>
