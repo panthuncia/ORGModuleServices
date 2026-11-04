@@ -348,6 +348,60 @@ void TestBuildAndCatchUp() {
     Check(outcome.kind == VersionedBufferBuildOutcome::Kind::Failed);
 }
 
+// An append grows the image inside the same class: the backing catches up with the new tail, not the whole image, and a sparse
+// append's zero-filled gap reaches the backing even though no write names it.
+void TestCatchUpAfterAppend() {
+    auto clock = std::make_shared<RetirementClock>();
+    auto pool = MakePool(clock);
+    auto uploads = std::make_shared<RecordingUploads>();
+
+    constexpr std::uint32_t kCapacity = 64, kInitial = 32;
+    BufferJournal journal(sizeof(std::uint32_t));
+    std::vector<std::uint32_t> rows(kInitial, 7u);
+    journal.Initialize(std::as_bytes(std::span(rows)), kInitial, kCapacity);
+    const auto build = [&](std::uint64_t revision) {
+        const auto capture = journal.CaptureDesired();
+        VersionedBufferBuildInput input;
+        input.uploadOwner = uploads;
+        input.uploadService = uploads.get();
+        input.debugName = "append";
+        input.writeSequence = capture.writeSequence;
+        input.elementStride = sizeof(std::uint32_t);
+        input.elementCount = capture.elementCount;
+        input.capacity = capture.capacity;
+        input.previous = capture.previous;
+        input.backingPool = pool;
+        input.writes = capture.writes;
+        input.image = capture.image;
+        input.journalBaseSequence = capture.journalBaseSequence;
+        input.tag = std::make_shared<const int>(7);
+        auto outcome = BuildVersionedBuffer(input, Context(revision));
+        Check(outcome.kind == VersionedBufferBuildOutcome::Kind::Ready && outcome.version);
+        return std::shared_ptr<const PublishedBufferVersion>(std::move(outcome.version));
+    };
+    auto v1 = build(1);
+    const auto* backing = v1->lease.Get().get();
+    auto record = std::make_shared<PublishedBufferVersion>();
+    record->writeSequence = v1->writeSequence;
+    record->elementCount = v1->elementCount;
+    record->capacity = v1->capacity;
+    record->elementStride = v1->elementStride;
+    record->resource = v1->resource;
+    record->image = v1->image;
+    journal.Acknowledge(record);
+    v1.reset();
+
+    // Sparse: rows 32..39 stay zero, row 40 is written.
+    rows.resize(41, 0u);
+    rows[40] = 2000;
+    journal.AppendWrite(40, std::as_bytes(std::span(&rows[40], 1)), 41);
+    uploads->uploads.clear();
+    auto v2 = build(2);
+    Check(v2->lease.Get().get() == backing && v2->revisionMode == BufferRevisionMode::Patch);
+    Check(uploads->UploadedBytes() == (41 - kInitial) * sizeof(std::uint32_t));
+    CheckContents(*uploads, v2->lease, std::as_bytes(std::span(rows)));
+}
+
 // A backing reused at an older contentEpoch still catches up from the journal: Acknowledge keeps the writes back to the pool's
 // trim floor (OldestContentEpoch), not only past the acknowledged version.
 void TestCatchUpIntoReusedOlderBacking() {
@@ -1004,6 +1058,7 @@ void TestPredecessorShrink() {
 int main() {
     TestReplay();
     TestBuildAndCatchUp();
+    TestCatchUpAfterAppend();
     TestCatchUpIntoReusedOlderBacking();
     TestPredecessorCopy();
     TestPredecessorShrink();

@@ -10,6 +10,8 @@ struct ArtifactKindPolicy {
     // ReadyGate and Latest requirements never acquire these exact recipe pins.
     bool pinExactContent = true;
     bool traceResourceLifetime = false;
+    // Applied after other kinds' completions: high volume, and nothing urgent waits on any one of them.
+    bool bulkCompletions = false;
 };
 
 } // namespace org::async

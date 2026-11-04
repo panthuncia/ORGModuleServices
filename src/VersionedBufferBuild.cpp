@@ -133,9 +133,13 @@ VersionedBufferBuildOutcome Build(const VersionedBufferBuildInput& input, const 
         std::vector<DirtyRange> dirtyRanges;
         const auto held = backing.contentEpoch.load(std::memory_order_acquire);
         // Catch up from what the backing holds: every journal write since its contentEpoch, when the journal reaches back that far.
+        // An append grows the image, so a smaller held image still qualifies; what lies past it is filled below.
         const bool journalCoversBacking = !acquired.allocated && input.image && held != 0 && held >= input.journalBaseSequence &&
-            held <= input.writeSequence && backing.image && backing.image->ByteSize() == image->ByteSize();
+            held <= input.writeSequence && backing.image && backing.image->ByteSize() <= image->ByteSize();
         if (journalCoversBacking) {
+            if (const auto heldBytes = backing.image->ByteSize(); heldBytes < image->ByteSize()) {
+                dirtyRanges.push_back({heldBytes, image->ByteSize() - heldBytes});
+            }
             for (const auto& write : input.writes) {
                 if (write.sequence <= held || write.byteSize == 0u) continue;
                 dirtyRanges.push_back({static_cast<std::size_t>(write.byteOffset), static_cast<std::size_t>(write.byteSize)});

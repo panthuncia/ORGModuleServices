@@ -777,6 +777,9 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
 	std::chrono::steady_clock::time_point nextStallDump{};
 	std::vector<ArtifactSnapshot> propagatedReady;
 	tbb::concurrent_queue<Completion> completions;
+	// Completions of kinds whose policy says bulkCompletions. A pass applies the others
+	// first: a control artifact must not wait behind thousands of bulk completions.
+	tbb::concurrent_queue<Completion> bulkCompletions;
 	std::atomic<std::uint64_t> completionCount{ 0 };
     // Allocated once from the validated immutable host layout, never resized.
     std::vector<tbb::concurrent_queue<AcceptanceDispatch>> acceptanceMailboxes;
@@ -971,8 +974,7 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
             item.completion.result = ArtifactBuildResult::Failure(
                 "scheduler rejected acceptance mailbox");
             item.completion.queuedAt = std::chrono::steady_clock::now();
-            completions.push(std::move(item.completion));
-            completionCount.fetch_add(1, std::memory_order_release);
+            PushCompletion(std::move(item.completion));
         }
         acceptanceMailboxScheduled[index].store(false, std::memory_order_release);
         ScheduleDrain();
@@ -1010,8 +1012,7 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
             ++appliedCount;
             if (!succeeded) item.completion.result = ArtifactBuildResult::Failure(std::move(error));
             item.completion.queuedAt = std::chrono::steady_clock::now();
-            completions.push(std::move(item.completion));
-            completionCount.fetch_add(1, std::memory_order_release);
+            PushCompletion(std::move(item.completion));
             if (auto session = AcquireTrace()) {
                 session->Record(AsyncStateGraphTraceEventID::AcceptanceApplied, item.snapshot.key,
                     item.snapshot.revision, item.snapshot.generation,
@@ -1037,8 +1038,7 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
                 static_cast<std::uint32_t>(dispatch.registration.domain)});
             if (!index) {
                 dispatch.completion.result = ArtifactBuildResult::Failure("acceptance class outside graph scheduler layout");
-                completions.push(std::move(dispatch.completion));
-                completionCount.fetch_add(1, std::memory_order_release);
+                PushCompletion(std::move(dispatch.completion));
                 ScheduleDrain();
                 continue;
             }
@@ -2502,9 +2502,8 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
                         ArtifactReadiness::Preparing, duration,
                         { { static_cast<unsigned>(result.outcome), taskKind, correlationID } });
                 }
-				self->completions.push({ key, revision, generation,
+				self->PushCompletion({ key, revision, generation,
 					std::move(dependencyStamp), std::move(result) });
-				self->completionCount.fetch_add(1, std::memory_order_release);
                 self->ScheduleDrain();
             };
         const TaskTraceMetadata trace{
@@ -2527,11 +2526,18 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
                 session->Record(AsyncStateGraphTraceEventID::BuildRejected, key, revision, generation,
                     ArtifactReadiness::Failed);
             }
-			completions.push({ key, revision, generation, std::move(dependencyStamp),
+			PushCompletion({ key, revision, generation, std::move(dependencyStamp),
 				ArtifactBuildResult::Failure("scheduler rejected producer") });
-			completionCount.fetch_add(1, std::memory_order_release);
             ScheduleDrain();
         }
+    }
+
+    void PushCompletion(Completion completion) {
+        const auto kindIndex = static_cast<std::size_t>(completion.key.kind);
+        const bool bulk = kindIndex < hooks.artifactPolicies.size() &&
+            hooks.artifactPolicies[kindIndex].bulkCompletions;
+        (bulk ? bulkCompletions : completions).push(std::move(completion));
+        completionCount.fetch_add(1, std::memory_order_release);
     }
 
     bool PrepareAcceptance(Completion& completion,
@@ -3107,7 +3113,8 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
 		std::vector<Completion> readyCompletions;
 		readyCompletions.reserve(kMaxCompletionsPerPass);
 		Completion readyCompletion;
-		while (readyCompletions.size() < kMaxCompletionsPerPass && completions.try_pop(readyCompletion)) {
+		while (readyCompletions.size() < kMaxCompletionsPerPass &&
+			(completions.try_pop(readyCompletion) || bulkCompletions.try_pop(readyCompletion))) {
 			completionCount.fetch_sub(1, std::memory_order_acq_rel);
 			if (readyCompletion.result.outcome == ArtifactBuildResult::Outcome::Ready &&
 				readyCompletion.result.gpuSubmissions) {
@@ -4822,7 +4829,7 @@ auto StateGraph<Binding>::Shutdown() -> void {
     }
     m_impl->pending.clear();
 	typename Impl::Completion discardedCompletion;
-	while (m_impl->completions.try_pop(discardedCompletion)) {
+	while (m_impl->completions.try_pop(discardedCompletion) || m_impl->bulkCompletions.try_pop(discardedCompletion)) {
 		if (discardedCompletion.result.gpuSubmissions)
 			(void)discardedCompletion.result.gpuSubmissions->Cancel();
 	}
