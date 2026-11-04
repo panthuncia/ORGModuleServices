@@ -359,11 +359,12 @@ public:
         variant.hasRootBytes = true;
         variant.build = &build;
         auto resolved = store_->Resolve(variant);
+        result.variantKey = variant.variantKey;
         result.diagnostics = std::move(resolved.diagnostics);
         if (resolved.outcome == ShaderStoreOutcome::Failed) return result;
         result.binary = std::move(resolved.binary);
         result.fromCache = resolved.outcome != ShaderStoreOutcome::Compiled;
-        { std::scoped_lock lock(mutex_); memory_[key] = result; }
+        if (request.keepInMemory) { std::scoped_lock lock(mutex_); memory_[key] = result; }
         return result;
     }
 

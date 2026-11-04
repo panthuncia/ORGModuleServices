@@ -35,6 +35,8 @@ struct ShaderCompileRequest {
     // every source file's text embedded. sourceName is the file name the debug info and diagnostics refer to.
     bool debugInfo{};
     bool warningsAsErrors{ true };
+    // Whether the compiler keeps the result in memory for later requests. A host with its own cache of thousands of variants says no.
+    bool keepInMemory{ true };
 };
 
 struct ShaderArtifact {
@@ -43,6 +45,7 @@ struct ShaderArtifact {
     std::vector<std::byte> binary;
     std::string diagnostics;
     bool fromCache{};
+    ShaderStoreHash variantKey;  // The store's record, whose dependencies are the files this read.
     explicit operator bool() const noexcept { return !binary.empty(); }
 };
 
