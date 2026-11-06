@@ -270,8 +270,11 @@ public:
      * that hold nothing (written whole). A journal keeps its changes back to here (the trim floor). nullopt: none holds anything.
      */
     [[nodiscard]] std::optional<std::uint64_t> OldestContentEpoch() const;
-    /** @brief Acquirer: takes returned backings in and releases spares (what Acquire does first). */
-    void Trim();
+    /**
+     * @brief Acquirer: takes returned backings in and releases spares (what Acquire does first). `spareFree` overrides
+     * Config::spareFree for this call: an idle pool's host passes 0 to give back its warm spare too.
+     */
+    void Trim(std::optional<std::uint32_t> spareFree = std::nullopt);
     /** @brief Acquirer: every backing the pool holds, for diagnostics (BasicRenderer's lifetime trace). */
     void Visit(const std::function<void(const Backing&)>& visit) const;
 

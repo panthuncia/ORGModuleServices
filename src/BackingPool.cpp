@@ -570,7 +570,8 @@ std::optional<std::uint64_t> BackingPool::OldestContentEpoch() const {
     return oldest;
 }
 
-void BackingPool::Trim() {
+void BackingPool::Trim(std::optional<std::uint32_t> spareFree) {
+    const std::uint32_t keep = spareFree.value_or(m_config.spareFree);
     RunExclusive(m_hooks, m_acquiring, [&] {
         auto& state = *m_state;
         TakeReturned();
@@ -586,7 +587,7 @@ void BackingPool::Trim() {
             });
             std::uint32_t spares = 0;
             for (const auto& backing : candidates) {
-                if (backing->capacityClass == active.capacityClass && spares < m_config.spareFree) {
+                if (backing->capacityClass == active.capacityClass && spares < keep) {
                     ++spares;
                     continue;
                 }
