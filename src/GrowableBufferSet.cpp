@@ -36,13 +36,14 @@ std::uint32_t NamedVersions::IndexOf(const VersionedBuffer& buffer) const noexce
 
 std::shared_ptr<const BufferVersion> NamedVersions::Find(const VersionedBuffer& buffer) const noexcept {
     if (const std::uint32_t index = IndexOf(buffer); index != UINT32_MAX) return m_entries[index].version;
-    m_misses.fetch_add(1, std::memory_order_relaxed);
+    if (!m_textureSet) m_misses.fetch_add(1, std::memory_order_relaxed);
     return nullptr;
 }
 
 std::shared_ptr<const NamedVersions> NamedVersions::Textures(std::span<const TextureEntry> textures) {
     auto named = std::make_shared<NamedVersions>();
     named->m_serial = NextSerial();
+    named->m_textureSet = true;
     named->m_textures.reserve(textures.size());
     for (const auto& [texture, version] : textures) {
         if (!texture || !version) throw std::invalid_argument("NamedVersions: a texture entry without a texture or a version");
@@ -62,7 +63,7 @@ const NamedVersions::NamedTexture* NamedVersions::TextureOf(const VersionedTextu
 
 std::shared_ptr<const TextureVersion> NamedVersions::FindTexture(const VersionedTexture& texture) const noexcept {
     if (const auto* entry = TextureOf(texture)) return entry->version;
-    m_misses.fetch_add(1, std::memory_order_relaxed);
+    if (m_textureSet) m_misses.fetch_add(1, std::memory_order_relaxed);
     return nullptr;
 }
 

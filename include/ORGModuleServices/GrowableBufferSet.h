@@ -125,8 +125,8 @@ public:
      */
     void Bind(std::uint64_t safeAt) const noexcept;
     /**
-     * @brief Diagnostics: Find and FindTexture calls for a resource this set does not name (a recording resolved an unnamed one).
-     * In a ComposedVersions every part before the one that answers counts one.
+     * @brief Diagnostics: calls for a resource of the set's kind that it does not name (a recording resolved an unnamed one). A
+     * buffer set counts Find calls, a texture set (Textures) FindTexture calls. Asking for the other kind is not a miss.
      */
     [[nodiscard]] std::uint64_t Misses() const noexcept { return m_misses.load(std::memory_order_relaxed); }
 
@@ -146,6 +146,7 @@ private:
         std::shared_ptr<const TextureVersion> version;
     };
     std::vector<NamedTexture> m_textures;  // sorted by key
+    bool m_textureSet = false;             // made by Textures: it names textures and no buffer
     mutable std::atomic<std::uint64_t> m_misses{0};
 };
 

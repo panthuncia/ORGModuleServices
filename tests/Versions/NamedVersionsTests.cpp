@@ -89,8 +89,9 @@ int TestFindAndMiss() {
     CHECK(named->Misses() == 0);
     CHECK(named->FindTexture(*b) == nullptr);
     CHECK(named->Misses() == 1);
+    // A texture set is not asked about buffers: no miss.
     CHECK(named->Find(*buffer) == nullptr);
-    CHECK(named->Misses() == 2);
+    CHECK(named->Misses() == 1);
     // A clone shares the versions (Key), so the set names it too.
     const auto clone = a->Clone();
     CHECK(named->FindTexture(static_cast<const org::VersionedTexture&>(*clone)) == pending);
