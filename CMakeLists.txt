@@ -29,7 +29,8 @@ add_library(ORGModuleServices STATIC
     src/PipelineRegistry.cpp
     src/PipelineService.cpp
     src/VersionedBufferBuild.cpp
-    src/VersionedBufferGrowth.cpp)
+    src/VersionedBufferGrowth.cpp
+    src/VersionedTextureGrowth.cpp)
 add_library(ORGModuleServices::ORGModuleServices ALIAS ORGModuleServices)
 target_compile_features(ORGModuleServices PUBLIC cxx_std_20)
 target_include_directories(ORGModuleServices PUBLIC
@@ -75,6 +76,14 @@ if(ORG_MODULE_SERVICES_BUILD_TESTS)
             target_compile_options(ORGNamedVersionsTests PRIVATE /utf-8)
         endif()
         add_test(NAME ORGNamedVersionsTests COMMAND ORGNamedVersionsTests)
+        # Texture versions made, zero-filled on the uploader's copy queue and named, on WARP (D3D12).
+        add_executable(ORGTextureVersionsTests tests/Versions/TextureVersionsTests.cpp)
+        target_link_libraries(ORGTextureVersionsTests PRIVATE ORGModuleServices::ORGModuleServices d3d12 dxgi)
+        target_compile_definitions(ORGTextureVersionsTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+        if(MSVC)
+            target_compile_options(ORGTextureVersionsTests PRIVATE /utf-8)
+        endif()
+        add_test(NAME ORGTextureVersionsTests COMMAND ORGTextureVersionsTests)
     endif()
 endif()
 
