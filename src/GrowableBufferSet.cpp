@@ -5,16 +5,26 @@
 #include <stdexcept>
 
 #include "Render/LatchBlock.h"
+#include "Resources/VersionedTexture.h"
+#include "VersionsSerial.h"
 
 namespace org::services {
 
 namespace {
 
-// Serials of named versions and of sealed sets: one process-wide sequence, so no two sets or versions share one.
-std::atomic<std::uint64_t> g_serials{0};
-std::uint64_t NextSerial() { return g_serials.fetch_add(1, std::memory_order_relaxed) + 1; }
+std::uint64_t NextSerial() { return detail::NextVersionsSerial(); }
 
 } // namespace
+
+namespace detail {
+
+// Serials of named versions, sealed sets and composed sets: one process-wide sequence, so no two share one.
+std::uint64_t NextVersionsSerial() noexcept {
+    static std::atomic<std::uint64_t> serials{0};
+    return serials.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+} // namespace detail
 
 // ---- NamedVersions ----
 
@@ -29,6 +39,34 @@ std::shared_ptr<const BufferVersion> NamedVersions::Find(const VersionedBuffer& 
     m_misses.fetch_add(1, std::memory_order_relaxed);
     return nullptr;
 }
+
+std::shared_ptr<const NamedVersions> NamedVersions::Textures(std::span<const TextureEntry> textures) {
+    auto named = std::make_shared<NamedVersions>();
+    named->m_serial = NextSerial();
+    named->m_textures.reserve(textures.size());
+    for (const auto& [texture, version] : textures) {
+        if (!texture || !version) throw std::invalid_argument("NamedVersions: a texture entry without a texture or a version");
+        named->m_textures.push_back({texture->Key(), texture, version});
+    }
+    std::sort(named->m_textures.begin(), named->m_textures.end(), [](const auto& a, const auto& b) { return a.key < b.key; });
+    const auto twice = std::adjacent_find(named->m_textures.begin(), named->m_textures.end(), [](const auto& a, const auto& b) { return a.key == b.key; });
+    if (twice != named->m_textures.end()) throw std::invalid_argument("NamedVersions: a texture is named twice");
+    return named;
+}
+
+const NamedVersions::NamedTexture* NamedVersions::TextureOf(const VersionedTexture& texture) const noexcept {
+    const void* key = texture.Key();
+    const auto it = std::lower_bound(m_textures.begin(), m_textures.end(), key, [](const auto& entry, const void* k) { return entry.key < k; });
+    return it != m_textures.end() && it->key == key ? &*it : nullptr;
+}
+
+std::shared_ptr<const TextureVersion> NamedVersions::FindTexture(const VersionedTexture& texture) const noexcept {
+    if (const auto* entry = TextureOf(texture)) return entry->version;
+    m_misses.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
+}
+
+bool NamedVersions::Names(const VersionedTexture& texture) const noexcept { return TextureOf(texture) != nullptr; }
 
 const NamedEntry& NamedVersions::Of(GrowableHandle handle) const {
     if (!Names(handle)) throw std::out_of_range("NamedVersions: the set names no version of this buffer");
@@ -58,6 +96,12 @@ std::size_t NamedVersions::AdoptAll() const {
         const auto buffer = m_buffers[i].lock();
         if (!buffer || buffer->Current() == version) continue;
         buffer->Adopt(version);
+        ++adopted;
+    }
+    for (const auto& entry : m_textures) {
+        const auto texture = entry.texture.lock();
+        if (!texture || texture->Current() == entry.version) continue;
+        texture->Adopt(entry.version);
         ++adopted;
     }
     return adopted;

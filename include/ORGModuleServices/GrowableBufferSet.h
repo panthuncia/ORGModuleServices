@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -74,16 +75,32 @@ struct LatchHandle {
 /**
  * @brief The versions a sealed set names: every live buffer of the set (an entry per handle) and every latch block made. Immutable;
  * a preparation for a revision carrying it resolves each VersionedBuffer here (IResourceVersions), whatever is current when it runs.
+ *
+ * A texture set (Textures) names texture versions instead, and no buffer. A frame names both through ComposedVersions.
  */
 class NamedVersions final : public IResourceVersions {
 public:
+    /** @brief A texture and the version of it a set names. */
+    using TextureEntry = std::pair<std::shared_ptr<VersionedTexture>, std::shared_ptr<const TextureVersion>>;
+
+    /**
+     * @brief Any thread: a set that names these texture versions and nothing else, with a new Serial. A version may be pending
+     * (VersionedTexture::Make): what is recorded against the set binds it before it is current. The textures are held weakly.
+     * Throws on a null texture or version, or a texture named twice.
+     */
+    [[nodiscard]] static std::shared_ptr<const NamedVersions> Textures(std::span<const TextureEntry> textures);
+
     std::shared_ptr<const BufferVersion> Find(const VersionedBuffer& buffer) const noexcept override;
+    std::shared_ptr<const TextureVersion> FindTexture(const VersionedTexture& texture) const noexcept override;
 
     /** @brief Process-unique: moves exactly when any named version or latch block does. */
     [[nodiscard]] std::uint64_t Serial() const noexcept { return m_serial; }
     [[nodiscard]] bool Names(GrowableHandle handle) const noexcept { return handle.index < m_entries.size() && m_entries[handle.index].version; }
     [[nodiscard]] bool Names(const VersionedBuffer& buffer) const noexcept { return IndexOf(buffer) != UINT32_MAX; }
     [[nodiscard]] bool Names(const std::shared_ptr<VersionedBuffer>& buffer) const noexcept { return buffer && Names(*buffer); }
+    [[nodiscard]] bool Names(const VersionedTexture& texture) const noexcept;
+    /** @brief How many texture versions the set names. */
+    [[nodiscard]] std::size_t TextureCount() const noexcept { return m_textures.size(); }
     /** @brief The handle's entry; throws when the set does not name it. */
     [[nodiscard]] const NamedEntry& Of(GrowableHandle handle) const;
     /** @brief The buffer's entry, found by its key; throws when the set does not name it. */
@@ -91,7 +108,10 @@ public:
     [[nodiscard]] const NamedEntry& Of(const std::shared_ptr<VersionedBuffer>& buffer) const;
     /** @brief The handle's latch block; null before its first requirement. */
     [[nodiscard]] std::shared_ptr<LatchBlock> Latch(LatchHandle handle) const noexcept;
-    /** @brief Owner thread: makes every named version current (VersionedBuffer::Adopt). Returns how many were not already. */
+    /**
+     * @brief Owner thread: makes every named version current (VersionedBuffer::Adopt, VersionedTexture::Adopt). Returns how many
+     * were not already. An expired buffer or texture is skipped.
+     */
     std::size_t AdoptAll() const;
     /**
      * @brief Any thread: binds every named pooled version's backing (BackingLease::Bind, max-merged): not reused before the
@@ -104,17 +124,28 @@ public:
      * need no bind: a version is named only once its copies completed.
      */
     void Bind(std::uint64_t safeAt) const noexcept;
-    /** @brief Diagnostics: Find calls for a buffer this set does not name (a recording resolved an unnamed buffer). */
+    /**
+     * @brief Diagnostics: Find and FindTexture calls for a resource this set does not name (a recording resolved an unnamed one).
+     * In a ComposedVersions every part before the one that answers counts one.
+     */
     [[nodiscard]] std::uint64_t Misses() const noexcept { return m_misses.load(std::memory_order_relaxed); }
 
 private:
     friend class GrowableBufferSet;
     [[nodiscard]] std::uint32_t IndexOf(const VersionedBuffer& buffer) const noexcept;
+    struct NamedTexture;
+    [[nodiscard]] const NamedTexture* TextureOf(const VersionedTexture& texture) const noexcept;
     std::uint64_t m_serial = 0;
     std::vector<NamedEntry> m_entries;                       // by handle (version null: not named)
     std::vector<std::weak_ptr<VersionedBuffer>> m_buffers;   // by handle
     std::vector<std::pair<const void*, std::uint32_t>> m_byKey;  // (VersionedBuffer::Key, handle), sorted
     std::vector<std::shared_ptr<LatchBlock>> m_latches;      // by latch handle
+    struct NamedTexture {
+        const void* key = nullptr;  // VersionedTexture::Key
+        std::weak_ptr<VersionedTexture> texture;
+        std::shared_ptr<const TextureVersion> version;
+    };
+    std::vector<NamedTexture> m_textures;  // sorted by key
     mutable std::atomic<std::uint64_t> m_misses{0};
 };
 

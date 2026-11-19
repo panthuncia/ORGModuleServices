@@ -22,6 +22,7 @@ add_library(ORGModuleServices STATIC
     src/BackingPoolBinding.cpp
     src/BufferImage.cpp
     src/BufferJournal.cpp
+    src/ComposedVersions.cpp
     src/GraphJob.cpp
     src/GrowableBufferSet.cpp
     src/JournaledBufferSet.cpp
@@ -65,6 +66,16 @@ if(ORG_MODULE_SERVICES_BUILD_TESTS)
     add_executable(ORGModuleServicesTests tests/ServicesTests.cpp)
     target_link_libraries(ORGModuleServicesTests PRIVATE ORGModuleServices::ORGModuleServices)
     add_test(NAME ORGModuleServicesTests COMMAND ORGModuleServicesTests)
+    # Named texture versions and composed sets, against OpenRenderGraph on WARP (D3D12).
+    if(WIN32)
+        add_executable(ORGNamedVersionsTests tests/Versions/NamedVersionsTests.cpp)
+        target_link_libraries(ORGNamedVersionsTests PRIVATE ORGModuleServices::ORGModuleServices d3d12 dxgi)
+        target_compile_definitions(ORGNamedVersionsTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+        if(MSVC)
+            target_compile_options(ORGNamedVersionsTests PRIVATE /utf-8)
+        endif()
+        add_test(NAME ORGNamedVersionsTests COMMAND ORGNamedVersionsTests)
+    endif()
 endif()
 
 install(TARGETS ORGModuleServices ORGShaderStore EXPORT ORGModuleServicesTargets
