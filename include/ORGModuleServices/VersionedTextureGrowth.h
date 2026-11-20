@@ -23,6 +23,7 @@ namespace org::services {
 enum class TextureContents : std::uint8_t {
     Undefined,  // nothing is written: the version's writers write it whole, or its maker initialized it
     Zero,       // zero-filled on the uploader's worker path (a History texture is born cleared)
+    Fill,       // filled on that path with what the request's writer writes (a texture born with a value or contents)
 };
 
 /** @brief The size of a texture version made from the slot's current one. Depth is for a 3D texture. */
@@ -41,8 +42,8 @@ struct TextureExtent {
  * - When `image` is null, a PixelBuffer that MakeTextureVersions makes like the slot's current one, at `extent`. The current
  *   version must then be a PixelBuffer.
  *
- * A Zero version is filled on the uploader's copy queue, so it must be rhi::QueueSharing::Concurrent, single-sampled and not a
- * depth format. A PixelBuffer made from `extent` for a Zero request is made Concurrent.
+ * A Zero or Fill version is filled on the uploader's copy queue, so it must be rhi::QueueSharing::Concurrent, single-sampled and
+ * not a depth format. A PixelBuffer made from `extent` for such a request is made Concurrent.
  */
 struct TextureVersionRequest {
     std::shared_ptr<VersionedTexture> slot;
@@ -53,6 +54,8 @@ struct TextureVersionRequest {
     std::shared_ptr<const void> owner;
     // A PixelBuffer made from `extent` gets this name (empty: the current version's name).
     std::string name;
+    // A Fill version's contents, written subresource by subresource on the thread that makes the versions.
+    TextureFillWriter fill;
 };
 
 /** @brief Texture versions made together. They are adopted as one, so they are ready as one. */
@@ -76,7 +79,8 @@ struct TextureVersionsMade {
  * Every version is made before any fill is queued, so a shape-class change queues nothing. Throws:
  * - std::invalid_argument for a request without a slot, a slot named twice, an `extent` request whose current version is not
  *   a PixelBuffer, an empty extent, and a version of another shape class than the slot's (ORG's MakeVersion).
- * - std::invalid_argument for a Zero request without `uploads`, or whose texture the uploader cannot fill.
+ * - std::invalid_argument for a Zero or Fill request without `uploads`, a Fill request without a writer, or a texture the
+ *   uploader cannot fill (or whose writer failed).
  */
 TextureVersionsMade MakeTextureVersions(std::span<const TextureVersionRequest> requests,
     const std::shared_ptr<runtime::IUploadService>& uploads);

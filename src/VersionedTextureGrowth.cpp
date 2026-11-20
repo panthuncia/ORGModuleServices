@@ -39,7 +39,7 @@ std::shared_ptr<GloballyIndexedResource> NextTexture(const TextureVersionRequest
         throw std::invalid_argument("MakeTextureVersions: '" + current->GetName() + "' asks for an empty extent");
     auto description = DescriptionAt(current->GetDescription(), request.extent, current->GetMipLevels(), current->GetArraySize());
     // The uploader fills on its copy queue, which only a concurrent texture allows without ownership transfers.
-    if (request.contents == TextureContents::Zero) description.queueSharing = rhi::QueueSharing::Concurrent;
+    if (request.contents != TextureContents::Undefined) description.queueSharing = rhi::QueueSharing::Concurrent;
     auto next = PixelBuffer::CreateShared(description);
     next->SetName(request.name.empty() ? current->GetName() : request.name);
     return next;
@@ -103,8 +103,10 @@ TextureVersionsMade MakeTextureVersions(std::span<const TextureVersionRequest> r
         if (std::ranges::find(keys, request.slot->Key()) != keys.end())
             throw std::invalid_argument("MakeTextureVersions: a texture asked for twice");
         keys.push_back(request.slot->Key());
-        if (request.contents == TextureContents::Zero && !uploads)
-            throw std::invalid_argument("MakeTextureVersions: a zero-filled version without an upload service");
+        if (request.contents != TextureContents::Undefined && !uploads)
+            throw std::invalid_argument("MakeTextureVersions: a filled version without an upload service");
+        if (request.contents == TextureContents::Fill && !request.fill)
+            throw std::invalid_argument("MakeTextureVersions: a filled version without contents");
     }
     TextureVersionsMade made;
     made.versions.reserve(requests.size());
@@ -119,14 +121,15 @@ TextureVersionsMade MakeTextureVersions(std::span<const TextureVersionRequest> r
     made.named = NamedVersions::Textures(entries);
     std::vector<std::shared_ptr<TrackedUploadTicket>> tickets;
     for (std::size_t i = 0; i < requests.size(); ++i) {
-        if (requests[i].contents != TextureContents::Zero) continue;
+        if (requests[i].contents == TextureContents::Undefined) continue;
         const auto& resource = made.versions[i]->resource;
         // The version is pending and its texture new: no queue uses it before its owner adopts it, after these copies.
-        auto ticket = uploads->QueueTrackedStreamingTextureZeroFill(
-            WorkerOwnedDestination{resource, WorkerOwnedDestination::Ownership::FreshTexture});
+        const WorkerOwnedDestination destination{resource, WorkerOwnedDestination::Ownership::FreshTexture};
+        auto ticket = requests[i].contents == TextureContents::Zero ? uploads->QueueTrackedStreamingTextureZeroFill(destination) :
+                                                                      uploads->QueueTrackedStreamingTextureFill(destination, requests[i].fill);
         if (!ticket)
-            throw std::invalid_argument("MakeTextureVersions: the uploader cannot zero-fill '" + resource->GetName() +
-                "'. It must be a concurrent, single-sampled colour texture");
+            throw std::invalid_argument("MakeTextureVersions: the uploader cannot fill '" + resource->GetName() +
+                "'. It must be a concurrent, single-sampled colour texture, and its contents must be written");
         tickets.push_back(std::move(ticket));
     }
     made.ready = TokenForTickets(std::move(tickets));
