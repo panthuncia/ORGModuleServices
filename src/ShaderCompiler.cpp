@@ -417,6 +417,10 @@ ShaderStore& ShaderCompiler::Store() const noexcept { return *impl_->store_; }
 std::shared_future<ShaderArtifact> ShaderCompiler::CompileAsync(ShaderCompileRequest request) { return CompileAsync(std::move(request), {}); }
 
 std::shared_future<ShaderArtifact> ShaderCompiler::CompileAsync(ShaderCompileRequest request, CompletionCallback onComplete) {
+    return Start(std::move(request), std::move(onComplete), false);
+}
+
+std::shared_future<ShaderArtifact> ShaderCompiler::Start(ShaderCompileRequest request, CompletionCallback onComplete, bool onCaller) {
     BT_ZONE_SCOPE("ORG.ShaderCompiler.CompileAsync");
     const uint64_t key = BuildKey(request);
     BT_ZONE_NAMED(enqueueZone, "ORG.ShaderCompiler.Enqueue");
@@ -449,6 +453,10 @@ std::shared_future<ShaderArtifact> ShaderCompiler::CompileAsync(ShaderCompileReq
     if (!owner) return future;
     const auto format = request.format;
     std::vector<std::byte> source(request.source.begin(), request.source.end()); request.source = {};
+    if (onCaller) {
+        impl_->RunFlight(flight, std::move(request), std::move(source), key);
+        return future;
+    }
     ServiceTask task = [impl = impl_, flight, request = std::move(request), source = std::move(source), key]() mutable {
         impl->RunFlight(flight, std::move(request), std::move(source), key);
     };
@@ -458,5 +466,6 @@ std::shared_future<ShaderArtifact> ShaderCompiler::CompileAsync(ShaderCompileReq
 }
 void ShaderCompiler::Configure(Submit submit) { std::scoped_lock lock(impl_->mutex_); impl_->submit_ = std::move(submit); }
 ShaderArtifact ShaderCompiler::Compile(ShaderCompileRequest request) { return CompileAsync(std::move(request)).get(); }
+ShaderArtifact ShaderCompiler::CompileHere(ShaderCompileRequest request) { return Start(std::move(request), {}, true).get(); }
 void ShaderCompiler::ClearMemoryCache() { std::scoped_lock lock(impl_->mutex_); impl_->memory_.clear(); }
 }

@@ -86,6 +86,9 @@ public:
     // Synchronous: blocks on CompileAsync. Never call it from a thread the configured submitter needs in order to run
     // the compile (for example the thread that drains a manual queue).
     ShaderArtifact Compile(ShaderCompileRequest request);
+    // Synchronous, on the calling thread: a compile this call starts runs here, not through the submitter. One already in
+    // flight for the same key is waited for. For a host thread that should not hand its work to the configured submitter.
+    ShaderArtifact CompileHere(ShaderCompileRequest request);
     // Installs the executor every compile is submitted to; empty restores the default (one new thread per compile).
     // Setup: call before the compiler is shared with other threads. Requests submitted earlier keep their executor.
     // Queued compiles keep the compiler's internals alive, so destroying the ShaderCompiler before they run is safe.
@@ -93,6 +96,9 @@ public:
     void ClearMemoryCache();
 
 private:
+    // CompileAsync's body. onCaller: an owned compile runs on this thread.
+    std::shared_future<ShaderArtifact> Start(ShaderCompileRequest request, CompletionCallback onComplete, bool onCaller);
+
     class Impl;
     std::shared_ptr<Impl> impl_; // shared with the compiles in flight
 };
