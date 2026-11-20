@@ -2,7 +2,6 @@
 #include <ORGModuleServices/CompileFlightRegistry.h>
 #if defined(ORG_MODULE_SERVICES_HAS_DXC)
 #include <ORGModuleServices/ShaderCompiler.h>
-#include <ORGModuleServices/ShaderServiceAdapter.h>
 #endif
 
 #include <atomic>
@@ -39,11 +38,5 @@ int main() {
     const auto keyA = compiler.BuildKey(request), keyB = compiler.BuildKey(request);
     CHECK(keyA != 0 && keyA == keyB);
     if (compiler.Available()) { auto artifact = compiler.Compile(request); CHECK(artifact); }
-	org::services::ShaderServiceAdapter service(compiler);
-	ORGShaderCompilerServiceAPI table{ sizeof(table), ORG_SHADER_COMPILER_SERVICE_VERSION_1 };
-	CHECK(service.Query(2, &table, sizeof(table)) == ORG_RG_E_UNSUPPORTED_VERSION);
-	const auto queryStatus = service.Query(ORG_SHADER_COMPILER_SERVICE_VERSION_1, &table, sizeof(table));
-	CHECK(queryStatus == (compiler.Available() ? ORG_RG_OK : ORG_RG_E_UNSUPPORTED_CAPABILITY));
-	service.Shutdown();
 #endif
 }

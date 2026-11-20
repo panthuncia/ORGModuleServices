@@ -7,9 +7,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
-#include <numeric>
 #include <optional>
-#include <stdexcept>
 #include <string>
 
 #include "Render/Runtime/IUploadService.h"
@@ -44,7 +42,7 @@ ClassChoice ChooseClass(const VersionedBufferBuildInput& input) {
     if (previous) choice.window = previous->shrinkWindow;
     if (previous && previous->resource && input.capacity <= previous->capacity) {
         // A fresh class for the peak: what this chain grows to from nothing (the plain path's power of two).
-        const GrowthPolicy fresh = input.predecessorCopy && input.growth ? *input.growth : GrowthPolicy::Doubling();
+        const GrowthPolicy fresh = input.growth ? *input.growth : GrowthPolicy::Doubling();
         if (const auto target = choice.window.Observe(input.shrink, fresh, previous->capacity, required, ShrinkWindow::Clock::now())) {
             choice.capacityClass = (std::max)(*target, required);
             choice.shrunk = choice.capacityClass < previous->capacity;
@@ -55,7 +53,7 @@ ClassChoice ChooseClass(const VersionedBufferBuildInput& input) {
         return choice;
     }
     choice.window.Reset();
-    choice.capacityClass = input.predecessorCopy && input.growth ? input.growth->Next(previous ? previous->capacity : 0, required) : ReplacementCapacity(input);
+    choice.capacityClass = input.growth ? input.growth->Next(previous ? previous->capacity : 0, required) : ReplacementCapacity(input);
     return choice;
 }
 
@@ -74,144 +72,7 @@ VersionedBufferBuildOutcome Cancel() {
 
 // The leased backing holds nothing a successor may catch up from (a build that failed after writing part of it).
 void Forget(Backing& backing) noexcept {
-    backing.image.reset();
     backing.contentEpoch.store(0, std::memory_order_release);
-}
-
-VersionedBufferBuildOutcome Build(const VersionedBufferBuildInput& input, const VersionedBufferBuildContext& context) {
-    const auto stopped = [&] { return context.stopRequested && context.stopRequested(); };
-    if (!input.uploadService || input.elementStride == 0u) return Fail("versioned buffer input/upload service/stride missing");
-    if (!input.backingPool) return Fail("versioned buffer input has no backing pool");
-    if (stopped()) return Cancel();
-    const auto choice = ChooseClass(input);
-    const auto mode = choice.mode;
-    const auto capacityClass = choice.capacityClass;
-    auto& pool = *input.backingPool;
-
-    BackingRequest request;
-    request.capacityClass = capacityClass;
-    request.stride = input.elementStride;
-    request.flags = input.flags;
-    request.name = input.debugName;
-    BackingPool::AcquireInfo acquired;
-    auto lease = pool.Acquire(request, input.writeSequence, &acquired);
-    if (!lease) {
-        // Exhausted (Config::maxPerClass): suspend until the pool's availability wakes the graph.
-        if (!context.allocateSuspension) return Fail("versioned buffer backing pool exhausted and the caller cannot suspend");
-        VersionedBufferBuildOutcome outcome;
-        outcome.kind = VersionedBufferBuildOutcome::Kind::Suspended;
-        outcome.suspension = context.allocateSuspension();
-        outcome.error = "versioned buffer backing pool exhausted";
-        if (context.notifySuspension) pool.SubscribeAvailability(outcome.suspension, context.notifySuspension);
-        return outcome;
-    }
-    auto& backing = *lease;
-    if (input.elementCount * input.elementStride > backing.byteCapacity) return Fail("versioned buffer backing smaller than the version's elements");
-
-    // The journal is replayed only once a backing is in hand: exhaustion is an expected transient state, and replaying on every
-    // retry multiplied host work while waiting for retirement.
-    std::shared_ptr<const BufferImage> image = input.image;
-    if (!input.gpuWritten && !image) {
-        std::string replayError;
-        const auto bytes = ReplayVersionedBuffer(input, replayError);
-        if (!bytes) return Fail(std::move(replayError));
-        image = BufferImage::FromBytes(*bytes);
-    }
-    if (stopped()) return Cancel();
-
-    const auto& resource = backing.buffer;
-    if (!resource) return Fail("versioned buffer backing has no buffer");
-    std::vector<std::shared_ptr<TrackedUploadTicket>> tickets;
-    // Indirect argument buffers are transient UAV outputs whose producer writes every command before they are consumed: uploading
-    // the zero-filled CPU image is unnecessary, and thousands of them would serialize behind the copy timeline at load.
-    const bool needsInitialContent =
-        !input.gpuWritten && !(input.flags.unorderedAccess && input.flags.indirectArguments && input.bytes.empty() && input.writes.empty());
-    if (needsInitialContent && image && image->ByteSize() != 0u) {
-        struct DirtyRange {
-            std::size_t offset = 0, size = 0;
-        };
-        std::vector<DirtyRange> dirtyRanges;
-        const auto held = backing.contentEpoch.load(std::memory_order_acquire);
-        // Catch up from what the backing holds: every journal write since its contentEpoch, when the journal reaches back that far.
-        // An append grows the image, so a smaller held image still qualifies; what lies past it is filled below.
-        const bool journalCoversBacking = !acquired.allocated && input.image && held != 0 && held >= input.journalBaseSequence &&
-            held <= input.writeSequence && backing.image && backing.image->ByteSize() <= image->ByteSize();
-        if (journalCoversBacking) {
-            if (const auto heldBytes = backing.image->ByteSize(); heldBytes < image->ByteSize()) {
-                dirtyRanges.push_back({heldBytes, image->ByteSize() - heldBytes});
-            }
-            for (const auto& write : input.writes) {
-                if (write.sequence <= held || write.byteSize == 0u) continue;
-                dirtyRanges.push_back({static_cast<std::size_t>(write.byteOffset), static_cast<std::size_t>(write.byteSize)});
-            }
-            std::ranges::sort(dirtyRanges, {}, &DirtyRange::offset);
-            std::vector<DirtyRange> merged;
-            for (const auto& range : dirtyRanges) {
-                if (!merged.empty() && range.offset <= merged.back().offset + merged.back().size + 256u) {
-                    const auto end = (std::max)(merged.back().offset + merged.back().size, range.offset + range.size);
-                    merged.back().size = end - merged.back().offset;
-                } else
-                    merged.push_back(range);
-            }
-            dirtyRanges = std::move(merged);
-        } else {
-            dirtyRanges.push_back({0, image->ByteSize()});
-        }
-        const auto dirtyBytes = std::accumulate(
-            dirtyRanges.begin(), dirtyRanges.end(), std::size_t{0}, [](std::size_t total, const DirtyRange& range) { return total + range.size; });
-        if (dirtyRanges.size() > 128u || dirtyBytes * 2u > image->ByteSize()) dirtyRanges.assign(1u, DirtyRange{0, image->ByteSize()});
-        // From here the backing's contents change: until the new contentEpoch is set it holds nothing a successor may rely on.
-        Forget(backing);
-        for (const auto& range : dirtyRanges) {
-            std::size_t remaining = range.size;
-            std::size_t offset = range.offset;
-            std::vector<StreamingUploadSegment> segments;
-            segments.reserve((range.size + BufferImage::PageBytes - 1u) / BufferImage::PageBytes + 1u);
-            while (remaining != 0u) {
-                const auto pageIndex = offset / BufferImage::PageBytes;
-                const auto pageOffset = offset % BufferImage::PageBytes;
-                if (pageIndex >= image->Pages().size() || !image->Pages()[pageIndex]) break;
-                const auto size = (std::min)(remaining, image->Pages()[pageIndex]->size() - pageOffset);
-                if (size == 0u) break;
-                segments.push_back({image->Pages()[pageIndex]->data() + pageOffset, size});
-                offset += size;
-                remaining -= size;
-            }
-            if (remaining != 0u) return Fail("versioned buffer paged image does not cover upload range");
-            // The backing is a pool lease (no lease and retired on the clock before it was handed out), so no queue touches it
-            // during the copy: that is what makes the worker path legal.
-            if (backing.retired.load(std::memory_order_acquire)) return Fail("versioned buffer backing was retired before its upload was queued");
-            auto ticket = input.uploadService->QueueTrackedStreamingUploadSegments(segments, range.size,
-                WorkerOwnedDestination{resource, WorkerOwnedDestination::Ownership::PooledBackingLease}, range.offset);
-            if (!ticket) return Fail("versioned buffer streaming upload enqueue failed");
-            tickets.push_back(std::move(ticket));
-        }
-    }
-    backing.image = input.gpuWritten ? nullptr : image;
-    backing.contentEpoch.store(input.writeSequence, std::memory_order_release);
-
-    auto version = std::make_shared<PublishedBufferVersion>();
-    version->revision = context.revision;
-    version->writeSequence = input.writeSequence;
-    version->elementCount = input.elementCount;
-    version->capacity = backing.capacityClass;
-    version->elementStride = input.elementStride;
-    version->revisionMode = mode;
-    version->contentVersion = context.revision;
-    version->contentEpoch = input.writeSequence;
-    version->backingEpoch = backing.generation;
-    version->resource = resource;
-    version->shrinkWindow = choice.window;
-    version->shrunk = choice.shrunk;
-    version->image = input.gpuWritten ? nullptr : std::move(image);
-    version->tag = input.tag;
-    version->lease = std::move(lease);
-
-    VersionedBufferBuildOutcome outcome;
-    outcome.kind = VersionedBufferBuildOutcome::Kind::Ready;
-    outcome.version = std::move(version);
-    outcome.ready = TokenForTickets(std::move(tickets));
-    return outcome;
 }
 
 // Disjoint byte intervals [begin, end), keyed by begin; touching ones merge.
@@ -265,13 +126,12 @@ std::shared_ptr<const async::GpuSubmissionSet> TokenHolding(
     return holding;
 }
 
-// Input::predecessorCopy: previous's contents GPU-copied into the leased backing where it lacks them, plus the delta uploaded.
-VersionedBufferBuildOutcome BuildFromPredecessor(const VersionedBufferBuildInput& input, const VersionedBufferBuildContext& context) {
+// Previous's contents GPU-copied into the leased backing where it lacks them, plus the delta uploaded.
+VersionedBufferBuildOutcome Build(const VersionedBufferBuildInput& input, const VersionedBufferBuildContext& context) {
     const auto stopped = [&] { return context.stopRequested && context.stopRequested(); };
     if (!input.uploadService || input.elementStride == 0u) return Fail("versioned buffer input/upload service/stride missing");
     if (!input.backingPool) return Fail("versioned buffer input has no backing pool");
-    if (!input.emitDelta) return Fail("versioned buffer predecessor copy has no emitDelta");
-    if (input.gpuWritten) return Fail("versioned buffer predecessor copy cannot be GPU-written");
+    if (!input.emitDelta) return Fail("versioned buffer input has no emitDelta");
     if (input.elementCount > input.capacity || input.elementCount > (std::numeric_limits<std::uint64_t>::max)() / input.elementStride)
         return Fail("versioned buffer count/capacity/stride invalid");
     const auto& previous = input.previous;
@@ -426,76 +286,12 @@ VersionedBufferBuildOutcome BuildFromPredecessor(const VersionedBufferBuildInput
 
 VersionedBufferBuildOutcome BuildVersionedBuffer(const VersionedBufferBuildInput& input, const VersionedBufferBuildContext& context) {
     try {
-        return input.predecessorCopy ? BuildFromPredecessor(input, context) : Build(input, context);
+        return Build(input, context);
     } catch (const std::exception& error) {
         return Fail(error.what());
     } catch (...) {
         return Fail("versioned buffer build failed");
     }
-}
-
-std::shared_ptr<const std::vector<std::byte>> ReplayVersionedBuffer(const VersionedBufferBuildInput& input, std::string& error) {
-    error.clear();
-    if (input.elementStride == 0u || input.elementCount > input.capacity || input.capacity > (std::numeric_limits<std::uint32_t>::max)()) {
-        error = "versioned buffer count/capacity/stride invalid";
-        return {};
-    }
-    if (input.elementCount > (std::numeric_limits<std::size_t>::max)() / input.elementStride) {
-        error = "versioned buffer byte count overflows address space";
-        return {};
-    }
-    const auto requiredBytes = static_cast<std::size_t>(input.elementCount * input.elementStride);
-    // A journal keeps writes back to its pool's trim floor (journalBaseSequence), which may precede `previous`.
-    std::uint64_t validatedSequence = input.previous ? (std::min)(input.previous->writeSequence, input.journalBaseSequence) : 0u;
-    for (const auto& write : input.writes) {
-        if (write.sequence <= validatedSequence || write.sequence > input.writeSequence || write.byteOffset > requiredBytes ||
-            write.byteSize > requiredBytes - write.byteOffset || write.byteOffset % input.elementStride != 0u ||
-            write.byteSize % input.elementStride != 0u) {
-            error = "versioned buffer write journal sequence/range invalid";
-            return {};
-        }
-        validatedSequence = write.sequence;
-    }
-    if (!input.writes.empty() && validatedSequence != input.writeSequence) {
-        error = "versioned buffer is not closed through requested write sequence";
-        return {};
-    }
-    if (input.image) {
-        if (input.image->ByteSize() != requiredBytes) {
-            error = "versioned buffer desired image byte count does not match rows";
-            return {};
-        }
-        return input.image->Materialize();
-    }
-    auto shadow = std::make_shared<std::vector<std::byte>>(requiredBytes);
-    if (!input.bytes.empty()) {
-        if (requiredBytes != input.bytes.size()) {
-            error = "versioned buffer byte count does not match rows";
-            return {};
-        }
-        *shadow = input.bytes;
-    } else if (input.previous && input.previous->image) {
-        const auto previous = input.previous->image->Materialize();
-        const auto copyBytes = (std::min)(shadow->size(), previous->size());
-        std::copy_n(previous->begin(), copyBytes, shadow->begin());
-    }
-    std::uint64_t lastSequence = input.previous ? input.previous->writeSequence : 0u;
-    for (const auto& write : input.writes) {
-        if (write.sequence <= lastSequence) continue;  // kept for the trim floor: already in `previous`
-        if (write.byteSize != 0u) {
-            error = "versioned buffer deltas require an immutable paged image";
-            return {};
-        }
-        lastSequence = write.sequence;
-    }
-    // A full snapshot is self-contained: its revision need not follow the previous journal sequence. Only delta captures must
-    // prove that their journal closes through the requested sequence.
-    if (input.bytes.empty() && ((!input.writes.empty() && lastSequence != input.writeSequence) ||
-                                   (input.writes.empty() && input.previous && input.writeSequence != input.previous->writeSequence))) {
-        error = "versioned buffer is not closed through requested write sequence";
-        return {};
-    }
-    return shadow;
 }
 
 std::shared_ptr<const async::GpuSubmissionSet> TokenForTickets(std::vector<std::shared_ptr<TrackedUploadTicket>> tickets) {

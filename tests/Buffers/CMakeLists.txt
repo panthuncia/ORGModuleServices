@@ -5,19 +5,14 @@ find_package(Threads REQUIRED)
 
 set(_services_root "${CMAKE_CURRENT_LIST_DIR}/../..")
 
-# Standalone, MS headers only: the paged image, the journal, the retirement clock and the backing pool (no org::Buffer: the
-# allocate hook makes none, and NoBufferBinding.cpp stands in for the pin-factory install), plus the public headers' self-containment.
+# Standalone, MS headers only: the retirement clock and the backing pool (no org::Buffer: the allocate hook makes none, and
+# NoBufferBinding.cpp stands in for the pin-factory install), plus the public headers' self-containment.
 add_executable(ORGBufferPoolTests
     BackingPoolTests.cpp
     NoBufferBinding.cpp
-    PublicHeaders/BufferImage.cpp
-    PublicHeaders/BufferJournal.cpp
     PublicHeaders/BackingPool.cpp
     PublicHeaders/VersionedBufferBuild.cpp
-    PublicHeaders/JournaledBufferSet.cpp
-    "${_services_root}/src/BackingPool.cpp"
-    "${_services_root}/src/BufferImage.cpp"
-    "${_services_root}/src/BufferJournal.cpp")
+    "${_services_root}/src/BackingPool.cpp")
 target_compile_features(ORGBufferPoolTests PRIVATE cxx_std_20)
 target_include_directories(ORGBufferPoolTests PRIVATE "${_services_root}/include")
 target_link_libraries(ORGBufferPoolTests PRIVATE Threads::Threads)
@@ -26,8 +21,8 @@ target_compile_options(ORGBufferPoolTests PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/
 add_test(NAME ORGBufferPoolTests COMMAND ORGBufferPoolTests)
 set_tests_properties(ORGBufferPoolTests PROPERTIES TIMEOUT 120)
 
-# Header-compiled against OpenRenderGraph/BasicRHI (nothing of them is linked): BuildVersionedBuffer, ReplayVersionedBuffer,
-# JournaledBufferSet and VersionedBufferFamily through a recording upload service. Needs ORG's third-party headers (flecs, spdlog,
+# Header-compiled against OpenRenderGraph/BasicRHI (nothing of them is linked): BuildVersionedBuffer through a recording upload
+# service. Needs ORG's third-party headers (flecs, spdlog,
 # boost, fmt), e.g. CommunityShaders' vcpkg tree; skipped without them.
 set(ORG_BUFFERS_TEST_EXTERN "${_services_root}/.." CACHE PATH "Directory holding OpenRenderGraph, BasicRHI, volk and BasicTelemetry")
 find_path(ORG_BUFFERS_TEST_DEPS_INCLUDE flecs.h
@@ -40,9 +35,6 @@ if(ORG_BUFFERS_TEST_DEPS_INCLUDE AND ORG_BUFFERS_TEST_VULKAN_INCLUDE AND EXISTS 
         VersionedBufferBuildTests.cpp
         NoBufferBinding.cpp
         "${_services_root}/src/BackingPool.cpp"
-        "${_services_root}/src/BufferImage.cpp"
-        "${_services_root}/src/BufferJournal.cpp"
-        "${_services_root}/src/JournaledBufferSet.cpp"
         "${_services_root}/src/VersionedBufferBuild.cpp")
     target_compile_features(ORGBufferBuildTests PRIVATE cxx_std_20)
     target_include_directories(ORGBufferBuildTests PRIVATE

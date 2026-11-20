@@ -5,7 +5,7 @@ Optional module-facing services shared by OpenRenderGraph hosts. OpenRenderGraph
 Provided services:
 
 - Exact-fence-retired D3D12 upload allocations and shader-visible descriptor heaps.
-- A versioned-buffer pool: GPU backings leased per version, filled by journal catch-up, and reused once their frames retired on a host retirement clock.
+- A versioned-buffer pool: GPU backings leased per version, filled by copying what they lack of the predecessor plus the delta, and reused once their frames retired on a host retirement clock.
 - Content-addressed DXC compilation with memory/disk artifacts and deduplicated in-flight requests.
 - DXIL targets by default and optional SPIR-V targets through `ORG_MODULE_SERVICES_ENABLE_VULKAN`.
 - Backend-neutral pipeline recipes, asynchronous deduplicated construction, family generations, and fence retirement.
@@ -123,8 +123,8 @@ ctest --test-dir build/growth-tests -C Release --output-on-failure
 ## Versioned-buffer pool
 
 Pooled GPU backings reused once retired (BasicRenderer's `VersionedGpuBufferBackingPool`, generalised; namespace `org::services`):
-a version is made into a backing leased from a pool and filled by journal catch-up from what that backing already holds; the
-backing is reused only after the frames that used it retired and its last lease went. Nothing waits on the GPU. CS uses it for
+a version is made into a backing leased from a pool and filled from what that backing already holds (a predecessor copy and the
+delta); the backing is reused only after the frames that used it retired and its last lease went. Nothing waits on the GPU. CS uses it for
 DCLF's payload and FrameValues and for growable-set growth; BasicRenderer uses it through its adapter
 (`BasicRenderer/Streaming/VersionedGpuBuffer.h`).
 
@@ -134,8 +134,8 @@ DCLF's payload and FrameValues and for growable-set growth; BasicRenderer uses i
   graph host's completed-frame callback; BasicRenderer: one per renderer). It replaces BasicRenderer's process-global
   `NotifyVersionedGpuBufferFrameRetirement`.
 - **`Backing`**: fixed `buffer`, `generation`, `capacityClass`, `byteCapacity`, `address`, `srvIndex`, `stride`, flags and
-  compatibility; atomics `contentEpoch` (the journal position its contents hold; 0: nothing), `safeAt`, `leases`, `retired`,
-  `readbackPins`, `bindingConsumers`; `image` (the lease holder's `BufferImage`; BasicRenderer).
+  compatibility; atomics `contentEpoch` (the write position its contents hold; 0: nothing), `safeAt`, `leases`, `retired`,
+  `readbackPins`, `bindingConsumers`.
 - **`BackingRequest`**: `capacityClass` (elements of `stride`, or bytes when `stride` is 0; the caller's size class), `stride`,
   `BackingFlags` (`unorderedAccess`, `indirectArguments`, `deviceAddress`), a host `compatibility` key, `name`, and an optional
   `like` (a buffer whose kind the allocation copies). Backings are reused only for an equal class, stride, flags and compatibility.
@@ -153,48 +153,27 @@ DCLF's payload and FrameValues and for growable-set growth; BasicRenderer uses i
     it allocates; it releases free backings of other classes and spares past `spareFree`. The lease is empty only when
     `maxPerClass` is reached: the caller suspends through `SubscribeAvailability(identity, wake)`, which runs once a backing may be
     reusable (a lease returned, a pin released, the clock passing a free backing's `safeAt`; `ArtifactSuspension::Capacity`).
-  - **`OldestContentEpoch()`**: the oldest journal position a backing in circulation holds, ignoring backings that hold nothing:
-    a journal's trim floor. Also `PinBindingConsumer` (a binding consumer's pin, refused for a backing already retired),
+  - **`OldestContentEpoch()`**: the oldest write position a backing in circulation holds, ignoring backings that hold nothing:
+    a host change journal's trim floor. Also `PinBindingConsumer` (a binding consumer's pin, refused for a backing already retired),
     `Count()` (census), `Trim()` and `Visit()`.
 - **`BackingLease`**: copyable (each copy counts); the last one released, on any thread, returns the backing lock-free through a
   Treiber return stack the acquirer drains. `Bind(safeAt)` (any thread, max-merged): not reused before the clock reaches `safeAt`,
   so a frame binds the point that retires with it and the backing stays immutable for the GPU after the last lease goes.
-- **`BufferImage`** (`BufferImage.h`): an immutable paged CPU image of a buffer's contents, in 64 KB pages shared between images
-  (BasicRenderer's `VersionedGpuBufferImage`).
-- **`BufferJournal`** (`BufferJournal.h`; BasicRenderer's `VersionedGpuBufferJournal`, its mutex moved): a manager's desired state
-  (a paged image plus the writes since the acknowledged version); `CaptureDesired()` yields an immutable `Capture` for the
-  producer. With `SetBackingPool(pool)`, `Acknowledge` keeps the writes back to min(acknowledged sequence,
-  `pool.OldestContentEpoch()`), so a reused backing at an older `contentEpoch` still catches up instead of being written whole.
-  BasicRenderer only; DCLF keeps its `KeptView`/`ChangeJournal`.
-- **`VersionedBufferBuild.h`**: `VersionedBufferBuildInput` (a complete image, or the predecessor plus the journal's writes since
-  `journalBaseSequence`; `backingPool` required; the host's identity as an opaque `tag`) and `PublishedBufferVersion` (owns its
-  backing's lease; `hostState` for host-seeded state that holds no consumer pin). `BuildVersionedBuffer(input, context)` acquires
-  (the predecessor's class for a Patch, a grown class for a Replace, preferring the backing nearest the request's sequence),
-  uploads what changed since that backing's `contentEpoch` (or everything) as `PooledBackingLease` writes, sets `contentEpoch` and
-  `image`, and returns Ready with a readiness token, or Suspended on an exhausted pool; it never throws.
-  `ReplayVersionedBuffer` is the pure byte replay shared with tests; `TokenForTickets` is the one readiness token over upload
-  tickets.
+- **`VersionedBufferBuild.h`**: `VersionedBufferBuildInput` (the predecessor, the host's `changedSince` and `emitDelta`;
+  `backingPool` required; the host's identity as an opaque `tag`) and `PublishedBufferVersion` (owns its backing's lease;
+  `hostState` for host-seeded state that holds no consumer pin). `BuildVersionedBuffer(input, context)` acquires (the
+  predecessor's class for a Patch, a grown class for a Replace, preferring the backing nearest the predecessor's sequence),
+  GPU-copies what that backing lacks of the predecessor, uploads the delta as `PooledBackingLease` writes, sets `contentEpoch`,
+  and returns Ready with a readiness token, or Suspended on an exhausted pool; it never throws. `TokenForTickets` is the one
+  readiness token over upload tickets. The host keeps the change journal (CS: DCLF's `ChangeJournal`).
 - **`Async/VersionedBufferProducer.h`**: `RegisterVersionedBufferProducer<Binding>(graph, kinds, lane, domain, taskName, hooks)`
   runs `BuildVersionedBuffer` as graph work (modelled on `RegisterVersionGrowthProducer`): ready with its uploads, suspended
   (`Capacity`) until the pool's availability wakes the graph. Hooks: `decorate` (seeds `hostState` before the version is frozen)
   and `wrap` (the artifact payload; BasicRenderer: a `RendererStateFragmentArtifact`).
-- **`Async/VersionedBufferFamily.h`**: `VersionedBufferFamily<Binding>`, the request authority for one persistent buffer address
-  (snapshot, GPU-written, content-derived and journal-capture requests, plus lock-free `Post*` variants), generic over the host's
-  `Requests` service (`SubmitLatest`, `PostLatest`). `Acknowledge(version)` makes the version the successor's predecessor and binds
-  the superseded backing to `Completed() + 2·framesInFlight + 1` (`Config::framesInFlight`, no longer a hardcoded 3).
-- **`JournaledBufferSet.h`**: buffers published together by journal catch-up (the DCLF payload model). There is one pool per part
-  (`JournaledPartConfig{name, stride, flags, policy}`; a part's class only grows). `Publish(requests, uploads)` (single
-  publisher) leases a backing per present part (`preferEpoch`: the journal's position) and calls the part's
-  `emit(target, sink)`. The emit sends every run since `target.contentEpoch` (everything at 0) through the `JournaledSink`
-  (`PooledBackingLease` uploads; the data is copied when queued), patches rows that hold their own address with
-  `target.address`, writes whole tails whole, and returns the new `contentEpoch` (0: written whole next time). The
-  `JournaledPublication` holds the leases and a `ready` token over the uploads; `Bind(safeAt)` binds every part, `Discard` marks a
-  failed publication's backings as holding nothing, and `OldestContentEpoch(part)` is the part's trim floor.
 
-The buffer tests are in `tests/Buffers`. `ORGBufferPoolTests` needs only these headers (the image, journal, clock and pool, and
-the public headers' self-containment). `ORGBufferBuildTests` (`BuildVersionedBuffer`, `ReplayVersionedBuffer`,
-`JournaledBufferSet` and `VersionedBufferFamily` through a recording upload service) also needs OpenRenderGraph's third-party
-headers (e.g. CommunityShaders' vcpkg tree) and the Vulkan SDK; it is skipped without them.
+The buffer tests are in `tests/Buffers`. `ORGBufferPoolTests` needs only these headers (the clock and pool, and the public
+headers' self-containment). `ORGBufferBuildTests` (`BuildVersionedBuffer` through a recording upload service) also needs
+OpenRenderGraph's third-party headers (e.g. CommunityShaders' vcpkg tree) and the Vulkan SDK; it is skipped without them.
 
 ```sh
 cmake -S tests/Buffers -B build/buffers-tests

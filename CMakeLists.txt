@@ -20,12 +20,9 @@ endif()
 add_library(ORGModuleServices STATIC
     src/BackingPool.cpp
     src/BackingPoolBinding.cpp
-    src/BufferImage.cpp
-    src/BufferJournal.cpp
     src/ComposedVersions.cpp
     src/GraphJob.cpp
     src/GrowableBufferSet.cpp
-    src/JournaledBufferSet.cpp
     src/PipelineRegistry.cpp
     src/PipelineService.cpp
     src/VersionedBufferBuild.cpp
@@ -46,7 +43,7 @@ if(ORG_MODULE_SERVICES_ENABLE_DXC)
             "${CMAKE_CURRENT_LIST_DIR}/../../extern/FidelityFX-SDK/framework/cauldron/framework/libs/dxc/inc"
             "$ENV{VULKAN_SDK}/Include/dxc")
     if(ORG_MODULE_SERVICES_DXC_INCLUDE_DIR)
-        target_sources(ORGModuleServices PRIVATE src/ShaderCompiler.cpp src/ShaderServiceAdapter.cpp)
+        target_sources(ORGModuleServices PRIVATE src/ShaderCompiler.cpp)
         target_include_directories(ORGModuleServices PRIVATE "${ORG_MODULE_SERVICES_DXC_INCLUDE_DIR}")
         target_compile_definitions(ORGModuleServices PUBLIC ORG_MODULE_SERVICES_HAS_DXC=1)
         if(ORG_MODULE_SERVICES_ENABLE_VULKAN)

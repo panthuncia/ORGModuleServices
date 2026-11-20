@@ -1,17 +1,12 @@
-// RetirementClock, BackingPool and BufferJournal, standalone (MS headers only; backings have no org::Buffer).
+// RetirementClock and BackingPool, standalone (MS headers only; backings have no org::Buffer).
 #include <ORGModuleServices/BackingPool.h>
-#include <ORGModuleServices/BufferImage.h>
-#include <ORGModuleServices/BufferJournal.h>
-#include <ORGModuleServices/VersionedBufferBuild.h>
 
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <memory>
 #include <set>
 #include <source_location>
-#include <span>
 #include <thread>
 #include <vector>
 
@@ -133,17 +128,14 @@ void TestAcquireReuseRules() {
     // Both free and reusable now; equal contentEpoch (0): either may come back, but nothing new is made.
     auto again = h.pool->Acquire(Request(4), BackingPool::kAnyEpoch, &info);
     Check(!info.allocated);
-    // A reused backing is a fresh fill: no published version names it, so its sealed mark is gone.
-    again->sealedBytes.store(48);
-    auto* sealed = again.Get().get();
+    auto* reused = again.Get().get();
     again.Reset();
     {
         // The two free backings come back (either order), nothing new made.
         auto a = h.pool->Acquire(Request(4), BackingPool::kAnyEpoch, &info);
         Check(!info.allocated);
         auto b = h.pool->Acquire(Request(4), BackingPool::kAnyEpoch, &info);
-        Check(!info.allocated && (a.Get().get() == sealed || b.Get().get() == sealed));
-        Check((a.Get().get() == sealed ? a : b)->sealedBytes.load() == 0);
+        Check(!info.allocated && (a.Get().get() == reused || b.Get().get() == reused));
     }
 
     // A readback pin and a binding consumer each keep a free backing from reuse.
@@ -413,121 +405,6 @@ void TestPoolOutlivedAndHooks() {
     survivor.Reset();
 }
 
-void TestJournal() {
-    BufferJournal journal(sizeof(std::uint32_t));
-    const std::uint32_t initialRows[]{10, 20, 30};
-    journal.Initialize(std::as_bytes(std::span(initialRows)), 3, 4);
-    auto capture = journal.CaptureDesired();
-    Check(capture.writeSequence == 1 && capture.elementCount == 3 && capture.capacity == 4 && capture.image &&
-        capture.image->ByteSize() == sizeof(initialRows));
-    const auto initialDesired = capture.image->Materialize();
-
-    auto published = std::make_shared<PublishedBufferVersion>();
-    published->writeSequence = capture.writeSequence;
-    published->elementCount = capture.elementCount;
-    published->capacity = capture.capacity;
-    published->elementStride = sizeof(std::uint32_t);
-    published->image = capture.image;
-    journal.Acknowledge(published);
-    Check(!journal.HasUnpublishedChanges());
-
-    journal.RequestCapacity(8);
-    const std::uint32_t replacement = 200;
-    journal.AppendWrite(1, std::as_bytes(std::span(&replacement, 1)), 4);
-    capture = journal.CaptureDesired();
-    Check(capture.previous == published && capture.writes.size() == 2 && capture.capacity == 8 && capture.elementCount == 4 &&
-        capture.journalBaseSequence == published->writeSequence && capture.image && journal.HasUnpublishedChanges());
-    Check(std::memcmp(initialDesired->data(), initialRows, sizeof(initialRows)) == 0);
-    const auto capturedImage = capture.image;
-    const auto capturedDesired = capturedImage->Materialize();
-    const auto* desiredRows = reinterpret_cast<const std::uint32_t*>(capturedDesired->data());
-    Check(desiredRows[0] == 10 && desiredRows[1] == 200 && desiredRows[2] == 30 && desiredRows[3] == 0);
-    const std::uint32_t overlap[]{300, 400};
-    journal.AppendWrite(1, std::as_bytes(std::span(overlap)), 4);
-    // Captures are immutable while the journal's image advances.
-    const auto recaptured = capturedImage->Materialize();
-    desiredRows = reinterpret_cast<const std::uint32_t*>(recaptured->data());
-    Check(desiredRows[1] == 200 && desiredRows[2] == 30);
-    const auto repeatedCapture = journal.CaptureDesired();
-    Check(repeatedCapture.writes.size() == capture.writes.size() + 1u && repeatedCapture.image != capturedImage);
-    const std::uint32_t lowRangeReplacement = 11;
-    journal.AppendWrite(0, std::as_bytes(std::span(&lowRangeReplacement, 1)), 1);
-    const auto sparseCapture = journal.CaptureDesired();
-    Check(sparseCapture.elementCount == 4 && sparseCapture.image && sparseCapture.image->ByteSize() == 4 * sizeof(std::uint32_t));
-    const auto sparseBytes = sparseCapture.image->Materialize();
-    const auto* sparseRows = reinterpret_cast<const std::uint32_t*>(sparseBytes->data());
-    Check(sparseRows[0] == 11 && sparseRows[1] == 300 && sparseRows[2] == 400 && sparseRows[3] == 0);
-
-    // Sparse growth across a page: the former tail page grows, zero-filled.
-    BufferJournal crossPage(1);
-    const std::byte first{0x2a};
-    crossPage.Initialize(std::span(&first, 1), 1, BufferImage::PageBytes + 8u);
-    const std::byte distant{0x5b};
-    crossPage.AppendWrite(BufferImage::PageBytes + 5u, std::span(&distant, 1), BufferImage::PageBytes + 6u);
-    const auto crossPageCapture = crossPage.CaptureDesired();
-    const auto crossPageBytes = crossPageCapture.image->Materialize();
-    Check(crossPageBytes->size() == BufferImage::PageBytes + 6u && (*crossPageBytes)[0] == first &&
-        (*crossPageBytes)[BufferImage::PageBytes - 1u] == std::byte{} && (*crossPageBytes)[BufferImage::PageBytes + 5u] == distant);
-
-    const std::uint32_t compactedRows[]{7, 8};
-    const auto replacementSequence = journal.ReplaceImage(std::as_bytes(std::span(compactedRows)), 2, 8);
-    const auto compacted = journal.CaptureDesired();
-    Check(compacted.writeSequence == replacementSequence && compacted.elementCount == 2 && compacted.capacity == 8 && compacted.image &&
-        compacted.image->ByteSize() == sizeof(compactedRows));
-    const auto compactedBytes = compacted.image->Materialize();
-    const auto* compactedImage = reinterpret_cast<const std::uint32_t*>(compactedBytes->data());
-    Check(compactedImage[0] == 7 && compactedImage[1] == 8);
-
-    // Acknowledge drops the writes the version holds, and ignores an older version.
-    auto newer = std::make_shared<PublishedBufferVersion>();
-    newer->writeSequence = compacted.writeSequence;
-    journal.Acknowledge(newer);
-    Check(journal.CaptureDesired().writes.empty() && !journal.HasUnpublishedChanges());
-    journal.Acknowledge(published);
-    Check(journal.CaptureDesired().previous == newer);
-
-    bool threw = false;
-    try {
-        journal.AppendWrite(0, std::as_bytes(std::span(compactedRows)), 9);  // past the desired capacity
-    } catch (const std::out_of_range&) {
-        threw = true;
-    }
-    Check(threw);
-}
-
-// Acknowledge trims to min(acknowledged, the pool's OldestContentEpoch()): writes an older backing still needs stay.
-void TestJournalTrimFloor() {
-    Harness h({.name = "journal", .maxPerClass = 0, .framesInFlight = 3, .spareFree = 4});
-    BufferJournal journal(sizeof(std::uint32_t));
-    journal.SetBackingPool(h.pool);
-    const std::uint32_t rows[]{1, 2, 3, 4};
-    journal.Initialize(std::as_bytes(std::span(rows)), 4, 4);
-    const auto version = [](std::uint64_t sequence) {
-        auto published = std::make_shared<PublishedBufferVersion>();
-        published->writeSequence = sequence;
-        return std::shared_ptr<const PublishedBufferVersion>(std::move(published));
-    };
-    for (std::uint32_t i = 0; i < 4; ++i) journal.AppendWrite(i, std::as_bytes(std::span(&rows[i], 1)), 4);  // sequences 2..5
-    auto older = h.pool->Acquire(Request(4));
-    auto newer = h.pool->Acquire(Request(4));
-    older->contentEpoch.store(3);
-    newer->contentEpoch.store(5);
-    journal.Acknowledge(version(5));
-    auto capture = journal.CaptureDesired();
-    Check(capture.journalBaseSequence == 3 && capture.writes.size() == 2 && capture.writes[0].sequence == 4);
-    older->contentEpoch.store(0);  // holds nothing: no floor
-    journal.AppendWrite(0, std::as_bytes(std::span(&rows[0], 1)), 4);  // 6
-    journal.Acknowledge(version(6));
-    capture = journal.CaptureDesired();
-    Check(capture.journalBaseSequence == 5 && capture.writes.size() == 1 && capture.writes[0].sequence == 6);
-    older->contentEpoch.store(2);  // a floor below the base never brings dropped writes back
-    journal.AppendWrite(0, std::as_bytes(std::span(&rows[0], 1)), 4);  // 7
-    journal.Acknowledge(version(7));
-    Check(journal.CaptureDesired().journalBaseSequence == 5);
-    older.Reset();
-    newer.Reset();
-}
-
 } // namespace
 
 int main() {
@@ -539,8 +416,6 @@ int main() {
     TestLeaseReturnFromOtherThreads();
     TestOldestContentEpoch();
     TestPoolOutlivedAndHooks();
-    TestJournal();
-    TestJournalTrimFloor();
     std::puts("ORGBufferPoolTests: all passed");
     return 0;
 }
