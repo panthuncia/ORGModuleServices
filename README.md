@@ -141,7 +141,7 @@ DCLF's payload and FrameValues and for growable-set growth; BasicRenderer uses i
   `like` (a buffer whose kind the allocation copies). Backings are reused only for an equal class, stride, flags and compatibility.
 - **`BackingPoolHooks`**: `allocate` (required; BasicRenderer: `CreateIndexedStructuredBuffer`, CS: an `org::Buffer` and its SRV;
   throws when it cannot: no fallback), `tag` (memory attribution), `telemetry(BackingPoolEvent, name, value)` (any thread),
-  `env` (a portable environment read replacing `_dupenv_s`), `exclusive(body)` (runs the acquirer-side bodies inside the host's
+  `exclusive(body)` (runs the acquirer-side bodies inside the host's
   serialization: BasicRenderer's moved pool mutex; empty in CS) and `retire` (takes a released backing's buffer so the host picks
   the destroying thread; CS: not the render thread).
 - **`BackingPool::Create(hooks, clock, Config)`**: `Config{name, maxPerClass (0: no cap; CS), framesInFlight (the host's, for

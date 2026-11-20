@@ -118,8 +118,6 @@ struct BackingPoolHooks {
     std::function<void(Buffer& buffer, std::string_view name)> tag;
     // Optional, any thread: counters and gauges (BasicTelemetry in BasicRenderer, the DCLF report in CS).
     std::function<void(BackingPoolEvent event, std::string_view name, std::uint64_t value)> telemetry;
-    // Optional: a portable environment read (replaces _dupenv_s), for the pool's and the producer's trace switches.
-    std::function<std::optional<std::string>(std::string_view name)> env;
     // Optional: runs the acquirer-side bodies (Acquire, Trim, OldestContentEpoch, Visit) as `body()` inside the host's own
     // serialization, for a host whose pools see several acquirers (BasicRenderer: its pool mutex, moved). Empty (CS): the
     // single-acquirer contract holds and the bodies run directly.

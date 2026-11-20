@@ -774,7 +774,6 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
 	// pop_front, and an entry leaves this map before its wake can be popped.
 	std::unordered_map<ArtifactKey, PendingWaiterWake*, typename ArtifactKey::Hasher> queuedWaiterWakes;
 	bool wakingWaiters = false;
-	std::chrono::steady_clock::time_point nextStallDump{};
 	std::vector<ArtifactSnapshot> propagatedReady;
 	tbb::concurrent_queue<Completion> completions;
 	// Completions of kinds whose policy says bulkCompletions. A pass applies the others
@@ -1466,19 +1465,6 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
 			retentionTrace->Config().includeRetentionEvents &&
 			retentionTrace->Config().detail == AsyncStateGraphTraceDetail::FullDependencies;
 		std::uint64_t reclaimedInBatch = 0;
-		static const bool traceGpuLifetime = [] {
-#ifdef _WIN32
-			char* value = nullptr;
-			size_t length = 0;
-			const bool enabled = _dupenv_s(&value, &length, "SARP_GPU_LIFETIME_TRACE") == 0 &&
-				value && value[0] && value[0] != '0';
-			std::free(value);
-			return enabled;
-#else
-			const char* value = std::getenv("SARP_GPU_LIFETIME_TRACE");
-			return value && value[0] && value[0] != '0';
-#endif
-		}();
 		StoredVersionKey candidate;
 		for (std::size_t examined = 0;
 			examined < maxCandidatesPerDrain && reclaimQueue.try_pop(candidate); ++examined) {
@@ -1496,7 +1482,6 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
 			const bool externallyLeased = lease != versionLeases.end() && !lease->second.expired();
 			bool waiterReferenced = false;
 			bool cursorReferenced = false;
-			ArtifactKey retainingConsumer{};
 			bool referenced = exactPinned || externallyLeased;
 			if (const auto dependents = waiters.find(candidate.address);
 				!referenced && dependents != waiters.end()) {
@@ -1510,7 +1495,6 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
 							return RecipeReferences(candidate, successor.requirements);
 						});
 					referenced = waiterReferenced;
-					if (waiterReferenced) retainingConsumer = node.key;
 					if (referenced) break;
 				}
 			}
@@ -1527,21 +1511,7 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
 					}));
 				referenced = referenced || cursorReferenced;
 			}
-			if (referenced) {
-				if (traceGpuLifetime && KindPolicy(candidate.address.kind).traceResourceLifetime) {
-					spdlog::info("GpuLifetime graph_retain: address=({},{}) revision={} generation={} exact={} lease={} waiter={} cursor={} consumer=({},{},{})",
-						candidate.address.primaryID, candidate.address.variantID, candidate.revision,
-						candidate.generation, exactPinned, externallyLeased, waiterReferenced,
-						cursorReferenced, static_cast<unsigned>(retainingConsumer.kind),
-						retainingConsumer.primaryID, retainingConsumer.variantID);
-				}
-				continue;
-			}
-			if (traceGpuLifetime && KindPolicy(candidate.address.kind).traceResourceLifetime) {
-				spdlog::info("GpuLifetime graph_reclaim: address=({},{}) revision={} generation={}",
-					candidate.address.primaryID, candidate.address.variantID,
-					candidate.revision, candidate.generation);
-			}
+			if (referenced) continue;
 			const auto reclaimed = candidate;
 			MarkViewDirty(candidate.address);
 			pendingRetirement.push_back(std::move(version->second));
@@ -2025,91 +1995,6 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
             output += "]";
         }
         visited.erase(key);
-    }
-
-    // ORG_STATEGRAPH_STALL_DUMP=1: every 5 s, log each desired node that has been
-    // outstanding for over 5 s with its full requirement set as the drain resolves
-    // it now, the dependency cursor it would select, and whether the reverse wake
-    // edge is installed. A node whose dependencies are all satisfied while it is
-    // still Blocked is flagged: it missed a wake. Diagnostic only; no state changes.
-    void DumpStalledNodes(std::chrono::steady_clock::time_point now) {
-        static const bool enabled = [] {
-#ifdef _WIN32
-            char* value = nullptr;
-            size_t length = 0;
-            const bool on = _dupenv_s(&value, &length, "ORG_STATEGRAPH_STALL_DUMP") == 0 &&
-                value && value[0] && value[0] != '0';
-            std::free(value);
-            return on;
-#else
-            const char* value = std::getenv("ORG_STATEGRAPH_STALL_DUMP");
-            return value && value[0] && value[0] != '0';
-#endif
-        }();
-        if (!enabled || now < nextStallDump) return;
-        constexpr auto stallAge = std::chrono::seconds(5);
-        nextStallDump = now + stallAge;
-        constexpr std::size_t maxNodes = 64;
-        std::size_t stalled = 0;
-        std::size_t lostWakes = 0;
-        for (const auto& [key, node] : nodes) {
-            if (!node.desired || !IsOutstandingState(node.state) || now - node.stateSince < stallAge)
-                continue;
-            ++stalled;
-            const bool satisfied = DependenciesSatisfied(node);
-            const bool lostWake = satisfied && node.state == ArtifactReadiness::Blocked &&
-                !node.buildInFlight && !node.suspension && !node.retryAt;
-            if (lostWake) ++lostWakes;
-            if (stalled > maxNodes) continue;
-            const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - node.stateSince).count();
-            std::string line = std::format(
-                "StateGraph stall [{}]: {} state={} age={}ms rev={}/{} versionGen={} gen={} "
-                "inFlight={} attempted={} suspension={} retry={} terminal={} successors={} "
-                "edges={} requested={} satisfied={}{}",
-                graphName, KeyString(key), ReadinessName(node.state), age, node.producedRevision,
-                node.desiredRevision, node.versionGeneration, node.generation, node.buildInFlight,
-                node.buildAttempted, node.suspension ? node.suspension->identity : 0,
-                node.retryAt.has_value(), node.terminalFailure, node.successors.size(),
-                node.installedWaiterKeys.size(), node.requestedRequirements.size(), satisfied,
-                lostWake ? " LOST-WAKE" : "");
-            if (!node.error.empty()) line += " error=" + node.error;
-            for (const auto& requirement : node.requirements) {
-                ArtifactSnapshot currentSnapshot;
-                const auto* selected = SelectSnapshot(requirement, currentSnapshot);
-                const auto dependency = nodes.find(requirement.key);
-                const auto edges = waiters.find(requirement.key);
-                const bool edge = edges != waiters.end() && edges->second.contains(key);
-                line += std::format(
-                    "\n    <- {} policy={} invalidation={} needs={} minRev={} latchRev={} gen={} "
-                    "satisfied={} selected={} edge={}",
-                    KeyString(requirement.key), static_cast<unsigned>(requirement.policy),
-                    static_cast<unsigned>(requirement.invalidation),
-                    ReadinessName(requirement.requiredReadiness), requirement.minimumRevision,
-                    requirement.minimumLatchRevision, requirement.requiredGeneration,
-                    RequirementSatisfied(requirement),
-                    selected ? std::format("{}:{}:{}", selected->revision, selected->generation,
-                        ReadinessName(selected->readiness)) : std::string("none"),
-                    edge);
-                if (dependency == nodes.end()) {
-                    line += " node=absent";
-                } else {
-                    const auto& value = dependency->second;
-                    line += std::format(" node={} rev={}/{} versionGen={} desired={} age={}ms",
-                        ReadinessName(value.state), value.producedRevision, value.desiredRevision,
-                        value.versionGeneration, value.desired,
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                            now - value.stateSince).count());
-                }
-            }
-            spdlog::warn("{}", line);
-        }
-        if (stalled != 0) {
-            spdlog::warn("StateGraph stall [{}]: stalled={} lostWakes={} nodes={} pending={} "
-                "pendingWaiterWakes={} suspended={} completions={}", graphName, stalled, lostWakes,
-                nodes.size(), pending.size(), pendingWaiterWakes.size(), suspendedByIdentity.size(),
-                completionCount.load(std::memory_order_relaxed));
-        }
     }
 
     std::vector<ArtifactSnapshot> DependencySnapshots(const Node& node) const {
@@ -3419,7 +3304,6 @@ struct StateGraph<Binding>::Impl : std::enable_shared_from_this<typename StateGr
 				if (registered.empty()) exactWaiters.erase(found);
 			}
 			recordApplyPhase("apply_exact_waiters");
-			DumpStalledNodes(now);
             callbacks.reserve(readyCallbacks.size());
             for (const auto& [_, callback] : readyCallbacks) callbacks.push_back(callback);
 			hasImmediateWork = !postedAwaits.empty() || !postedIntents.empty() ||
