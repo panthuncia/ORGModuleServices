@@ -28,10 +28,39 @@ bool SameShaderFile(std::string_view changed, std::string_view source) {
 constexpr size_t kMaxErrors = 8;
 }
 
+LivePipelineSlot::LivePipelineSlot(PipelineVersionPtr first) : versions_(std::make_shared<const Versions>(Versions{ std::move(first) })) {}
+
+PipelineVersionPtr LivePipelineSlot::Current() const noexcept { return versions_.load(std::memory_order_acquire)->back(); }
+
+PipelineVersionPtr LivePipelineSlot::At(uint64_t generation) const noexcept {
+    const auto versions = versions_.load(std::memory_order_acquire);
+    // Newest first: the first one published at or before the generation.
+    for (auto it = versions->rbegin(); it != versions->rend(); ++it)
+        if ((*it)->generation <= generation) return *it;
+    return versions->front();
+}
+
+void LivePipelineSlot::Append(PipelineVersionPtr version) {
+    auto next = std::make_shared<Versions>(*versions_.load(std::memory_order_acquire));
+    next->push_back(std::move(version));
+    versions_.store(std::shared_ptr<const Versions>(std::move(next)), std::memory_order_release);
+}
+
+void LivePipelineSlot::DropBefore(uint64_t oldest, std::vector<PipelinePayload>& released) {
+    const auto versions = versions_.load(std::memory_order_acquire);
+    // The version the oldest pin binds, and every newer one, stay.
+    size_t keep = 0;
+    for (size_t i = 0; i < versions->size(); ++i)
+        if ((*versions)[i]->generation <= oldest) keep = i;
+    if (keep == 0) return;
+    for (size_t i = 0; i < keep; ++i) released.push_back((*versions)[i]->payload);
+    versions_.store(std::make_shared<const Versions>(versions->begin() + static_cast<std::ptrdiff_t>(keep), versions->end()), std::memory_order_release);
+}
+
 struct PipelineRegistry::Entry {
     std::weak_ptr<LivePipelineSlot> slot;
     LivePipelineDesc desc;     // sources normalized; immutable once registered
-    uint64_t fingerprint{};    // the slot's payload's (mutex_)
+    uint64_t fingerprint{};    // the slot's newest version's (mutex_)
     bool stale{};              // built for an earlier SourcesGeneration: in the next reload (mutex_)
     bool inBatch{};            // the running reload's (mutex_)
 };
@@ -72,7 +101,8 @@ void PipelineRegistry::PruneLocked() {
 }
 
 std::shared_ptr<LivePipelineSlot> PipelineRegistry::Register(LivePipelineDesc desc, PipelinePayload payload, uint64_t fingerprint, uint64_t builtFor) {
-    auto slot = std::make_shared<LivePipelineSlot>(std::move(payload));
+    auto slot = std::make_shared<LivePipelineSlot>(
+        std::make_shared<const PipelineVersion>(PipelineVersion{ std::move(payload), generation_.load(std::memory_order_acquire) }));
     auto entry = std::make_shared<Entry>();
     entry->slot = slot;
     for (auto& source : desc.sources) source = NormalizeShaderPath(source);
@@ -101,22 +131,31 @@ void PipelineRegistry::RequestReload(std::string_view changedFile, bool force) {
     asked_.store(true, std::memory_order_release);
 }
 
+std::shared_ptr<const PipelinePin> PipelineRegistry::Pin() {
+    std::scoped_lock lock(mutex_);
+    auto pin = std::make_shared<const PipelinePin>(PipelinePin{ generation_.load(std::memory_order_acquire) });
+    if (pins_.size() >= prunePinsAt_) {
+        std::erase_if(pins_, [](const std::weak_ptr<const PipelinePin>& held) { return held.expired(); });
+        prunePinsAt_ = (std::max<size_t>)(64, pins_.size() * 2);
+    }
+    pins_.push_back(pin);
+    return pin;
+}
+
 PipelineRegistry::ServiceResult PipelineRegistry::Service() {
     ServiceResult result;
     if (running_ && running_->remaining.load(std::memory_order_acquire) == 0) {
-        FinishBatch();
+        result.published += FinishBatch();
         result.finished = true;
     }
     if (!running_ && asked_.load(std::memory_order_acquire)) {
         StartBatch();
         // Every rebuild may have completed at once (nothing changed, or no entry to rebuild).
         if (running_ && running_->remaining.load(std::memory_order_acquire) == 0) {
-            FinishBatch();
+            result.published += FinishBatch();
             result.finished = true;
         }
     }
-    std::scoped_lock lock(mutex_);
-    result.staged = !staged_.empty();
     return result;
 }
 
@@ -183,59 +222,70 @@ void PipelineRegistry::StartBatch() {
         for (size_t i = 0; i < batch->entries.size(); ++i) batch->Complete(i, LiveBuild{ {}, 0, "the registry's submitter refused the reload" });
 }
 
-void PipelineRegistry::FinishBatch() {
+uint32_t PipelineRegistry::FinishBatch() {
     auto batch = std::exchange(running_, {});
     ReloadOutcome outcome;
     outcome.entries = static_cast<uint32_t>(batch->entries.size());
     outcome.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - batch->started).count();
-    std::scoped_lock lock(mutex_);
-    outcome.serial = outcome_.serial + 1;
-    for (size_t i = 0; i < batch->entries.size(); ++i) {
-        auto& entry = *batch->entries[i];
-        auto& build = batch->results[i].build;
-        entry.inBatch = false;
-        if (build.payload) {
-            staged_.push_back({ entry.slot, batch->entries[i], std::move(build.payload), build.fingerprint });
-            ++outcome.rebuilt;
-        } else if (!build.error.empty()) {
-            ++outcome.failed;
-            if (outcome.errors.size() < kMaxErrors) outcome.errors.push_back(entry.desc.id + ": " + build.error);
-        } else {
-            ++outcome.unchanged;
-        }
-    }
-    outcome_ = std::move(outcome);
-}
-
-uint32_t PipelineRegistry::Publish(uint64_t retirementPoint) {
-    std::vector<Staged> staged;
+    uint32_t published = 0;
     {
         std::scoped_lock lock(mutex_);
-        staged.swap(staged_);
-    }
-    if (staged.empty()) return 0;
-    uint32_t published = 0;
-    std::vector<Retired> replaced;
-    replaced.reserve(staged.size());
-    for (auto& item : staged) {
-        const auto slot = item.slot.lock();
-        if (!slot) continue;  // released meanwhile: nothing binds it
-        replaced.push_back({ retirementPoint, slot->Exchange(std::move(item.payload)) });
-        if (const auto entry = item.entry.lock()) {
-            std::scoped_lock lock(mutex_);
-            entry->fingerprint = item.fingerprint;
+        outcome.serial = outcome_.serial + 1;
+        // Every new payload of this reload is a version of the same next generation. A pin taken before binds none of them.
+        const uint64_t generation = generation_.load(std::memory_order_acquire) + 1;
+        for (size_t i = 0; i < batch->entries.size(); ++i) {
+            auto& entry = *batch->entries[i];
+            auto& build = batch->results[i].build;
+            entry.inBatch = false;
+            if (build.payload) {
+                // A slot released meanwhile: nothing binds it.
+                if (const auto slot = entry.slot.lock()) {
+                    slot->Append(std::make_shared<const PipelineVersion>(PipelineVersion{ std::move(build.payload), generation }));
+                    entry.fingerprint = build.fingerprint;
+                    ++published;
+                }
+                ++outcome.rebuilt;
+            } else if (!build.error.empty()) {
+                ++outcome.failed;
+                if (outcome.errors.size() < kMaxErrors) outcome.errors.push_back(entry.desc.id + ": " + build.error);
+            } else {
+                ++outcome.unchanged;
+            }
         }
-        ++published;
+        if (published) generation_.store(generation, std::memory_order_release);
+        outcome.generation = generation_.load(std::memory_order_acquire);
+        outcome_ = std::move(outcome);
     }
-    {
-        std::scoped_lock lock(retiredMutex_);
-        for (auto& retired : replaced) retired_.push_back(std::move(retired));
-    }
-    if (published) {
-        generation_.fetch_add(1, std::memory_order_acq_rel);
-        Notify();
-    }
+    if (published) Notify();
     return published;
+}
+
+uint64_t PipelineRegistry::OldestPinnedLocked() {
+    // Unpinned, the newest versions are what the next pin binds.
+    uint64_t oldest = generation_.load(std::memory_order_acquire);
+    std::erase_if(pins_, [&](const std::weak_ptr<const PipelinePin>& held) {
+        const auto pin = held.lock();
+        if (!pin) return true;
+        oldest = (std::min)(oldest, pin->generation);
+        return false;
+    });
+    prunePinsAt_ = (std::max<size_t>)(64, pins_.size() * 2);
+    return oldest;
+}
+
+void PipelineRegistry::Release(uint64_t retirementPoint) {
+    std::vector<PipelinePayload> released;
+    {
+        std::scoped_lock lock(mutex_);
+        const uint64_t oldest = OldestPinnedLocked();
+        if (oldest <= releasedTo_) return;
+        releasedTo_ = oldest;
+        for (const auto& entry : entries_)
+            if (const auto slot = entry->slot.lock()) slot->DropBefore(oldest, released);
+    }
+    if (released.empty()) return;
+    std::scoped_lock lock(retiredMutex_);
+    for (auto& payload : released) retired_.push_back({ retirementPoint, std::move(payload) });
 }
 
 void PipelineRegistry::Retire(uint64_t completedPoint) noexcept {
@@ -251,15 +301,8 @@ void PipelineRegistry::Retire(uint64_t completedPoint) noexcept {
 
 void PipelineRegistry::DrainRetired() noexcept {
     std::deque<Retired> retired;
-    std::vector<Staged> staged;
-    {
-        std::scoped_lock lock(retiredMutex_);
-        retired.swap(retired_);
-    }
-    {
-        std::scoped_lock lock(mutex_);
-        staged.swap(staged_);
-    }
+    std::scoped_lock lock(retiredMutex_);
+    retired.swap(retired_);
 }
 
 void PipelineRegistry::Notify() {
