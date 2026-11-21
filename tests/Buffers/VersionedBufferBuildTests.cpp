@@ -111,7 +111,7 @@ public:
     void UploadTextureSubresources(org::runtime::UploadTarget, rhi::Format, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
         const rhi::helpers::SubresourceData*, uint32_t, const char*, int) override {}
     void QueueResourceCopy(const std::shared_ptr<org::Resource>&, const std::shared_ptr<org::Resource>&, size_t) override {}
-    void ProcessDeferredReleases(uint8_t) override {}
+    void ProcessDeferredReleases(uint32_t) override {}
     void Cleanup() override {}
 };
 

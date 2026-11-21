@@ -154,8 +154,8 @@ void TestAcquireReuseRules() {
     Check(!info.allocated && avoided.Get() != pinnedBacking);
     consumer.reset();
     Check(pinnedBacking->bindingConsumers.load() == 0);
-    auto reused = pins.pool->Acquire(Request(8), BackingPool::kAnyEpoch, &info);
-    Check(!info.allocated && reused.Get() == pinnedBacking);
+    auto reusedPinned = pins.pool->Acquire(Request(8), BackingPool::kAnyEpoch, &info);
+    Check(!info.allocated && reusedPinned.Get() == pinnedBacking);
     Check(!pinnedBacking->retired.load());
 
     // Another stride or compatibility key is never handed out for a request.
