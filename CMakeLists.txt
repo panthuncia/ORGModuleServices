@@ -23,6 +23,7 @@ add_library(ORGModuleServices STATIC
     src/Async/ExecutorTaskService.cpp
     src/BackingPool.cpp
     src/BackingPoolBinding.cpp
+    src/BuildContext.cpp
     src/ComposedVersions.cpp
     src/GraphJob.cpp
     src/GraphHostBackings.cpp
@@ -38,6 +39,7 @@ add_library(ORGModuleServices STATIC
     src/RecordingPools.cpp
     src/RetirementJoin.cpp
     src/SecondaryListPool.cpp
+    src/StagedBuilds.cpp
     src/TexelEncoding.cpp
     src/VersionedBufferBuild.cpp
     src/VersionedBufferGrowth.cpp
@@ -79,6 +81,7 @@ if(ORG_MODULE_SERVICES_BUILD_TESTS)
     add_subdirectory(tests/Services)
     add_subdirectory(tests/Growth)
     add_subdirectory(tests/Buffers)
+    add_subdirectory(tests/Builds)
     add_subdirectory(tests/ShaderStore)
     add_subdirectory(tests/Variables)
     add_executable(ORGModuleServicesTests tests/ServicesTests.cpp)
