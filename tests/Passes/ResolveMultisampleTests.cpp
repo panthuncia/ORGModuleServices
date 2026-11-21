@@ -83,14 +83,16 @@ org::TextureDescription Describe(uint32_t samples, bool target, bool unordered, 
     return description;
 }
 
-// Clears a render target through its RTV, in an empty render pass.
+// Clears a render target through its RTV with the load op of an empty render pass.
 struct ClearBindings { org::DeclaredViewToken target; };
 struct ClearFrame { uint32_t width = 0, height = 0; };
 class ClearPass final : public org::TypedRenderGraphPass<ClearPass, ClearFrame, ClearBindings> {
 public:
     explicit ClearPass(std::shared_ptr<org::Resource> target) : m_target(std::move(target)) {}
     ClearBindings Declare(org::PassBuilder& builder) {
-        return {builder.RenderTargetClear(m_target).View()};
+        // The load op clears it, so it is a render target. RenderTargetClear is for ClearRTV, which Vulkan does in a
+        // transfer layout.
+        return {builder.RenderTarget(m_target).View()};
     }
     ClearFrame Prepare(const ClearBindings& bindings, const org::PassPrepareContext& preparation) const {
         const auto& texture = preparation.Describe(bindings.target).texture;
