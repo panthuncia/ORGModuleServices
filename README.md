@@ -143,6 +143,23 @@ cmake --build build/growth-tests --config Release
 ctest --test-dir build/growth-tests -C Release --output-on-failure
 ```
 
+## Commit uploads
+
+`CommitUploads.h` (namespace `org::services`) writes a commit's bytes on the upload service's owner thread:
+
+- **`CommitUploads`** stages each write into a pooled `StagedUploadBatch` (`AcquireStagedBatch`) and submits the batch to the
+  active upload service when it goes. A versioned buffer is written in the version the adopted `NamedVersions` set names.
+- **`LatchedUploads`** writes per-run values into a `LatchedList`'s copies in the run's latch region; a value with no copy is staged
+  by its `CommitUploads`. `Finish` zeroes the copies not written.
+- **`OwnedRow<Row, Binding>`** (`OwnedRows.h`) is a GPU row plus the owners of the descriptors its `DescriptorIndex` fields name.
+  `Binding` is the host's descriptor binding (an index, an owner, a validity test; `OwnedBinding` by default).
+- **`ContentOwners`** (`ContentOwners.h`) tracks those owners by target key and byte range. `Snapshot(seal)` gives one owner for an
+  execution to hold; the host's `seal` decides how they are released.
+- The host passes `CommitUploadHooks`: `onError` for an error a write can't return (a row naming descriptors uploaded with no
+  content owners), and an optional `IUploadBytesSink` for byte statistics.
+
+The CPU tests (owned rows, content owners) are in `tests/Uploads`.
+
 ## Versioned-buffer pool
 
 Pooled GPU backings reused once retired (BasicRenderer's `VersionedGpuBufferBackingPool`, generalised; namespace `org::services`):
