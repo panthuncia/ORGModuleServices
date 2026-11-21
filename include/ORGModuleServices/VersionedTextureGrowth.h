@@ -39,7 +39,8 @@ struct TextureExtent {
  * @brief One texture's next version (the texture twin of VersionGrowthRequest).
  *
  * The version is one of these:
- * - `image`, a texture the caller made. It must have the slot's shape class (format, mip count, slice count). It may be any
+ * - `image`, a texture the caller made. It must have the slot's shape class (format, mip count). Its slice count may differ:
+ *   that version switches in with graphs built for it (ORG VersionedResource, "Array-size versions"). It may be any
  *   GloballyIndexedResource with a layout, such as a PixelBuffer or an ExternalTextureResource.
  * - When `image` is null, a PixelBuffer that MakeTextureVersions makes like the slot's current one, at `extent`. The current
  *   version must then be a PixelBuffer.
