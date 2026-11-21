@@ -25,6 +25,11 @@ CPU-only consumers needing the compiled identity service include
 This static runtime must have one owner when exchanging identities across DLLs;
 independently linked copies do not provide cross-module uniqueness.
 
+The CPU sphere cull (`Cpu/SphereCull.h`) is the separate `ORGModuleServices::SphereCull`
+target, from `cmake/SphereCull.cmake`. It tests sphere columns against a plane set with
+SSE2, AVX2 or AVX-512 kernels, picked at run time from CPUID, and every kernel gives the
+same verdicts. Its tests are in `tests/Cpu`.
+
 Standalone tests:
 
 ```sh
