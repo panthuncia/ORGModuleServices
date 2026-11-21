@@ -25,6 +25,7 @@ add_library(ORGModuleServices STATIC
     src/GrowableBufferSet.cpp
     src/Passes/GenerateMipsPass.cpp
     src/Passes/ResolveMultisamplePass.cpp
+    src/Passes/UavClearPass.cpp
     src/PipelineRegistry.cpp
     src/VersionedBufferBuild.cpp
     src/VersionedBufferGrowth.cpp
