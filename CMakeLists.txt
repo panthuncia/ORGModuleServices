@@ -23,11 +23,16 @@ add_library(ORGModuleServices STATIC
     src/ComposedVersions.cpp
     src/GraphJob.cpp
     src/GrowableBufferSet.cpp
+    src/Passes/GenerateMipsPass.cpp
+    src/Passes/ResolveMultisamplePass.cpp
     src/PipelineRegistry.cpp
     src/VersionedBufferBuild.cpp
     src/VersionedBufferGrowth.cpp
     src/VersionedTextureGrowth.cpp)
 add_library(ORGModuleServices::ORGModuleServices ALIAS ORGModuleServices)
+# The passes' shaders (Passes/GenerateMipsPass.h, Passes/ResolveMultisamplePass.h). A host compiles them with its own
+# programs and ships this folder's files under "ORGModuleServices/" in its shader folder.
+set(ORG_MODULE_SERVICES_SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders" CACHE INTERNAL "ORGModuleServices pass shaders")
 target_compile_features(ORGModuleServices PUBLIC cxx_std_20)
 target_include_directories(ORGModuleServices PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
