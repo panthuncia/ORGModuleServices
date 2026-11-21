@@ -27,7 +27,8 @@ namespace org::services {
 /**
  * @brief How a variable may be used.
  *
- * A variable with `sizes = false` holds constants only. It may not be a dependency of a texture description (decision 6a).
+ * A variable with `sizes = false` holds constants only. It may not be a dependency of a texture description, nor of a
+ * derived variable that sizes (RequireSizes checks the first at DeclareTexture).
  * RenderSize and the dynamic resolution ratios are such variables.
  */
 struct VariableTraits {
