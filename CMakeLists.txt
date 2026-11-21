@@ -22,10 +22,15 @@ add_library(ORGModuleServices STATIC
     src/BackingPoolBinding.cpp
     src/ComposedVersions.cpp
     src/GraphJob.cpp
+    src/GraphHostBackings.cpp
+    src/GraphHostRetirement.cpp
     src/GrowableBufferSet.cpp
     src/Passes/GenerateMipsPass.cpp
     src/Passes/ResolveMultisamplePass.cpp
     src/PipelineRegistry.cpp
+    src/RecordingPools.cpp
+    src/RetirementJoin.cpp
+    src/SecondaryListPool.cpp
     src/VersionedBufferBuild.cpp
     src/VersionedBufferGrowth.cpp
     src/VersionedTextureGrowth.cpp)
