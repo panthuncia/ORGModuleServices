@@ -23,6 +23,7 @@ add_library(ORGModuleServices STATIC
     src/Async/ExecutorTaskService.cpp
     src/BackingPool.cpp
     src/BackingPoolBinding.cpp
+    src/BufferChains.cpp
     src/ComposedVersions.cpp
     src/GraphJob.cpp
     src/GraphHostBackings.cpp

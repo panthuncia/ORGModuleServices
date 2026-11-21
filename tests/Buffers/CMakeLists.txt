@@ -21,6 +21,21 @@ target_compile_options(ORGBufferPoolTests PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/
 add_test(NAME ORGBufferPoolTests COMMAND ORGBufferPoolTests)
 set_tests_properties(ORGBufferPoolTests PROPERTIES TIMEOUT 120)
 
+# Standalone, MS headers only: buffer version chains from a kept source, with a stand-in for the graph's builds.
+add_executable(ORGBufferChainsTests
+    BufferChainsTests.cpp
+    NoBufferBinding.cpp
+    PublicHeaders/BufferChains.cpp
+    "${_services_root}/src/BackingPool.cpp"
+    "${_services_root}/src/BufferChains.cpp")
+target_compile_features(ORGBufferChainsTests PRIVATE cxx_std_20)
+target_include_directories(ORGBufferChainsTests PRIVATE "${_services_root}/include")
+target_link_libraries(ORGBufferChainsTests PRIVATE Threads::Threads)
+target_compile_definitions(ORGBufferChainsTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(ORGBufferChainsTests PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/UNDEBUG,-UNDEBUG>)
+add_test(NAME ORGBufferChainsTests COMMAND ORGBufferChainsTests)
+set_tests_properties(ORGBufferChainsTests PROPERTIES TIMEOUT 120)
+
 # Standalone: the retirement join, the recording pools and the pool defaults. They use ORG's header-only EventQueue and nothing
 # else of it.
 set(ORG_RETIREMENT_TEST_ORG_INCLUDE "${_services_root}/../OpenRenderGraph/include" CACHE PATH "OpenRenderGraph's include directory")

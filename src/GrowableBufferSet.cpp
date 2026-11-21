@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include "Render/LatchBlock.h"
+#include "Resources/Buffers/Buffer.h"
 #include "Resources/VersionedTexture.h"
 #include "VersionsSerial.h"
 
@@ -223,6 +224,46 @@ LatchHandle GrowableBufferSet::Register(LatchRegistration registration) {
     const LatchHandle handle{node->index};
     Push(m_registered, node);
     return handle;
+}
+
+LatchHandle GrowableBufferSet::Register(std::string name, LatchRegions regions, GrowthPolicy policy) {
+    // One region makes a dedicated block (LatchBlock::Create); any other count a block of the frame arena.
+    const std::uint32_t slots = regions == LatchRegions::Shared ? 1u : 2u;
+    return Register(LatchRegistration{std::move(name), slots, policy});
+}
+
+std::shared_ptr<VersionedBuffer> GrowableBufferSet::Make(std::shared_ptr<Buffer> first, GrowableBufferSpec spec) {
+    if (!first) return nullptr;
+    GrowableRegistration registration;
+    registration.name = first->GetName();
+    auto versioned = VersionedBuffer::Create(std::move(first));
+    registration.buffer = versioned;
+    registration.extent = spec.extent;
+    registration.policy = spec.policy;
+    registration.shrink = spec.shrink;
+    registration.contents = spec.contents;
+    registration.capture = std::move(spec.capture);
+    registration.address = spec.address;
+    (void)Register(std::move(registration));
+    return versioned;
+}
+
+void GrowableBufferSet::Require(Build& build, const std::shared_ptr<VersionedBuffer>& buffer, std::uint64_t units) {
+    if (buffer && units) build.Require(HandleOf(*buffer), units);
+}
+
+void GrowableBufferSet::RequireNewer(Build& build, const std::shared_ptr<VersionedBuffer>& buffer, std::uint64_t serial) {
+    if (buffer && serial) build.RequireNewer(HandleOf(*buffer), serial);
+}
+
+std::uint64_t GrowableBufferSet::Units(const Build& build, const std::shared_ptr<VersionedBuffer>& buffer) {
+    return buffer ? build.Units(HandleOf(*buffer)) : 0;
+}
+
+std::uint64_t GrowableBufferSet::MostAsked(const Build& build, const std::shared_ptr<VersionedBuffer>& buffer) {
+    if (!buffer) return 0;
+    const auto handle = HandleOf(*buffer);
+    return std::max(build.Asked(handle), build.Units(handle));
 }
 
 NamedEntry GrowableBufferSet::EntryOf(const Slot& slot, std::shared_ptr<const BufferVersion> version, std::optional<std::uint64_t> stamp,
