@@ -33,6 +33,7 @@ add_library(ORGModuleServices STATIC
     src/Passes/PrefixSumPass.cpp
     src/Passes/ResolveMultisamplePass.cpp
     src/Passes/UavClearPass.cpp
+    src/PipelinePins.cpp
     src/PipelineRegistry.cpp
     src/RecordingPools.cpp
     src/RetirementJoin.cpp
