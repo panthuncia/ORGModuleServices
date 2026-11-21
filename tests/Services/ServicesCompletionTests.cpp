@@ -1,5 +1,5 @@
-// Completion callbacks and the executor hook of ShaderCompiler and PipelineService.
-#include <ORGModuleServices/PipelineService.h>
+// Completion callbacks and the executor hook of ShaderCompiler and BuildPipeline.
+#include <ORGModuleServices/PipelineRegistry.h>
 #if defined(ORG_MODULE_SERVICES_HAS_DXC)
 #include <ORGModuleServices/ShaderCompiler.h>
 #endif
@@ -13,6 +13,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -114,170 +115,68 @@ private:
     size_t count_{};
 };
 
-org::services::PipelineRecipe Recipe(std::string id, uint64_t shaderKey, std::atomic_uint32_t* builds = nullptr,
-    std::vector<std::thread::id>* buildThreads = nullptr, std::mutex* buildThreadsMutex = nullptr) {
-    return { std::move(id), 1, shaderKey, 3, 4, [=] {
-        if (builds) ++*builds;
-        if (buildThreads) { std::scoped_lock lock(*buildThreadsMutex); buildThreads->push_back(std::this_thread::get_id()); }
-        return std::static_pointer_cast<void>(std::make_shared<uint64_t>(shaderKey));
-    } };
+// A build runs on the submitter's thread and reaches done there, once.
+void PipelineBuildThroughManualQueue() {
+    ManualExecutor executor;
+    Counter calls;
+    std::thread::id buildThread, doneThread;
+    org::services::BuildPipeline(executor.Submitter(), [&] {
+        buildThread = std::this_thread::get_id();
+        return std::static_pointer_cast<void>(std::make_shared<uint64_t>(7));
+    }, [&](org::services::LiveBuild build) {
+        CHECK(build.payload); CHECK(build.error.empty());
+        doneThread = std::this_thread::get_id(); calls.Hit();
+    });
+    CHECK(executor.Pending() == 1); CHECK(calls.Count() == 0);
+    std::thread drain([&] { executor.Drain(); });
+    drain.join();
+    CHECK(calls.Count() == 1); CHECK(buildThread == doneThread); CHECK(buildThread != std::this_thread::get_id());
 }
 
-void PipelineDefaultUnchanged() {
-    org::services::PipelineService pipelines;
-    std::atomic_uint32_t builds{};
-    std::vector<std::thread::id> threads; std::mutex threadsMutex;
-    auto recipe = Recipe("tests.default", 1, &builds, &threads, &threadsMutex);
-    const auto key = pipelines.BuildKey(recipe);
-    auto first = pipelines.Request(recipe);
-    auto duplicate = pipelines.Request(recipe);
-    CHECK(first.get()); CHECK(duplicate.get()); CHECK(builds == 1);
-    CHECK(threads.size() == 1 && threads[0] != std::this_thread::get_id()); // still a thread of its own
-    pipelines.PublishReady(5); CHECK(pipelines.Find(key)); CHECK(pipelines.InFlightCount() == 0);
-    // With a callback, still default executor: once, on the building thread, after the future is ready.
-    Counter calls; std::thread::id callbackThread;
-    bool joinedReady = false;
-    auto second = Recipe("tests.default", 2);
-    auto future = pipelines.Request(second, [&](const org::services::PipelineArtifact& artifact) {
-        callbackThread = std::this_thread::get_id();
-        // Re-entering the service from the callback joins the now-done flight: its future is ready already.
-        joinedReady = IsReady(pipelines.Request(second)) && artifact;
+// A null payload, a throw, no build function and a refused submission each reach done with an error.
+void PipelineBuildFailuresReachDone() {
+    Counter calls;
+    auto expectFailure = [&] { return [&](org::services::LiveBuild build) { CHECK(!build.payload); CHECK(!build.error.empty()); calls.Hit(); }; };
+    const org::services::ServiceSubmit inline_ = [](ServiceTask task) { task(); return true; };
+    org::services::BuildPipeline(inline_, [] { return org::services::PipelinePayload{}; }, expectFailure());
+    org::services::BuildPipeline(inline_, []() -> org::services::PipelinePayload { throw std::runtime_error("boom"); }, expectFailure());
+    org::services::BuildPipeline(inline_, {}, expectFailure());
+    org::services::BuildPipeline([](ServiceTask) { return false; }, [] { return org::services::PipelinePayload{}; }, expectFailure());
+    org::services::BuildPipeline([](ServiceTask) -> bool { throw std::runtime_error("refused"); }, [] { return org::services::PipelinePayload{}; },
+        expectFailure());
+    CHECK(calls.Count() == 5);
+}
+
+// Many builds on a fixed pool all complete on its threads.
+void PipelineBuildFixedPool() {
+    constexpr size_t kBuilds = 64;
+    Counter calls;
+    std::atomic_uint32_t foreign{};
+    {
+        FixedPool pool(3);
+        for (size_t i = 0; i < kBuilds; ++i)
+            org::services::BuildPipeline(pool.Submitter(), [i] { return std::static_pointer_cast<void>(std::make_shared<size_t>(i)); },
+                [&](org::services::LiveBuild build) {
+                    CHECK(build.payload);
+                    if (!pool.Owns(std::this_thread::get_id())) ++foreign;
+                    calls.Hit();
+                });
+        CHECK(calls.WaitFor(kBuilds));
+    }
+    CHECK(foreign == 0);
+}
+
+// Without a submitter a build runs on a new thread.
+void PipelineBuildDefaultThread() {
+    Counter calls;
+    const auto caller = std::this_thread::get_id();
+    std::atomic_bool otherThread{};
+    org::services::BuildPipeline({}, [] { return std::static_pointer_cast<void>(std::make_shared<int>(1)); }, [&](org::services::LiveBuild build) {
+        CHECK(build.payload);
+        otherThread = std::this_thread::get_id() != caller;
         calls.Hit();
     });
-    CHECK(calls.WaitFor(1)); CHECK(future.get());
-    CHECK(joinedReady); CHECK(calls.Count() == 1); CHECK(callbackThread != std::this_thread::get_id());
-}
-
-void PipelineCallbacksThroughManualQueue() {
-    ManualExecutor executor;
-    org::services::PipelineService pipelines;
-    pipelines.Configure(executor.Submitter());
-    std::atomic_uint32_t builds{};
-    std::vector<std::thread::id> buildThreads; std::mutex buildThreadsMutex;
-    auto recipe = Recipe("tests.manual", 7, &builds, &buildThreads, &buildThreadsMutex);
-    const auto key = pipelines.BuildKey(recipe);
-    int a = 0, b = 0, c = 0, d = 0, e = 0;
-    std::vector<std::thread::id> callbackThreads;
-    auto note = [&](int& count) { return [&](const org::services::PipelineArtifact& artifact) { CHECK(artifact); ++count; callbackThreads.push_back(std::this_thread::get_id()); }; };
-    auto first = pipelines.Request(recipe, note(a));
-    auto joined = pipelines.Request(recipe, note(b));    // joins before completion
-    auto plainJoin = pipelines.Request(recipe);           // a future-only joiner
-    CHECK(executor.Pending() == 1); CHECK(builds == 0);    // nothing ran anywhere: the library made no thread
-    CHECK(!IsReady(first) && !IsReady(joined) && !IsReady(plainJoin));
-    CHECK(a == 0 && b == 0);
-    CHECK(executor.Drain() == 1);
-    CHECK(builds == 1); CHECK(a == 1 && b == 1); CHECK(IsReady(first) && IsReady(joined) && IsReady(plainJoin));
-    CHECK(buildThreads.size() == 1 && buildThreads[0] == std::this_thread::get_id());
-    // Joins after completion (still in flight until PublishReady): at once, on this thread, no new work.
-    auto late = pipelines.Request(recipe, note(c));
-    CHECK(c == 1); CHECK(IsReady(late)); CHECK(executor.Pending() == 0);
-    pipelines.PublishReady(1); CHECK(pipelines.Find(key));
-    // Active hit: at once, on this thread.
-    auto active = pipelines.Request(recipe, note(d));
-    CHECK(d == 1); CHECK(IsReady(active)); CHECK(active.get().key == key); CHECK(executor.Pending() == 0);
-    for (const auto id : callbackThreads) CHECK(id == std::this_thread::get_id());
-    // A new key through the queue again.
-    pipelines.Request(Recipe("tests.manual", 8, &builds), note(e));
-    CHECK(e == 0); CHECK(executor.Drain() == 1); CHECK(e == 1); CHECK(builds == 2);
-    // A null callback is allowed.
-    pipelines.Request(Recipe("tests.manual", 9), {}); CHECK(executor.Drain() == 1);
-    CHECK(a == 1 && b == 1 && c == 1 && d == 1 && e == 1);
-}
-
-void PipelineFailuresReachCallbacks() {
-    ManualExecutor executor;
-    org::services::PipelineService pipelines;
-    pipelines.Configure(executor.Submitter());
-    int nullCalls = 0, throwCalls = 0, noFactoryCalls = 0, joinCalls = 0;
-    auto expectFailure = [](int& count) { return [&](const org::services::PipelineArtifact& artifact) { CHECK(!artifact); CHECK(!artifact.error.empty()); ++count; }; };
-    org::services::PipelineRecipe returnsNull{ "tests.fail.null", 1, 1, 1, 1, [] { return org::services::PipelinePayload{}; } };
-    org::services::PipelineRecipe throws{ "tests.fail.throw", 1, 1, 1, 1, []() -> org::services::PipelinePayload { throw std::runtime_error("boom"); } };
-    org::services::PipelineRecipe noFactory{ "tests.fail.none", 1, 1, 1, 1, {} };
-    auto f1 = pipelines.Request(returnsNull, expectFailure(nullCalls));
-    pipelines.Request(returnsNull, expectFailure(joinCalls));
-    auto f2 = pipelines.Request(throws, expectFailure(throwCalls));
-    auto f3 = pipelines.Request(noFactory, expectFailure(noFactoryCalls));
-    CHECK(executor.Drain() == 3);
-    CHECK(nullCalls == 1 && joinCalls == 1 && throwCalls == 1 && noFactoryCalls == 1);
-    CHECK(f2.get().error == "boom"); CHECK(!f1.get()); CHECK(!f3.get());
-    // A refusing submitter: the request completes at once, with an error, on the caller.
-    org::services::PipelineService refusing;
-    refusing.Configure([](ServiceTask) { return false; });
-    int refusedCalls = 0;
-    auto refused = refusing.Request(Recipe("tests.refused", 1), expectFailure(refusedCalls));
-    CHECK(refusedCalls == 1); CHECK(IsReady(refused)); CHECK(!refused.get());
-    // A throwing submitter is a refusal too.
-    org::services::PipelineService throwing;
-    throwing.Configure([](ServiceTask) -> bool { throw std::runtime_error("queue closed"); });
-    int thrownCalls = 0;
-    auto thrown = throwing.Request(Recipe("tests.thrown", 1), expectFailure(thrownCalls));
-    CHECK(thrownCalls == 1); CHECK(IsReady(thrown));
-}
-
-void PipelineCallbackReentersWithoutDeadlock() {
-    for (const bool manual : { true, false }) {
-        ManualExecutor executor;
-        org::services::PipelineService pipelines;
-        if (manual) pipelines.Configure(executor.Submitter());
-        Counter calls;
-        pipelines.Request(Recipe("tests.reenter", 1), [&](const org::services::PipelineArtifact&) {
-            // Every service entry point from inside a callback.
-            pipelines.Request(Recipe("tests.reenter", 2), [&](const org::services::PipelineArtifact&) { calls.Hit(); });
-            pipelines.Request(Recipe("tests.reenter", 1), [&](const org::services::PipelineArtifact&) { calls.Hit(); }); // joins its own, done, flight
-            (void)pipelines.InFlightCount(); (void)pipelines.Find(1);
-            pipelines.PublishReady(1);
-            calls.Hit(); // last: the test may end once all three are counted
-        });
-        if (manual) executor.Drain();
-        CHECK(calls.WaitFor(3)); CHECK(calls.Count() == 3);
-    }
-}
-
-void PipelineFixedPool() {
-    constexpr uint32_t kRequests = 64;
-    org::services::PipelineService pipelines;
-    std::atomic_uint32_t builds{};
-    std::vector<std::thread::id> buildThreads; std::mutex buildThreadsMutex;
-    Counter calls;
-    std::atomic_uint32_t foreignCallbacks{};
-    {
-        FixedPool pool(2);
-        pipelines.Configure(pool.Submitter());
-        std::vector<std::shared_future<org::services::PipelineArtifact>> futures;
-        for (uint32_t i = 0; i < kRequests; ++i)
-            futures.push_back(pipelines.Request(Recipe("tests.pool", 100 + i, &builds, &buildThreads, &buildThreadsMutex),
-                [&](const org::services::PipelineArtifact& artifact) {
-                    if (!pool.Owns(std::this_thread::get_id())) ++foreignCallbacks;
-                    CHECK(artifact); calls.Hit();
-                }));
-        CHECK(calls.WaitFor(kRequests));
-        for (auto& future : futures) CHECK(future.get());
-        for (const auto id : buildThreads) CHECK(pool.Owns(id)); // every build ran on the pool's two threads
-    }
-    CHECK(builds == kRequests); CHECK(calls.Count() == kRequests); CHECK(foreignCallbacks == 0);
-    pipelines.PublishReady(1); CHECK(pipelines.InFlightCount() == 0);
-}
-
-// Joiners racing a completing build: every caller's callback exactly once.
-void PipelineConcurrentJoiners() {
-    constexpr int kKeys = 200, kJoiners = 6;
-    org::services::PipelineService pipelines;
-    Counter calls;
-    std::atomic_uint32_t builds{};
-    FixedPool pool(3);
-    pipelines.Configure(pool.Submitter());
-    for (int k = 0; k < kKeys; ++k) {
-        auto recipe = Recipe("tests.race", 1000 + k, &builds);
-        std::vector<std::thread> joiners;
-        for (int j = 0; j < kJoiners; ++j)
-            joiners.emplace_back([&] { pipelines.Request(recipe, [&](const org::services::PipelineArtifact& artifact) { CHECK(artifact); calls.Hit(); }); });
-        for (auto& joiner : joiners) joiner.join();
-        if (k % 16 == 0) pipelines.PublishReady(k); // some later keys' joiners race a publish too
-    }
-    CHECK(calls.WaitFor(size_t(kKeys) * kJoiners));
-    std::this_thread::sleep_for(50ms);
-    CHECK(calls.Count() == size_t(kKeys) * kJoiners);
-    CHECK(builds == kKeys);
+    CHECK(calls.WaitFor(1)); CHECK(otherThread);
 }
 
 #if defined(ORG_MODULE_SERVICES_HAS_DXC)
@@ -692,12 +591,10 @@ struct Test { const char* name; void (*run)(); };
 
 int main() {
     const Test tests[] = {
-        { "PipelineDefaultUnchanged", PipelineDefaultUnchanged },
-        { "PipelineCallbacksThroughManualQueue", PipelineCallbacksThroughManualQueue },
-        { "PipelineFailuresReachCallbacks", PipelineFailuresReachCallbacks },
-        { "PipelineCallbackReentersWithoutDeadlock", PipelineCallbackReentersWithoutDeadlock },
-        { "PipelineFixedPool", PipelineFixedPool },
-        { "PipelineConcurrentJoiners", PipelineConcurrentJoiners },
+        { "PipelineBuildThroughManualQueue", PipelineBuildThroughManualQueue },
+        { "PipelineBuildFailuresReachDone", PipelineBuildFailuresReachDone },
+        { "PipelineBuildFixedPool", PipelineBuildFixedPool },
+        { "PipelineBuildDefaultThread", PipelineBuildDefaultThread },
 #if defined(ORG_MODULE_SERVICES_HAS_DXC)
         { "ShaderDefaultUnchanged", ShaderDefaultUnchanged },
         { "ShaderCallbacksThroughManualQueue", ShaderCallbacksThroughManualQueue },

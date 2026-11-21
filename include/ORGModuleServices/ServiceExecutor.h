@@ -4,7 +4,7 @@
 
 namespace org::services {
 
-// The executor hook ShaderCompiler and PipelineService run their work through, shaped like
+// The executor hook ShaderCompiler, BuildPipeline and PipelineRegistry run their work through, shaped like
 // org::async::SerializedTaskPump::Submit so one host scheduler can serve both.
 //
 // A submitter takes ownership of the task and runs it exactly once, on whichever thread it chooses. It returns false

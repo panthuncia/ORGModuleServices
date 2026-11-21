@@ -24,7 +24,6 @@ add_library(ORGModuleServices STATIC
     src/GraphJob.cpp
     src/GrowableBufferSet.cpp
     src/PipelineRegistry.cpp
-    src/PipelineService.cpp
     src/VersionedBufferBuild.cpp
     src/VersionedBufferGrowth.cpp
     src/VersionedTextureGrowth.cpp)

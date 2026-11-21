@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cctype>
 #include <exception>
+#include <memory>
+#include <stdexcept>
 #include <utility>
 
 namespace org::services {
@@ -220,6 +222,27 @@ void PipelineRegistry::StartBatch() {
     };
     if (!detail::LaunchServiceTask(submit, std::move(task)))
         for (size_t i = 0; i < batch->entries.size(); ++i) batch->Complete(i, LiveBuild{ {}, 0, "the registry's submitter refused the reload" });
+}
+
+void BuildPipeline(const ServiceSubmit& submit, std::function<PipelinePayload()> build, LiveRebuildDone done) {
+    // Shared, so a refused task still has its done to call.
+    auto finish = std::make_shared<LiveRebuildDone>(std::move(done));
+    ServiceTask task = [finish, build = std::move(build)]() mutable {
+        LiveBuild result;
+        try {
+            if (!build) throw std::runtime_error("the pipeline has no build function");
+            result.payload = build();
+            if (!result.payload) result.error = "the pipeline build returned no payload";
+        } catch (const std::exception& e) {
+            result.error = e.what();
+        } catch (...) {
+            result.error = "the pipeline build threw";
+        }
+        // The build's captures go before done runs.
+        build = {};
+        (*finish)(std::move(result));
+    };
+    if (!detail::LaunchServiceTask(submit, std::move(task))) (*finish)(LiveBuild{ {}, 0, "the pipeline submitter refused the build" });
 }
 
 uint32_t PipelineRegistry::FinishBatch() {

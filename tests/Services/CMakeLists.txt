@@ -3,8 +3,8 @@ project(ORGServicesCompletionTests LANGUAGES CXX)
 enable_testing()
 find_package(Threads REQUIRED)
 
-# Standalone: builds the ShaderCompiler/PipelineService sources directly, without BasicRHI/OpenRenderGraph targets.
-# ShaderCompiler needs dxcapi.h and BasicRHI's header-only rhi_shader_abi.h; without them only PipelineService is tested.
+# Standalone: builds the ShaderCompiler/PipelineRegistry sources directly, without BasicRHI/OpenRenderGraph targets.
+# ShaderCompiler needs dxcapi.h and BasicRHI's header-only rhi_shader_abi.h; without them only BuildPipeline is tested.
 set(ORG_SERVICES_TEST_RHI_INCLUDE "${CMAKE_CURRENT_LIST_DIR}/../../../BasicRHI" CACHE PATH "Directory containing rhi_shader_abi.h")
 find_path(ORG_SERVICES_TEST_DXC_INCLUDE dxcapi.h
     HINTS
@@ -12,7 +12,7 @@ find_path(ORG_SERVICES_TEST_DXC_INCLUDE dxcapi.h
         "$ENV{VULKAN_SDK}/Include/dxc")
 
 set(_services_root "${CMAKE_CURRENT_LIST_DIR}/../..")
-add_executable(ORGServicesCompletionTests ServicesCompletionTests.cpp "${_services_root}/src/PipelineService.cpp")
+add_executable(ORGServicesCompletionTests ServicesCompletionTests.cpp "${_services_root}/src/PipelineRegistry.cpp")
 target_compile_features(ORGServicesCompletionTests PRIVATE cxx_std_20)
 target_include_directories(ORGServicesCompletionTests PRIVATE "${_services_root}/include" "${CMAKE_CURRENT_LIST_DIR}/telemetry_shim")
 target_link_libraries(ORGServicesCompletionTests PRIVATE Threads::Threads)

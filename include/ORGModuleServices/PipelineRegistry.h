@@ -11,10 +11,12 @@
 #include <string_view>
 #include <vector>
 
-#include <ORGModuleServices/PipelineService.h>
 #include <ORGModuleServices/ServiceExecutor.h>
 
 namespace org::services {
+
+// A built pipeline, as its module keeps it (an rhi::PipelinePtr, say).
+using PipelinePayload = std::shared_ptr<void>;
 
 // One version of a live pipeline: the payload it binds and the registry generation it was published at. Immutable: a publish
 // makes a new version and never changes one a holder has.
@@ -71,6 +73,11 @@ using LiveRebuildDone = std::function<void(LiveBuild)>;
 // Builds the pipeline again from its shader files as they are now. It must not block: it may run on a thread a compile it waits for
 // needs. It calls done exactly once, on any thread (a compile's completion, say), or inline.
 using LiveRebuild = std::function<void(const LiveRebuildRequest&, LiveRebuildDone done)>;
+
+// Builds a pipeline once on submit's executor (one new thread when it is empty) and calls done exactly once with it, on the
+// thread that built it. A throw or a null payload is an error. A refused submission calls done at once with an error. Nothing
+// waits: the caller keeps its own record of what it asked for and admits the result when done says so.
+void BuildPipeline(const ServiceSubmit& submit, std::function<PipelinePayload()> build, LiveRebuildDone done);
 
 struct LivePipelineDesc {
     std::string id;  // the logs' name
