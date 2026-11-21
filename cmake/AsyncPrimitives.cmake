@@ -12,6 +12,8 @@ target_include_directories(ORGAsyncPrimitives INTERFACE
     $<INSTALL_INTERFACE:include>)
 target_sources(ORGAsyncPrimitives INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include/ORGModuleServices/Async/GraphDiagnostics.h>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include/ORGModuleServices/Async/FrameClock.h>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include/ORGModuleServices/Async/StarvationWatch.h>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include/ORGModuleServices/Async/GraphTrace.h>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include/ORGModuleServices/Async/ArtifactBuild.h>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include/ORGModuleServices/Async/GraphSchedulingLayout.h>

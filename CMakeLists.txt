@@ -28,7 +28,8 @@ add_library(ORGModuleServices STATIC
     src/PipelineRegistry.cpp
     src/VersionedBufferBuild.cpp
     src/VersionedBufferGrowth.cpp
-    src/VersionedTextureGrowth.cpp)
+    src/VersionedTextureGrowth.cpp
+    src/ViolationPolicy.cpp)
 add_library(ORGModuleServices::ORGModuleServices ALIAS ORGModuleServices)
 # The passes' shaders (Passes/GenerateMipsPass.h, Passes/ResolveMultisamplePass.h). A host compiles them with its own
 # programs and ships this folder's files under "ORGModuleServices/" in its shader folder.
@@ -69,6 +70,9 @@ if(ORG_MODULE_SERVICES_BUILD_TESTS)
     add_executable(ORGModuleServicesTests tests/ServicesTests.cpp)
     target_link_libraries(ORGModuleServicesTests PRIVATE ORGModuleServices::ORGModuleServices)
     add_test(NAME ORGModuleServicesTests COMMAND ORGModuleServicesTests)
+    add_executable(ORGViolationPolicyTests tests/Policy/ViolationPolicyTests.cpp)
+    target_link_libraries(ORGViolationPolicyTests PRIVATE ORGModuleServices::ORGModuleServices)
+    add_test(NAME ORGViolationPolicyTests COMMAND ORGViolationPolicyTests)
     # Named texture versions and composed sets, against OpenRenderGraph on WARP (D3D12).
     if(WIN32)
         add_executable(ORGNamedVersionsTests tests/Versions/NamedVersionsTests.cpp)

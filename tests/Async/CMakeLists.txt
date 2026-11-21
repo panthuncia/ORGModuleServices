@@ -13,3 +13,8 @@ add_executable(ORGAsyncRuntimeTests AsyncRuntimeTests.cpp SuspensionIdentityTest
 target_link_libraries(ORGAsyncRuntimeTests PRIVATE Threads::Threads ORGModuleServices::AsyncRuntime)
 target_compile_options(ORGAsyncRuntimeTests PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/UNDEBUG,-UNDEBUG>)
 add_test(NAME ORGAsyncRuntimeTests COMMAND ORGAsyncRuntimeTests)
+
+add_executable(ORGAsyncFrameTests FrameTests.cpp)
+target_link_libraries(ORGAsyncFrameTests PRIVATE ORGModuleServices::AsyncPrimitives)
+target_compile_options(ORGAsyncFrameTests PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/UNDEBUG,-UNDEBUG>)
+add_test(NAME ORGAsyncFrameTests COMMAND ORGAsyncFrameTests)
