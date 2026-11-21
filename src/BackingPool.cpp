@@ -447,8 +447,8 @@ BackingLease BackingPool::Acquire(const BackingRequest& request, std::uint64_t p
                 home.Emit(BackingPoolEvent::Exhausted, 1);
                 ArmAvailability(request);
             } else {
-                lease = Allocate(request);
-                local.allocated = true;
+                lease = Allocate(request, local.error);
+                local.allocated = static_cast<bool>(lease);
             }
         }
         EmitGauges();
@@ -501,10 +501,15 @@ void BackingPool::ArmAvailability(const BackingRequest& request) {
     });
 }
 
-BackingLease BackingPool::Allocate(const BackingRequest& request) {
+BackingLease BackingPool::Allocate(const BackingRequest& request, std::string& error) {
     auto& state = *m_state;
     auto& home = *m_home;
     auto allocation = m_hooks.allocate(request);
+    // A failed allocation leaves no backing behind. The caller gets an empty lease and the reason.
+    if (!allocation.error.empty()) {
+        error = std::move(allocation.error);
+        return {};
+    }
     auto backing = std::make_shared<Backing>();
     backing->buffer = std::move(allocation.buffer);
     backing->generation = state.nextGeneration++;

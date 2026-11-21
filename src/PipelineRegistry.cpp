@@ -230,9 +230,10 @@ void BuildPipeline(const ServiceSubmit& submit, std::function<PipelinePayload()>
     ServiceTask task = [finish, build = std::move(build)]() mutable {
         LiveBuild result;
         try {
-            if (!build) throw std::runtime_error("the pipeline has no build function");
-            result.payload = build();
-            if (!result.payload) result.error = "the pipeline build returned no payload";
+            if (!build)
+                result.error = "the pipeline has no build function";
+            else if (result.payload = build(); !result.payload)
+                result.error = "the pipeline build returned no payload";
         } catch (const std::exception& e) {
             result.error = e.what();
         } catch (...) {

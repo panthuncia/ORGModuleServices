@@ -7,8 +7,8 @@
 #include "Resources/Resource.h"
 
 #include <cassert>
+#include <exception>
 #include <limits>
-#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -22,28 +22,36 @@ std::uint64_t GraphHostDeviceAddress(const GraphHostAccess& host, const Buffer& 
 }
 
 BackingAllocation AllocateGraphHostBacking(const GraphHostAccess& host, const BackingRequest& request) {
-    Resource::ScopedECSRegistrationSuppression suppressECS;
-    std::shared_ptr<Buffer> buffer;
-    if (request.like) {
-        buffer = request.like->UnmaterializedLike();
-        if (request.stride)
-            buffer->ResizeStructured(static_cast<std::uint32_t>(request.capacityClass));
-        else
-            buffer->ResizeBytes(request.capacityClass);
-    } else if (request.stride) {
-        if (request.capacityClass > (std::numeric_limits<std::uint32_t>::max)())
-            throw std::length_error(std::string(request.name) + ": " + std::to_string(request.capacityClass) + " rows are past a structured buffer's elements");
-        buffer = Buffer::CreateUnmaterializedStructuredBuffer(static_cast<std::uint32_t>(request.capacityClass), request.stride, request.flags.unorderedAccess);
-    } else {
-        buffer = Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, request.capacityClass, request.flags.unorderedAccess);
-    }
-    if (!request.name.empty()) buffer->SetName(std::string(request.name).c_str());
-    buffer->Materialize();
     BackingAllocation allocation;
-    allocation.address = request.flags.deviceAddress ? GraphHostDeviceAddress(host, *buffer) : 0;
-    assert(allocation.address % 16 == 0);  // row and block offsets keep 16-byte alignment
-    allocation.srvIndex = buffer->HasSRV() ? buffer->GetSRVInfo(0).slot.index : 0;
-    allocation.buffer = std::move(buffer);
+    if (request.stride && !request.like && request.capacityClass > (std::numeric_limits<std::uint32_t>::max)()) {
+        allocation.error = std::string(request.name) + ": " + std::to_string(request.capacityClass) + " rows are past a structured buffer's elements";
+        return allocation;
+    }
+    // ORG reports a failed creation or materialization by throwing. The pool's contract is a returned error.
+    try {
+        Resource::ScopedECSRegistrationSuppression suppressECS;
+        std::shared_ptr<Buffer> buffer;
+        if (request.like) {
+            buffer = request.like->UnmaterializedLike();
+            if (request.stride)
+                buffer->ResizeStructured(static_cast<std::uint32_t>(request.capacityClass));
+            else
+                buffer->ResizeBytes(request.capacityClass);
+        } else if (request.stride) {
+            buffer = Buffer::CreateUnmaterializedStructuredBuffer(static_cast<std::uint32_t>(request.capacityClass), request.stride, request.flags.unorderedAccess);
+        } else {
+            buffer = Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, request.capacityClass, request.flags.unorderedAccess);
+        }
+        if (!request.name.empty()) buffer->SetName(std::string(request.name).c_str());
+        buffer->Materialize();
+        allocation.address = request.flags.deviceAddress ? GraphHostDeviceAddress(host, *buffer) : 0;
+        assert(allocation.address % 16 == 0);  // row and block offsets keep 16-byte alignment
+        allocation.srvIndex = buffer->HasSRV() ? buffer->GetSRVInfo(0).slot.index : 0;
+        allocation.buffer = std::move(buffer);
+    } catch (const std::exception& error) {
+        allocation = {};
+        allocation.error = std::string(request.name) + ": " + error.what();
+    }
     return allocation;
 }
 

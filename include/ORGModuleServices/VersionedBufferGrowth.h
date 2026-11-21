@@ -55,11 +55,15 @@ struct GrownVersion {
     // Complete when every fill's copy has completed on the uploader's queue (null: nothing to copy, ready now). Failed when a copy
     // was cancelled (the uploader shut down).
     std::shared_ptr<const async::GpuSubmissionSet> ready;
+    // Set when the version could not be made: no backing was leased, or the uploader refused a fill. Nothing else is set then.
+    std::string error;
 };
 
 /**
  * @brief Any thread, one growth at a time per pool (BackingPool's single acquirer: a set posts one batch at a time): leases the
- * version's backing and queues its fills. Throws without a pool, when no backing is leased, or when a fill is not queued.
+ * version's backing and queues its fills. A backing not leased or a fill not queued is returned in GrownVersion::error. A
+ * misuse throws: no buffer or pool, an empty or stride-less structured version, contents without an uploader, a fill past the
+ * version.
  */
 GrownVersion GrowVersion(const VersionGrowthRequest& request);
 
@@ -68,8 +72,9 @@ struct GrownVersions {
     std::vector<std::shared_ptr<const BufferVersion>> versions;  // by the requests' order
     std::vector<BackingLease> leases;                            // by the requests' order: each version's backing (copies)
     std::shared_ptr<const async::GpuSubmissionSet> ready;        // every fill's copy (null: nothing to copy)
+    std::string error;                                           // the first request's failure; nothing else is set then
 };
-/** @brief Any thread: GrowVersion for each request, ready together. */
+/** @brief Any thread: GrowVersion for each request, ready together. It stops at the first failure (GrownVersions::error). */
 GrownVersions GrowVersions(std::span<const VersionGrowthRequest> requests);
 
 } // namespace org::services

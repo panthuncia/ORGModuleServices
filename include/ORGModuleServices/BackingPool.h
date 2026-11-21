@@ -94,6 +94,8 @@ struct BackingAllocation {
     std::shared_ptr<Buffer> buffer;  // materialized; created with rhi::QueueSharing::Concurrent (the uploader writes it)
     std::uint64_t address = 0;       // its device address (flags.deviceAddress), else 0
     std::uint32_t srvIndex = 0;      // its SRV slot (0: none)
+    // Set when the backing could not be made. The pool then keeps nothing and Acquire returns an empty lease with this text.
+    std::string error;
 };
 
 /** @brief A pool's telemetry events (BackingPoolHooks::telemetry). `value`: 1 for a count, else the gauge or byte amount named. */
@@ -111,7 +113,8 @@ enum class BackingPoolEvent : std::uint8_t {
 
 /** @brief A pool's ties to its host. Called on the acquirer's thread unless noted. */
 struct BackingPoolHooks {
-    // Required: a new backing for the request. Throws when it cannot be made (no fallback: the caller fails).
+    // Required: a new backing for the request. When it cannot be made, it returns an allocation with `error` set (no fallback:
+    // the caller fails). Must not throw.
     // BasicRenderer: CreateIndexedStructuredBuffer; CS: org::Buffer::CreateUnmaterializedStructuredBuffer + Materialize, its SRV.
     std::function<BackingAllocation(const BackingRequest& request)> allocate;
     // Optional: memory attribution of a new backing (BasicRenderer: SetResourceUsageHint/SetResourceMemoryIdentifier by name).
@@ -235,13 +238,15 @@ public:
         std::uint32_t released = 0; // free backings released by this call (other classes, spares)
         // Config::reuseBound's: the clock point the backing is still bound to (its safeAt; writes into it wait for it); 0: reusable now.
         std::uint64_t writeAfter = 0;
+        // Set when a new backing could not be made (BackingAllocation::error). The lease is then empty.
+        std::string error;
     };
     /**
      * @brief Acquirer: a lease on a backing for `request`. Among the reusable ones (no lease, no binding consumer, no readback pin,
      * the clock at safeAt, the same class/stride/flags/compatibility) it prefers the highest contentEpoch <= preferEpoch, which
      * minimises the catch-up; else a new one. Releases free backings of other classes. At Config::maxPerClass, with
      * Config::reuseBound the free backing bound longest ago (AcquireInfo::writeAfter), else empty; empty too when every one of the
-     * class is leased. Throws when an allocation fails.
+     * class is leased. Empty when an allocation fails, with AcquireInfo::error saying why.
      */
     [[nodiscard]] BackingLease Acquire(const BackingRequest& request, std::uint64_t preferEpoch = kAnyEpoch, AcquireInfo* info = nullptr);
     /**
@@ -284,7 +289,7 @@ private:
     BackingPool(BackingPoolHooks hooks, std::shared_ptr<RetirementClock> clock, Config config);
     static void Returned(Backing& backing) noexcept;  // a backing's last lease went (any thread)
     void TakeReturned();
-    [[nodiscard]] BackingLease Allocate(const BackingRequest& request);
+    [[nodiscard]] BackingLease Allocate(const BackingRequest& request, std::string& error);
     void ReleaseBacking(const std::shared_ptr<Backing>& backing);
     void ArmAvailability(const BackingRequest& request);
     void EmitGauges() const noexcept;

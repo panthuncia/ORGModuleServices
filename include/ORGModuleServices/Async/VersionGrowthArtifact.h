@@ -22,8 +22,9 @@ struct VersionGrowthWork {
     struct Produced {
         std::shared_ptr<const void> value;           // what `done` is given
         std::shared_ptr<const GpuSubmissionSet> ready;  // null: ready now
+        std::string error;  // set when a version could not be made or filled; `done` gets it
     };
-    std::function<Produced()> produce;  // the producer's lane; throws when a version cannot be made or filled
+    std::function<Produced()> produce;  // the producer's lane; a failure is returned in Produced::error
     std::function<void(std::shared_ptr<const void> value, std::string error)> done;  // the done lane, once: null and why on failure
 };
 
@@ -45,6 +46,7 @@ void RegisterVersionGrowthProducer(StateGraph<Binding>& graph, typename Binding:
         if (!work || !work->produce) return Result::Failure("a growth without its work");
         try {
             auto produced = work->produce();
+            if (!produced.error.empty()) return Result::Failure(std::move(produced.error));
             if (!produced.value) return Result::Failure("a growth produced nothing");
             auto ready = produced.ready;
             return Result::Ready(ArtifactPayload::Make(std::make_shared<const VersionGrowthWork::Produced>(std::move(produced))), std::move(ready));

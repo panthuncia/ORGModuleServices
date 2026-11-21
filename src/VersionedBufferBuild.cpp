@@ -151,6 +151,7 @@ VersionedBufferBuildOutcome Build(const VersionedBufferBuildInput& input, const 
     request.name = input.debugName;
     BackingPool::AcquireInfo acquired;
     auto lease = pool.Acquire(request, previous ? previous->writeSequence : input.writeSequence, &acquired);
+    if (!acquired.error.empty()) return Fail("versioned buffer backing could not be made: " + acquired.error);
     if (!lease) {
         if (!context.allocateSuspension) return Fail("versioned buffer backing pool exhausted and the caller cannot suspend");
         VersionedBufferBuildOutcome outcome;
