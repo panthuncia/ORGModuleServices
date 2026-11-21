@@ -19,6 +19,10 @@ namespace org::async {
 // Active, AcquireActive and ClearActive are consumer-only. Destruction requires
 // both threads to be quiescent. Frame/GPU leases must be released on a cleanup
 // lane; this exchange only controls its own references.
+//
+// For a plain latest-wins handoff from any number of producers, with no acceptance
+// step and no retired slots, use LatestSlot (LatestSlot.h). For a lossless log one
+// consumer walks with several cursors, use PublicationLog (PublicationLog.h).
 template <class T>
 class PublicationExchange {
 public:

@@ -10,6 +10,8 @@ Provided services:
 - DXIL targets by default and optional SPIR-V targets through `ORG_MODULE_SERVICES_ENABLE_VULKAN`.
 - One-shot asynchronous pipeline builds (`BuildPipeline`) and live pipeline slots for hot reload, with pinned versions and retirement (`PipelineRegistry`).
 - Header-only async primitives: serialized task pumps, leased immutable array slots, and a bounded single-producer/single-consumer publication exchange.
+- Header-only containers in `Async/`: a latest-wins mailbox for any number of producers (`LatestSlot`), a lossless single-producer log with several consumer cursors (`PublicationLog`), generational slot tables freed after their last reference (`SlotTable`), and kept arrays: copy-on-write chunked arrays with change journals, so each mirroring buffer is sent only what it lacks (`KeptState.h`).
+- Ownership-based deferred reclamation (`RetirementChain.h`): batches return once every publication that may name them is gone, and `Retired<T>` hands the last drop of a publication to another thread. It queues through OpenRenderGraph's `EventQueue`.
 - Shared graph contracts: classified scheduler dispatch/cancellation, immutable artifact payloads and leases, readiness milestones, backend-opaque GPU submission prerequisites, and host-defined artifact policy.
 - Host-kind-parameterized artifact identities, exact dependency recipes, snapshots and typed handles; validated host-provided scheduler queue layouts.
 - Shared build/request/suspension and move-only continuation-registration contracts, host-defined scheduling defaults, and kind-count-parameterized graph statistics.

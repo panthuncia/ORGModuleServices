@@ -23,4 +23,8 @@ target_sources(ORGAsyncPrimitives INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include/ORGModuleServices/Async/SerializedTaskPump.h>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include/ORGModuleServices/Async/LeasedArraySlots.h>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include/ORGModuleServices/Async/PublicationExchange.h>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include/ORGModuleServices/Async/RevisionAssembly.h>)
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include/ORGModuleServices/Async/RevisionAssembly.h>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include/ORGModuleServices/Async/LatestSlot.h>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include/ORGModuleServices/Async/PublicationLog.h>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include/ORGModuleServices/Async/SlotTable.h>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include/ORGModuleServices/Async/KeptState.h>)
