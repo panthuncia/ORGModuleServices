@@ -28,6 +28,9 @@
 #include <typeindex>
 #include <vector>
 
+// ORG's test task service (OpenRenderGraph/tests).
+#include "TestTaskService.h"
+
 #define CHECK(...)                                                                          \
     do {                                                                                    \
         if (!(__VA_ARGS__)) {                                                               \
@@ -205,7 +208,7 @@ int main() {
     create.framesInFlight = 2;
     rhi::DevicePtr device;
     CHECK(!rhi::Failed(rhi::CreateD3D12Device(create, device)) && device);
-    auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::D3D12});
+    auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::D3D12, .tasks = std::make_shared<org::test::TestTaskService>(2)});
     for (const auto test : {&TestFindAndMiss, &TestSerialsAndErrors, &TestAdoptAll, &TestComposition})
         if (const int line = test()) return line;
     std::puts("PASS: NamedVersionsTests");

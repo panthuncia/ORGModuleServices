@@ -30,6 +30,9 @@
 #include <thread>
 #include <vector>
 
+// ORG's test task service (OpenRenderGraph/tests).
+#include "TestTaskService.h"
+
 #define CHECK(...)                                                                          \
     do {                                                                                    \
         if (!(__VA_ARGS__)) {                                                               \
@@ -444,7 +447,7 @@ int main(int argc, char** argv) {
         create.nativeAdapter = warp.Get();
         CHECK(!rhi::Failed(rhi::CreateD3D12Device(create, device)) && device);
     }
-    auto runtime = org::Runtime::Create({.device = device.Get(), .backend = create.backend});
+    auto runtime = org::Runtime::Create({.device = device.Get(), .backend = create.backend, .tasks = std::make_shared<org::test::TestTaskService>(2)});
     CHECK(runtime && runtime->Uploads());
     Context context{&device, runtime->Uploads()};
     for (const auto test : {&TestMakeFillResolve, &TestExtentForm, &TestUndefinedQueuesNothing, &TestShapeClassChangeThrows,
