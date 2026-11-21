@@ -1,4 +1,7 @@
 #include <ORGModuleServices/PipelineRegistry.h>
+#include <ORGModuleServices/PipelinePins.h>
+#include <Render/PreparedPass.h>
+#include <Render/RecordingTags.h>
 #include <ORGModuleServices/CompileFlightRegistry.h>
 #include <ORGModuleServices/Passes/GenerateMipsPass.h>
 #if defined(ORG_MODULE_SERVICES_HAS_DXC)
@@ -24,6 +27,35 @@ int main() {
     org::services::BuildPipeline([](org::services::ServiceTask) { return false; }, [&] { ++builds; return org::services::PipelinePayload{}; },
         [&](org::services::LiveBuild build) { refused = !build.payload && !build.error.empty(); });
     CHECK(refused); CHECK(builds == 1);
+    // A recording binds the version at its graph's pin, and the newest without one.
+    {
+        org::services::PipelineRegistry registry;
+        registry.Configure([](org::services::ServiceTask task) { task(); return true; });
+        const auto first = std::static_pointer_cast<void>(std::make_shared<uint32_t>(1));
+        const auto second = std::static_pointer_cast<void>(std::make_shared<uint32_t>(2));
+        org::services::LivePipelineDesc desc;
+        desc.id = "pinned";
+        desc.sources = { "Pinned.hlsl" };
+        desc.rebuild = [second](const org::services::LiveRebuildRequest&, org::services::LiveRebuildDone done) {
+            done(org::services::LiveBuild{ second, 2, {} });
+        };
+        const auto slot = registry.Register(std::move(desc), first, 1, registry.SourcesGeneration());
+        const auto oldPin = registry.Pin();
+        registry.RequestReload({}, true);
+        CHECK(registry.Service().published == 1);
+        const auto newPin = registry.Pin();
+        CHECK(newPin->generation > oldPin->generation);
+        auto recording = org::RecordingContext::ForSkipQuestions(org::RunRef{});
+        CHECK(org::services::VersionFor(*slot, recording)->payload == second);
+        recording.SetTags(std::make_shared<const org::RecordingTags>(org::RecordingTags{}.With(org::services::PipelinePinTag(), oldPin)));
+        CHECK(org::services::VersionFor(*slot, recording)->payload == first);
+        recording.SetTags(std::make_shared<const org::RecordingTags>(org::RecordingTags{}.With(org::services::PipelinePinTag(), newPin)));
+        CHECK(org::services::VersionFor(*slot, recording)->payload == second);
+        // Another extension's tag does not read as a pin.
+        static const org::RecordingTagKey other{ "other" };
+        recording.SetTags(std::make_shared<const org::RecordingTags>(org::RecordingTags{}.With(other, oldPin)));
+        CHECK(org::services::VersionFor(*slot, recording)->payload == second);
+    }
     // Mip steps halve, round down and stop at 1; the group counts cover each destination.
     const auto steps = org::services::PlanGenerateMips(5, 3, 3);
     CHECK(steps.size() == 2);
