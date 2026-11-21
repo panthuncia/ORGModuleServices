@@ -1,4 +1,4 @@
-// Texture versions (MakeTextureVersions) on WARP: made pending, zero-filled on the uploader's copy queue, named, and resolved
+// Texture versions (MakeTextureVersions) on WARP: made pending, zero- or value-filled on the uploader's copy queue, named, and resolved
 // as a revision fragment once the fills completed.
 //
 // The fills go through the runtime's real upload service, so these tests also cover the uploader's texture zero fill
@@ -243,6 +243,28 @@ int TestMakeFillResolve(Context& c) {
     return 0;
 }
 
+// A Value version: every texel the value, encoded in the version's own format (no valueFormat), on the uploader's queue.
+int TestValueFill(Context& c) {
+    constexpr uint32_t kSize = 16;
+    auto slot = org::VersionedTexture::CreateImage(
+        MakePixels(kSize, kSize, rhi::Format::R8G8B8A8_UNorm, 1, rhi::QueueSharing::Concurrent, "TextureVersionsTests value first"));
+    auto image = MakePixels(kSize, kSize, rhi::Format::R8G8B8A8_UNorm, 1, rhi::QueueSharing::Concurrent, "TextureVersionsTests value");
+    TextureVersionRequest request;
+    request.slot = slot;
+    request.image = image;
+    request.contents = TextureContents::Value;
+    request.value = {1.0f, 0.0f, 1.0f, 0.0f};
+    const auto made = MakeTextureVersions({&request, 1}, c.uploads);
+    CHECK(made.ready && made.fragment);
+    CHECK(WaitSettled(made.fragment));
+    CHECK(made.fragment->GetState() == org::async::RevisionFragment::State::Ready);
+    uint64_t nonZero = 0;
+    if (const int line = CountNonZero(c, *image, 1, 4, nonZero)) return line;
+    // Red and blue are 0xFF, green and alpha zero.
+    CHECK(nonZero == uint64_t{kSize} * kSize * 2);
+    return 0;
+}
+
 // A PixelBuffer made like the slot's current one at a new extent, zero-filled. The slot's current one is Exclusive, the new
 // one is made Concurrent for its fill.
 int TestExtentForm(Context& c) {
@@ -355,6 +377,12 @@ int TestRefusals(Context& c) {
     TextureVersionRequest empty;
     empty.slot = slot;
     CHECK(throws({empty}, c.uploads));      // an empty extent
+    TextureVersionRequest unencoded;
+    unencoded.slot = slot;
+    unencoded.image = MakePixels(32, 32, rhi::Format::R8G8B8A8_UNorm, 1, rhi::QueueSharing::Concurrent, "TextureVersionsTests unencoded");
+    unencoded.contents = TextureContents::Value;
+    unencoded.valueFormat = rhi::Format::BC1_UNorm;
+    CHECK(throws({unencoded}, c.uploads));  // a value with no texel encoding
     return 0;
 }
 
@@ -450,7 +478,7 @@ int main(int argc, char** argv) {
     auto runtime = org::Runtime::Create({.device = device.Get(), .backend = create.backend, .tasks = std::make_shared<org::test::TestTaskService>(2)});
     CHECK(runtime && runtime->Uploads());
     Context context{&device, runtime->Uploads()};
-    for (const auto test : {&TestMakeFillResolve, &TestExtentForm, &TestUndefinedQueuesNothing, &TestShapeClassChangeThrows,
+    for (const auto test : {&TestMakeFillResolve, &TestValueFill, &TestExtentForm, &TestUndefinedQueuesNothing, &TestShapeClassChangeThrows,
              &TestRefusals, &TestWorkForm, &TestFragmentSettling})
         if (const int line = test(context)) return line;
     std::puts("PASS: TextureVersionsTests");

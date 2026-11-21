@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "Resources/ExternalTextureResource.h"
 #include "Resources/PixelBuffer.h"
 
 namespace org::services {
@@ -43,6 +44,14 @@ std::shared_ptr<GloballyIndexedResource> NextTexture(const TextureVersionRequest
     auto next = PixelBuffer::CreateShared(description);
     next->SetName(request.name.empty() ? current->GetName() : request.name);
     return next;
+}
+
+// The format a Value request's texel is encoded in: the request's, or the version's own.
+rhi::Format ValueFormatOf(const TextureVersionRequest& request, const std::shared_ptr<Resource>& resource) {
+    if (request.valueFormat != rhi::Format::Unknown) return request.valueFormat;
+    if (const auto pixels = std::dynamic_pointer_cast<PixelBuffer>(resource)) return pixels->GetFormat();
+    if (const auto external = std::dynamic_pointer_cast<ExternalTextureResource>(resource)) return external->GetFormat();
+    return rhi::Format::Unknown;
 }
 
 // Settles a fragment from the uploader's notifications. The tickets hold the callback until they end, and the callback holds
@@ -119,14 +128,24 @@ TextureVersionsMade MakeTextureVersions(std::span<const TextureVersionRequest> r
         made.versions.push_back(std::move(version));
     }
     made.named = NamedVersions::Textures(entries);
+    // A Value request becomes a fill whose writer repeats its encoded texel. Each writer is made before any fill is queued.
+    std::vector<TextureFillWriter> values(requests.size());
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+        if (requests[i].contents != TextureContents::Value) continue;
+        const auto& resource = made.versions[i]->resource;
+        values[i] = ValueFillWriter(ValueFormatOf(requests[i], resource), requests[i].value);
+        if (!values[i])
+            throw std::invalid_argument("MakeTextureVersions: '" + resource->GetName() + "' has no texel encoding for its value");
+    }
     std::vector<std::shared_ptr<TrackedUploadTicket>> tickets;
     for (std::size_t i = 0; i < requests.size(); ++i) {
         if (requests[i].contents == TextureContents::Undefined) continue;
         const auto& resource = made.versions[i]->resource;
         // The version is pending and its texture new: no queue uses it before its owner adopts it, after these copies.
         const WorkerOwnedDestination destination{resource, WorkerOwnedDestination::Ownership::FreshTexture};
+        const auto& writer = requests[i].contents == TextureContents::Value ? values[i] : requests[i].fill;
         auto ticket = requests[i].contents == TextureContents::Zero ? uploads->QueueTrackedStreamingTextureZeroFill(destination) :
-                                                                      uploads->QueueTrackedStreamingTextureFill(destination, requests[i].fill);
+                                                                      uploads->QueueTrackedStreamingTextureFill(destination, writer);
         if (!ticket)
             throw std::invalid_argument("MakeTextureVersions: the uploader cannot fill '" + resource->GetName() +
                 "'. It must be a concurrent, single-sampled colour texture, and its contents must be written");
