@@ -34,6 +34,10 @@ add_library(ORGModuleServices STATIC
     src/Passes/ResolveMultisamplePass.cpp
     src/Passes/UavClearPass.cpp
     src/PipelineRegistry.cpp
+    src/Programs/ComputeProgram.cpp
+    src/Programs/ProgramBuild.cpp
+    src/Programs/ProgramService.cpp
+    src/Programs/RasterProgram.cpp
     src/RecordingPools.cpp
     src/RetirementJoin.cpp
     src/SecondaryListPool.cpp
@@ -82,6 +86,12 @@ if(ORG_MODULE_SERVICES_BUILD_TESTS)
     add_executable(ORGModuleServicesTests tests/ServicesTests.cpp)
     target_link_libraries(ORGModuleServicesTests PRIVATE ORGModuleServices::ORGModuleServices)
     add_test(NAME ORGModuleServicesTests COMMAND ORGModuleServicesTests)
+    # The program service's slots and the programs' environment, without a device.
+    add_executable(ORGProgramServiceTests tests/Programs/ProgramServiceTests.cpp)
+    target_link_libraries(ORGProgramServiceTests PRIVATE ORGModuleServices::ORGModuleServices)
+    target_compile_options(ORGProgramServiceTests PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/UNDEBUG,-UNDEBUG>)
+    add_test(NAME ORGProgramServiceTests COMMAND ORGProgramServiceTests)
+    set_tests_properties(ORGProgramServiceTests PROPERTIES TIMEOUT 60)
     add_executable(ORGViolationPolicyTests tests/Policy/ViolationPolicyTests.cpp)
     target_link_libraries(ORGViolationPolicyTests PRIVATE ORGModuleServices::ORGModuleServices)
     add_test(NAME ORGViolationPolicyTests COMMAND ORGViolationPolicyTests)
