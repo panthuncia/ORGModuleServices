@@ -14,6 +14,7 @@ Provided services:
   the shader compiler into live pipeline slots, and `ProgramService`, which builds them several at once on an executor
   and gates on them without waiting. The host gives the shader root, the backend, its defines and the pipeline version
   a recording binds through `ProgramEnvironment` (`Programs/ProgramBuild.h`).
+- Staged graph builds off the owner thread (`StagedBuilds`): rebuild requests are built on an executor lane, attached or staged at frame boundaries, and staged sets attach as one. Extensions defer work to a build's staging, attach or failure (`BuildContext.h`). Immutable build inputs with a serial, and which one is built and which attached (`BuildInputs.h`).
 - Header-only async primitives: serialized task pumps, leased immutable array slots, and a bounded single-producer/single-consumer publication exchange.
 - Header-only containers in `Async/`: a latest-wins mailbox for any number of producers (`LatestSlot`), a lossless single-producer log with several consumer cursors (`PublicationLog`), generational slot tables freed after their last reference (`SlotTable`), and kept arrays: copy-on-write chunked arrays with change journals, so each mirroring buffer is sent only what it lacks (`KeptState.h`).
 - Ownership-based deferred reclamation (`RetirementChain.h`): batches return once every publication that may name them is gone, and `Retired<T>` hands the last drop of a publication to another thread. It queues through OpenRenderGraph's `EventQueue`.
