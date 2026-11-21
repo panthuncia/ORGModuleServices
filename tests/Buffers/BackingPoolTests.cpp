@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <memory>
 #include <set>
+#include <string>
 #include <source_location>
 #include <thread>
 #include <vector>
@@ -405,6 +406,30 @@ void TestPoolOutlivedAndHooks() {
     survivor.Reset();
 }
 
+// A failed allocation is returned: an empty lease, the hook's reason in AcquireInfo::error, and no backing kept. The next
+// acquire allocates again.
+void TestAllocationFailureReturned() {
+    auto clock = std::make_shared<RetirementClock>();
+    auto fail = std::make_shared<bool>(true);
+    BackingPoolHooks hooks;
+    hooks.allocate = [fail](const BackingRequest&) {
+        BackingAllocation allocation;
+        if (*fail) allocation.error = "out of memory";
+        else allocation.address = 0x10000;
+        return allocation;
+    };
+    auto pool = BackingPool::Create(std::move(hooks), clock, {.name = "failing", .maxPerClass = 0});
+    BackingPool::AcquireInfo info;
+    auto lease = pool->Acquire(Request(4), BackingPool::kAnyEpoch, &info);
+    Check(!lease && !info.allocated && info.error == "out of memory");
+    Check(pool->Count().live == 0);
+    *fail = false;
+    BackingPool::AcquireInfo again;
+    lease = pool->Acquire(Request(4), BackingPool::kAnyEpoch, &again);
+    Check(static_cast<bool>(lease) && again.allocated && again.error.empty());
+    Check(pool->Count().live == 1);
+}
+
 } // namespace
 
 int main() {
@@ -416,6 +441,7 @@ int main() {
     TestLeaseReturnFromOtherThreads();
     TestOldestContentEpoch();
     TestPoolOutlivedAndHooks();
+    TestAllocationFailureReturned();
     std::puts("ORGBufferPoolTests: all passed");
     return 0;
 }

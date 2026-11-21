@@ -11,6 +11,7 @@ namespace org::services {
 namespace {
 
 // Leases the request's backing, makes it the buffer's next version (owning the lease) and queues its fills, adding their tickets.
+// A runtime failure is returned in `error`, with nothing else set. A misuse throws.
 GrownVersion MakeAndFill(const VersionGrowthRequest& request, std::vector<std::shared_ptr<TrackedUploadTicket>>& tickets) {
     if (!request.buffer) throw std::invalid_argument("GrowVersion: no buffer");
     if (!request.pool) throw std::invalid_argument("GrowVersion: " + request.name + " has no pool");
@@ -24,9 +25,14 @@ GrownVersion MakeAndFill(const VersionGrowthRequest& request, std::vector<std::s
     if (!backing.capacityClass) throw std::invalid_argument("GrowVersion: " + request.name + " asks for an empty version");
     if (request.elements && !request.stride) throw std::invalid_argument("GrowVersion: " + request.name + " is structured without a stride");
     GrownVersion out;
-    out.lease = request.pool->Acquire(backing);
+    BackingPool::AcquireInfo acquired;
+    out.lease = request.pool->Acquire(backing, BackingPool::kAnyEpoch, &acquired);
     // Exhausted (Config::maxPerClass): the batch fails and the next seal that needs it posts it again; no smaller version.
-    if (!out.lease || !out.lease->buffer) throw std::runtime_error("GrowVersion: no backing for " + request.name);
+    if (!out.lease || !out.lease->buffer) {
+        GrownVersion failed;
+        failed.error = "GrowVersion: no backing for " + request.name + (acquired.error.empty() ? std::string() : " (" + acquired.error + ")");
+        return failed;
+    }
     // The version is the backing (the pool keeps the buffer; a reused one holds an older version's bytes) and owns a lease of it.
     auto made = request.buffer->Make(out.lease->buffer);
     out.version = LeasedVersion(BufferVersion(*made), out.lease);
@@ -50,7 +56,11 @@ GrownVersion MakeAndFill(const VersionGrowthRequest& request, std::vector<std::s
         // frame reads it any more, its clock reached the point they bound).
         auto ticket = request.uploads->QueueTrackedStreamingUploadSegments(fill.segments, bytes,
             WorkerOwnedDestination{ version->buffer, WorkerOwnedDestination::Ownership::PendingVersion }, fill.offset);
-        if (!ticket) throw std::runtime_error("GrowVersion: the uploader refused a fill");
+        if (!ticket) {
+            GrownVersion failed;
+            failed.error = "GrowVersion: the uploader refused a fill of " + request.name;
+            return failed;
+        }
         // The uploader copies the segments into its staging pages as it queues them: `madeContents` may go after this.
         tickets.push_back(std::move(ticket));
     }
@@ -62,6 +72,7 @@ GrownVersion MakeAndFill(const VersionGrowthRequest& request, std::vector<std::s
 GrownVersion GrowVersion(const VersionGrowthRequest& request) {
     std::vector<std::shared_ptr<TrackedUploadTicket>> tickets;
     auto out = MakeAndFill(request, tickets);
+    if (!out.error.empty()) return out;
     out.ready = TokenForTickets(std::move(tickets));
     return out;
 }
@@ -73,6 +84,11 @@ GrownVersions GrowVersions(std::span<const VersionGrowthRequest> requests) {
     out.leases.reserve(requests.size());
     for (const auto& request : requests) {
         auto grown = MakeAndFill(request, tickets);
+        if (!grown.error.empty()) {
+            GrownVersions failed;
+            failed.error = std::move(grown.error);
+            return failed;
+        }
         out.versions.push_back(std::move(grown.version));
         out.leases.push_back(std::move(grown.lease));
     }

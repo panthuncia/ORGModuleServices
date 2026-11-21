@@ -356,6 +356,7 @@ bool GrowableBufferSet::Post(const std::vector<std::pair<std::uint32_t, std::uin
         request.buffer = std::move(buffer);
         if (registration.extent.structuredStride) {
             const std::uint64_t elements = registration.extent.ElementsFor(units);
+            // A size no version can have: the host's request is wrong, and posting it again would fail again.
             if (elements > UINT32_MAX) throw std::length_error("GrowableBufferSet: " + registration.name + " past a structured buffer's elements");
             request.elements = static_cast<std::uint32_t>(elements);
         } else {
@@ -398,8 +399,14 @@ bool GrowableBufferSet::Post(const std::vector<std::pair<std::uint32_t, std::uin
     async::VersionGrowthWork work;
     work.produce = [requests = std::move(requests)] {
         auto grown = std::make_shared<GrownVersions>(GrowVersions(requests));
-        auto ready = grown->ready;
-        return async::VersionGrowthWork::Produced{std::shared_ptr<const void>(std::move(grown)), std::move(ready)};
+        async::VersionGrowthWork::Produced produced;
+        if (!grown->error.empty()) {
+            produced.error = std::move(grown->error);
+            return produced;
+        }
+        produced.ready = grown->ready;
+        produced.value = std::shared_ptr<const void>(std::move(grown));
+        return produced;
     };
     work.done = [batch, wake = m_hooks.wake](std::shared_ptr<const void> value, std::string error) {
         const auto* grown = static_cast<const GrownVersions*>(value.get());

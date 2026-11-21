@@ -26,7 +26,8 @@ using GraphHostAccess = std::function<const GraphHost*()>;
 
 /**
  * @brief BackingPoolHooks::allocate. Makes and materializes a buffer without an ECS entity, since an acquirer off the host's
- * thread may not touch the host's world. Copies `request.like`'s kind when set. Throws when it cannot be made.
+ * thread may not touch the host's world. Copies `request.like`'s kind when set. When it cannot be made, it returns
+ * BackingAllocation::error (ORG's own failure text included) and does not throw.
  */
 [[nodiscard]] BackingAllocation AllocateGraphHostBacking(const GraphHostAccess& host, const BackingRequest& request);
 
