@@ -25,6 +25,17 @@ CPU-only consumers needing the compiled identity service include
 This static runtime must have one owner when exchanging identities across DLLs;
 independently linked copies do not provide cross-module uniqueness.
 
+The thread-pool scheduler is `ORGModuleServices::AsyncExecutor` (`cmake/AsyncExecutor.cmake`, CPU only, needs TBB):
+
+- `Async/Executor.h`: `org::async::Executor`, a `GraphScheduler` with per-domain worker pools, unbounded queues, timers,
+  cancellable scopes, `ParallelFor` with priority-boosted helpers, and frame-critical jobs that go first and can have
+  threads of their own. The domains, worker counts, thread start hook and priority callbacks come from `Executor::Desc`;
+  the default layout has a coordinator thread, a parallel pool, a serial thread and a small blocking pool.
+- `Async/Lanes.h`: `Lane` (one serial pass at a time, wakes coalesce), `JobLane<Job>` (posted jobs in order) and
+  `MakeLane` (a lane for the process's life), on an executor.
+- `Async/ExecutorTaskService.h` (in `ORGModuleServices`, which links OpenRenderGraph): OpenRenderGraph's `ITaskService`
+  over an executor. A task that throws is reported through the host's `onTaskError` callback.
+
 Standalone tests:
 
 ```sh
