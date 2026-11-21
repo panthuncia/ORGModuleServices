@@ -26,6 +26,7 @@ add_library(ORGModuleServices STATIC
     src/Passes/GenerateMipsPass.cpp
     src/Passes/ResolveMultisamplePass.cpp
     src/PipelineRegistry.cpp
+    src/TexelEncoding.cpp
     src/VersionedBufferBuild.cpp
     src/VersionedBufferGrowth.cpp
     src/VersionedTextureGrowth.cpp)
@@ -88,6 +89,11 @@ if(ORG_MODULE_SERVICES_BUILD_TESTS)
             target_compile_options(ORGTextureVersionsTests PRIVATE /utf-8)
         endif()
         add_test(NAME ORGTextureVersionsTests COMMAND ORGTextureVersionsTests)
+        # Texel encodings for value births, against a DirectXMath reference. CPU only.
+        add_executable(ORGTexelEncodingTests tests/Versions/TexelEncodingTests.cpp)
+        target_link_libraries(ORGTexelEncodingTests PRIVATE ORGModuleServices::ORGModuleServices d3d12 dxgi)
+        target_compile_definitions(ORGTexelEncodingTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+        add_test(NAME ORGTexelEncodingTests COMMAND ORGTexelEncodingTests)
     endif()
 endif()
 

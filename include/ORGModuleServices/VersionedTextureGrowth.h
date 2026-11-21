@@ -4,6 +4,7 @@
 #include <ORGModuleServices/Async/RevisionAssembly.h>
 #include <ORGModuleServices/Async/VersionGrowthArtifact.h>
 #include <ORGModuleServices/GrowableBufferSet.h>
+#include <ORGModuleServices/TexelEncoding.h>
 
 #include <cstdint>
 #include <functional>
@@ -23,7 +24,8 @@ namespace org::services {
 enum class TextureContents : std::uint8_t {
     Undefined,  // nothing is written: the version's writers write it whole, or its maker initialized it
     Zero,       // zero-filled on the uploader's worker path (a History texture is born cleared)
-    Fill,       // filled on that path with what the request's writer writes (a texture born with a value or contents)
+    Value,      // every texel one value (the request's `value`), filled on that path through ValueFillWriter
+    Fill,       // filled on that path with what the request's writer writes (a texture born with contents)
 };
 
 /** @brief The size of a texture version made from the slot's current one. Depth is for a 3D texture. */
@@ -42,7 +44,7 @@ struct TextureExtent {
  * - When `image` is null, a PixelBuffer that MakeTextureVersions makes like the slot's current one, at `extent`. The current
  *   version must then be a PixelBuffer.
  *
- * A Zero or Fill version is filled on the uploader's copy queue, so it must be rhi::QueueSharing::Concurrent, single-sampled and
+ * A Zero, Value or Fill version is filled on the uploader's copy queue, so it must be rhi::QueueSharing::Concurrent, single-sampled and
  * not a depth format. A PixelBuffer made from `extent` for such a request is made Concurrent.
  */
 struct TextureVersionRequest {
@@ -56,6 +58,10 @@ struct TextureVersionRequest {
     std::string name;
     // A Fill version's contents, written subresource by subresource on the thread that makes the versions.
     TextureFillWriter fill;
+    // A Value version's texel, encoded in `valueFormat` (EncodeTexel). Unknown: the version's own format, read from a
+    // PixelBuffer or an ExternalTextureResource.
+    TexelValue value{};
+    rhi::Format valueFormat = rhi::Format::Unknown;
 };
 
 /** @brief Texture versions made together. They are adopted as one, so they are ready as one. */
@@ -73,14 +79,16 @@ struct TextureVersionsMade {
 
 /**
  * @brief Any thread: makes each request's next version (VersionedTexture::MakeImage, pending, not current), queues the zero
- * fills on `uploads`' worker path (IUploadService::QueueTrackedStreamingTextureZeroFill) and names the versions in one texture
- * set (NamedVersions::Textures).
+ * fills on `uploads`' worker path (IUploadService::QueueTrackedStreamingTextureZeroFill) and the value and content fills
+ * (QueueTrackedStreamingTextureFill; a Value request through ValueFillWriter), and names the versions in one texture set
+ * (NamedVersions::Textures).
  *
- * Every version is made before any fill is queued, so a shape-class change queues nothing. Throws:
+ * Every version and every value's writer is made before any fill is queued, so a shape-class change or a value without an
+ * encoding queues nothing. Throws:
  * - std::invalid_argument for a request without a slot, a slot named twice, an `extent` request whose current version is not
  *   a PixelBuffer, an empty extent, and a version of another shape class than the slot's (ORG's MakeVersion).
- * - std::invalid_argument for a Zero or Fill request without `uploads`, a Fill request without a writer, or a texture the
- *   uploader cannot fill (or whose writer failed).
+ * - std::invalid_argument for a Zero, Value or Fill request without `uploads`, a Fill request without a writer, a Value
+ *   request whose format has no texel encoding, or a texture the uploader cannot fill (or whose writer failed).
  */
 TextureVersionsMade MakeTextureVersions(std::span<const TextureVersionRequest> requests,
     const std::shared_ptr<runtime::IUploadService>& uploads);
