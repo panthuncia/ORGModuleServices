@@ -21,6 +21,29 @@ target_compile_options(ORGBufferPoolTests PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/
 add_test(NAME ORGBufferPoolTests COMMAND ORGBufferPoolTests)
 set_tests_properties(ORGBufferPoolTests PROPERTIES TIMEOUT 120)
 
+# Standalone: the retirement join, the recording pools and the pool defaults. They use ORG's header-only EventQueue and nothing
+# else of it.
+set(ORG_RETIREMENT_TEST_ORG_INCLUDE "${_services_root}/../OpenRenderGraph/include" CACHE PATH "OpenRenderGraph's include directory")
+if(EXISTS "${ORG_RETIREMENT_TEST_ORG_INCLUDE}/Render/Runtime/EventQueue.h")
+    add_executable(ORGRetirementTests
+        RetirementTests.cpp
+        PublicHeaders/RetirementJoin.cpp
+        PublicHeaders/RecordingPools.cpp
+        "${_services_root}/src/BackingPool.cpp"
+        "${_services_root}/src/RecordingPools.cpp"
+        "${_services_root}/src/RetirementJoin.cpp"
+        NoBufferBinding.cpp)
+    target_compile_features(ORGRetirementTests PRIVATE cxx_std_20)
+    target_include_directories(ORGRetirementTests PRIVATE "${_services_root}/include" "${ORG_RETIREMENT_TEST_ORG_INCLUDE}")
+    target_link_libraries(ORGRetirementTests PRIVATE Threads::Threads)
+    target_compile_definitions(ORGRetirementTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_options(ORGRetirementTests PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/UNDEBUG,-UNDEBUG>)
+    add_test(NAME ORGRetirementTests COMMAND ORGRetirementTests)
+    set_tests_properties(ORGRetirementTests PROPERTIES TIMEOUT 120)
+else()
+    message(STATUS "ORGRetirementTests: OpenRenderGraph's EventQueue.h not found; skipped")
+endif()
+
 # Header-compiled against OpenRenderGraph/BasicRHI (nothing of them is linked): BuildVersionedBuffer through a recording upload
 # service. Needs ORG's third-party headers (flecs, spdlog,
 # boost, fmt), e.g. CommunityShaders' vcpkg tree; skipped without them.

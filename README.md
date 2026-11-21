@@ -172,6 +172,21 @@ DCLF's payload and FrameValues and for growable-set growth; BasicRenderer uses i
 - **`BackingLease`**: copyable (each copy counts); the last one released, on any thread, returns the backing lock-free through a
   Treiber return stack the acquirer drains. `Bind(safeAt)` (any thread, max-merged): not reused before the clock reaches `safeAt`,
   so a frame binds the point that retires with it and the backing stays immutable for the GPU after the last lease goes.
+- **`RetirementJoin`** (`RetirementJoin.h`; std and ORG's `EventQueue` only): one `RetirementClock` over two sources, a graph
+  host's submissions and a CPU pipeline's frame timeline, read through a `Source` interface. `SubmittedPoint()` (submitting thread)
+  notes a point that counts both; it retires once both passed it. The host calls `NoteGraphSubmissionsRetired` (its retired
+  callback), `NoteCpuFrameOpened`/`NoteCpuFrameSignalled`/`SealCpuFrames` (the CPU frames) and `Poll` (any thread, one run at a
+  time, nobody waits). Before the first CPU frame the points are the host's submission counts.
+- **`GraphHostRetirement`** (`GraphHostRetirement.h`): the join with a graph host as its source (`GraphHostAccess`, a callback that
+  returns the host or null), the host's chosen CPU frame timeline (`SetCpuFrameTimeline`), and the GPU points behind the points:
+  `SubmittedGpuPoint`, `SealedGpuPoint` and `Sealed(point)`.
+- **`GraphHostBackings.h`**: default pool hooks for a graph host (`GraphHostBackingHooks`: allocate without an ECS entity, retire on
+  the host's cleanup lane) and the pool defaults `PerFrameSpares(framesInFlight)`, `PerFrameCopies(asked, framesInFlight)` and
+  `BackingShrinkPolicy(BackingShrink)`.
+- **`RecordingPools.h`** (std and ORG's `EventQueue` only): `BumpArena` (a frame slot's CPU memory in chunks that never move, reset
+  at the slot's retirement), `ResetPools<Pool>` (pools reset off the owning thread through a host `Defer` callback; any thread
+  hands in, one takes) and `RecordingSlot<Pool>` (an arena per worker plus one pool; `Retire` resets the arenas and recycles the
+  pool). **`SecondaryListPool.h`**: the pool of secondary command lists from one allocator that `RecordingSlot` holds.
 - **`VersionedBufferBuild.h`**: `VersionedBufferBuildInput` (the predecessor, the host's `changedSince` and `emitDelta`;
   `backingPool` required; the host's identity as an opaque `tag`) and `PublishedBufferVersion` (owns its backing's lease;
   `hostState` for host-seeded state that holds no consumer pin). `BuildVersionedBuffer(input, context)` acquires (the
@@ -185,7 +200,8 @@ DCLF's payload and FrameValues and for growable-set growth; BasicRenderer uses i
   and `wrap` (the artifact payload; BasicRenderer: a `RendererStateFragmentArtifact`).
 
 The buffer tests are in `tests/Buffers`. `ORGBufferPoolTests` needs only these headers (the clock and pool, and the public
-headers' self-containment). `ORGBufferBuildTests` (`BuildVersionedBuffer` through a recording upload service) also needs
+headers' self-containment). `ORGRetirementTests` (the join, the recording pools and the pool defaults) also needs
+OpenRenderGraph's header-only `EventQueue.h` (`ORG_RETIREMENT_TEST_ORG_INCLUDE`). `ORGBufferBuildTests` (`BuildVersionedBuffer` through a recording upload service) also needs
 OpenRenderGraph's third-party headers (e.g. CommunityShaders' vcpkg tree) and the Vulkan SDK; it is skipped without them.
 
 ```sh
