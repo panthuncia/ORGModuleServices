@@ -36,6 +36,7 @@ if(EXISTS "${ORG_ASYNC_TEST_ORG_INCLUDE}/Render/Runtime/EventQueue.h")
     add_test(NAME ORGRetirementChainTests COMMAND ORGRetirementChainTests)
 else()
     message(STATUS "ORGRetirementChainTests: OpenRenderGraph's headers not found (ORG_ASYNC_TEST_ORG_INCLUDE); skipped")
+endif()
 
 # The thread-pool executor and its lanes.
 include(../../cmake/AsyncExecutor.cmake)
