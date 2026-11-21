@@ -24,6 +24,7 @@ add_library(ORGModuleServices STATIC
     src/BackingPool.cpp
     src/BackingPoolBinding.cpp
     src/BuildContext.cpp
+    src/BufferChains.cpp
     src/ComposedVersions.cpp
     src/ContentOwners.cpp
     src/GraphJob.cpp

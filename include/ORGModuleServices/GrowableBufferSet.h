@@ -19,6 +19,7 @@
 #include "Resources/Buffers/VersionedBuffer.h"
 
 namespace org {
+class Buffer;
 class LatchBlock;
 }
 
@@ -50,6 +51,24 @@ struct GrowableRegistration {
     // (BackingRequest::like) and reused only by this registration's versions. Null: the set's (GrowableBufferSetHooks::pool);
     // Register throws when both are (no fresh buffers). One acquirer at a time: a pool serves one set (its batches run in turn).
     std::shared_ptr<BackingPool> pool;
+};
+
+/**
+ * @brief How a buffer joins the set through GrowableBufferSet::Make. Its name is its first version's.
+ */
+struct GrowableBufferSpec {
+    BufferExtent extent;
+    GrowthPolicy policy = GrowthPolicy::Doubling();
+    GrowableContents contents = GrowableContents::Fresh;
+    GrowableCapture capture;  // Capture's
+    ShrinkPolicy shrink = ShrinkPolicy::Never();
+    bool address = false;  // its entries carry the version's device address
+};
+
+/** @brief What a latch block holds: a region per run, or one region every run reads, such as a block of zeros. */
+enum class LatchRegions : std::uint8_t {
+    PerRun,  // a region per run, from the runtime's frame arena
+    Shared,  // one dedicated region
 };
 
 /**
@@ -106,6 +125,8 @@ public:
     /** @brief The buffer's entry, found by its key; throws when the set does not name it. */
     [[nodiscard]] const NamedEntry& Of(const VersionedBuffer& buffer) const;
     [[nodiscard]] const NamedEntry& Of(const std::shared_ptr<VersionedBuffer>& buffer) const;
+    /** @brief Units in the version the set names, or 0 for a null buffer or one the set does not name (a set older than it). */
+    [[nodiscard]] std::uint64_t UnitsOf(const std::shared_ptr<VersionedBuffer>& buffer) const { return Names(buffer) ? Of(*buffer).units : 0; }
     /** @brief The handle's latch block; null before its first requirement. */
     [[nodiscard]] std::shared_ptr<LatchBlock> Latch(LatchHandle handle) const noexcept;
     /**
@@ -231,8 +252,27 @@ public:
     GrowableHandle Register(GrowableRegistration registration);
     /** @brief Any thread. */
     LatchHandle Register(LatchRegistration registration);
+    /**
+     * @brief Any thread. Registers a latch block by what it holds: Shared makes a dedicated block (one region), PerRun a block of
+     * the runtime's frame arena.
+     */
+    LatchHandle Register(std::string name, LatchRegions regions, GrowthPolicy policy = GrowthPolicy::Headroom(0));
+    /**
+     * @brief Any thread. Wraps `first` as the first version of a new buffer of the set and registers it, named as `first`.
+     * Null for a null `first`. Throws as Register does.
+     */
+    std::shared_ptr<VersionedBuffer> Make(std::shared_ptr<Buffer> first, GrowableBufferSpec spec);
     /** @brief Producer: a registered buffer's handle (registrations taken first); throws for one never registered or gone. */
     [[nodiscard]] GrowableHandle HandleOf(const VersionedBuffer& buffer);
+
+    /** @brief Producer: Build::Require for a buffer of the set. A null buffer or 0 units asks nothing. */
+    void Require(Build& build, const std::shared_ptr<VersionedBuffer>& buffer, std::uint64_t units);
+    /** @brief Producer: Build::RequireNewer for a buffer of the set. A null buffer or serial 0 asks nothing. */
+    void RequireNewer(Build& build, const std::shared_ptr<VersionedBuffer>& buffer, std::uint64_t serial);
+    /** @brief Producer: Build::Units for a buffer of the set; 0 for a null buffer. */
+    [[nodiscard]] std::uint64_t Units(const Build& build, const std::shared_ptr<VersionedBuffer>& buffer);
+    /** @brief Producer: the most asked of a buffer of the set (Build::Asked), at least what it holds; 0 for a null buffer. */
+    [[nodiscard]] std::uint64_t MostAsked(const Build& build, const std::shared_ptr<VersionedBuffer>& buffer);
 
     /** @brief Producer: takes in registrations and a settled batch, and starts a build. */
     [[nodiscard]] Build Begin();
@@ -290,6 +330,56 @@ private:
     Sealed m_last;                   // the last sealed set: returned again while nothing changed
     std::string m_failure;           // the last batch's, until a seal reports it
     Stats m_stats;
+};
+
+/**
+ * @brief Buffers of one set indexed alike, each with its own extent. One requirement fans out to every member, and the group holds
+ * the least any member holds.
+ */
+struct GrowableUnitGroup {
+    std::vector<std::shared_ptr<VersionedBuffer>> members;
+
+    /** @brief Adds a member; a null buffer is skipped. */
+    GrowableUnitGroup& Add(const std::shared_ptr<VersionedBuffer>& buffer) {
+        if (buffer) members.push_back(buffer);
+        return *this;
+    }
+    /** @brief Producer. Requires at least `units` of every member. */
+    void Require(GrowableBufferSet& set, GrowableBufferSet::Build& build, std::uint64_t units) const {
+        for (const auto& member : members) set.Require(build, member, units);
+    }
+    /** @brief The units every member's named version holds, or 0 without members. Throws for a member `sealed` does not name. */
+    [[nodiscard]] std::uint64_t Units(const NamedVersions& sealed) const {
+        std::uint64_t units = members.empty() ? 0 : ~0ull;
+        for (const auto& member : members) {
+            const std::uint64_t held = sealed.Of(member).units;
+            units = held < units ? held : units;
+        }
+        return units;
+    }
+    /** @brief Producer. The most asked of any member (GrowableBufferSet::MostAsked). */
+    [[nodiscard]] std::uint64_t Asked(GrowableBufferSet& set, const GrowableBufferSet::Build& build) const {
+        std::uint64_t asked = 0;
+        for (const auto& member : members) {
+            const std::uint64_t most = set.MostAsked(build, member);
+            asked = most > asked ? most : asked;
+        }
+        return asked;
+    }
+};
+
+/**
+ * @brief Fixed-stride rows in one buffer of a set that grows instead of capping. A row past the sealed capacity waits for the
+ * growth requirement: nothing is dropped and nothing falls back. The host makes the buffer (GrowableBufferSet::Make with a
+ * structured extent of `stride`).
+ */
+struct GrowableRows {
+    std::shared_ptr<VersionedBuffer> buffer;
+    std::uint32_t stride = 0;
+    std::string name;
+
+    /** @brief The row capacity of the version `sealed` names. Throws when it does not name the buffer. */
+    [[nodiscard]] std::uint32_t RowsIn(const NamedVersions& sealed) const { return static_cast<std::uint32_t>(sealed.Of(buffer).units); }
 };
 
 } // namespace org::services
