@@ -49,6 +49,12 @@ target, from `cmake/SphereCull.cmake`. It tests sphere columns against a plane s
 SSE2, AVX2 or AVX-512 kernels, picked at run time from CPUID, and every kernel gives the
 same verdicts. Its tests are in `tests/Cpu`.
 
+The Dear ImGui renderer backend (`ImGui/ImGuiBackend.h`) is the optional `ORGModuleServices::ImGui`
+target, from `cmake/ImGuiBackend.cmake` or `ORG_MODULE_SERVICES_ENABLE_IMGUI`. ImGui comes from the host: its target
+(`ORG_MODULE_SERVICES_IMGUI_TARGET`, `imgui::imgui` by default) or the folder holding `imgui.h`
+(`ORG_MODULE_SERVICES_IMGUI_INCLUDE_DIR`). The host builds the draw program from `ProgramDesc` and passes it in, and
+ships `shaders/ImGui.hlsl` with the other pass shaders. Its device-free tests are in `tests/ImGui`.
+
 Standalone tests:
 
 ```sh

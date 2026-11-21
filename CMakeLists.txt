@@ -8,6 +8,8 @@ option(ORG_MODULE_SERVICES_ENABLE_DXC "Build DXC shader compilation support" ON)
 option(ORG_MODULE_SERVICES_ENABLE_VULKAN "Enable SPIR-V shader targets" OFF)
 option(ORG_MODULE_SERVICES_BUILD_TESTS "Build ORGModuleServices tests" OFF)
 option(ORG_MODULE_SERVICES_ENABLE_ASYNC_STATE_GRAPH "Build the shared CPU dependency engine" OFF)
+# Dear ImGui's renderer backend (cmake/ImGuiBackend.cmake). ImGui comes from the host; off builds without it.
+option(ORG_MODULE_SERVICES_ENABLE_IMGUI "Build the Dear ImGui renderer backend with the host's ImGui" OFF)
 
 # Backend-independent coordination and immutable slot ownership. Kept separate
 # from shader/RHI services so CPU-only consumers and tests need no device.
@@ -53,7 +55,7 @@ add_library(ORGModuleServices STATIC
     src/VersionedTextureGrowth.cpp
     src/ViolationPolicy.cpp)
 add_library(ORGModuleServices::ORGModuleServices ALIAS ORGModuleServices)
-# The passes' shaders (Passes/GenerateMipsPass.h, Passes/ResolveMultisamplePass.h). A host compiles them with its own
+# The passes' shaders (Passes/GenerateMipsPass.h, Passes/ResolveMultisamplePass.h, ImGui/ImGuiBackend.h). A host compiles them with its own
 # programs and ships this folder's files under "ORGModuleServices/" in its shader folder.
 set(ORG_MODULE_SERVICES_SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders" CACHE INTERNAL "ORGModuleServices pass shaders")
 target_compile_features(ORGModuleServices PUBLIC cxx_std_20)
@@ -87,6 +89,10 @@ if(ORG_MODULE_SERVICES_ENABLE_DXC)
     endif()
 endif()
 
+if(ORG_MODULE_SERVICES_ENABLE_IMGUI)
+    include(${CMAKE_CURRENT_LIST_DIR}/cmake/ImGuiBackend.cmake)
+endif()
+
 if(ORG_MODULE_SERVICES_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests/Async)
@@ -115,6 +121,13 @@ if(ORG_MODULE_SERVICES_BUILD_TESTS)
     add_executable(ORGIndirectRunsTests tests/Passes/IndirectRunsTests.cpp)
     target_link_libraries(ORGIndirectRunsTests PRIVATE ORGModuleServices::ORGModuleServices)
     add_test(NAME ORGIndirectRunsTests COMMAND ORGIndirectRunsTests)
+    # The ImGui backend's device-free parts, when it is built with an ImGui target to link.
+    if(TARGET ORGModuleServices::ImGui AND TARGET ${ORG_MODULE_SERVICES_IMGUI_TARGET})
+        add_executable(ORGImGuiBackendTests tests/ImGui/ImGuiBackendTests.cpp)
+        target_link_libraries(ORGImGuiBackendTests PRIVATE ORGModuleServices::ImGui)
+        target_compile_options(ORGImGuiBackendTests PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/UNDEBUG,-UNDEBUG>)
+        add_test(NAME ORGImGuiBackendTests COMMAND ORGImGuiBackendTests)
+    endif()
     # Named texture versions and composed sets, against OpenRenderGraph on WARP (D3D12).
     if(WIN32)
         add_executable(ORGNamedVersionsTests tests/Versions/NamedVersionsTests.cpp)
