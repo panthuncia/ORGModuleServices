@@ -26,6 +26,7 @@ add_library(ORGModuleServices STATIC
     src/Passes/GenerateMipsPass.cpp
     src/Passes/ResolveMultisamplePass.cpp
     src/PipelineRegistry.cpp
+    src/ShaderReflection.cpp
     src/VersionedBufferBuild.cpp
     src/VersionedBufferGrowth.cpp
     src/VersionedTextureGrowth.cpp)
@@ -50,6 +51,11 @@ if(ORG_MODULE_SERVICES_ENABLE_DXC)
         target_sources(ORGModuleServices PRIVATE src/ShaderCompiler.cpp)
         target_include_directories(ORGModuleServices PRIVATE "${ORG_MODULE_SERVICES_DXC_INCLUDE_DIR}")
         target_compile_definitions(ORGModuleServices PUBLIC ORG_MODULE_SERVICES_HAS_DXC=1)
+        # DXIL reflection (ShaderReflection.h) goes through DXC's ID3D12ShaderReflection, a Windows SDK interface.
+        if(WIN32)
+            target_sources(ORGModuleServices PRIVATE src/DxilReflection.cpp)
+            target_compile_definitions(ORGModuleServices PRIVATE ORG_MODULE_SERVICES_DXIL_REFLECTION=1)
+        endif()
         if(ORG_MODULE_SERVICES_ENABLE_VULKAN)
             target_compile_definitions(ORGModuleServices PUBLIC ORG_MODULE_SERVICES_HAS_SPIRV=1)
         endif()
@@ -65,6 +71,7 @@ if(ORG_MODULE_SERVICES_BUILD_TESTS)
     add_subdirectory(tests/Growth)
     add_subdirectory(tests/Buffers)
     add_subdirectory(tests/ShaderStore)
+    add_subdirectory(tests/Reflection)
     add_subdirectory(tests/Variables)
     add_executable(ORGModuleServicesTests tests/ServicesTests.cpp)
     target_link_libraries(ORGModuleServicesTests PRIVATE ORGModuleServices::ORGModuleServices)

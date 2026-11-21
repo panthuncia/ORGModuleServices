@@ -8,6 +8,7 @@ Provided services:
 - A versioned-buffer pool: GPU backings leased per version, filled by copying what they lack of the predecessor plus the delta, and reused once their frames retired on a host retirement clock.
 - Content-addressed DXC compilation with memory/disk artifacts and deduplicated in-flight requests.
 - DXIL targets by default and optional SPIR-V targets through `ORG_MODULE_SERVICES_ENABLE_VULKAN`.
+- Stage reflection (`ShaderReflection.h`): inputs, used bindings, constant buffer members and outputs of DXC's SPIR-V (read word by word) and DXIL (through the loaded dxcompiler.dll, on Windows), with DXIL registers shifted onto the host's SPIR-V binding numbers. Tests: `tests/Reflection`.
 - One-shot asynchronous pipeline builds (`BuildPipeline`) and live pipeline slots for hot reload, with pinned versions and retirement (`PipelineRegistry`).
 - Header-only async primitives: serialized task pumps, leased immutable array slots, and a bounded single-producer/single-consumer publication exchange.
 - Shared graph contracts: classified scheduler dispatch/cancellation, immutable artifact payloads and leases, readiness milestones, backend-opaque GPU submission prerequisites, and host-defined artifact policy.
