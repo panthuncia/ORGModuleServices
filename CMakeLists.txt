@@ -147,6 +147,18 @@ if(ORG_MODULE_SERVICES_BUILD_TESTS)
             target_compile_options(ORGTextureVersionsTests PRIVATE /utf-8)
         endif()
         add_test(NAME ORGTextureVersionsTests COMMAND ORGTextureVersionsTests)
+        # A 4x texture cleared through its RTV, resolved by ResolveMultisamplePass through its SRV and read back, on WARP
+        # (D3D12). --vulkan and --hardware pick another device. Exit code 77: skipped (no DXC, or no shader model 6.6).
+        add_executable(ORGResolveMultisampleTests tests/Passes/ResolveMultisampleTests.cpp)
+        target_link_libraries(ORGResolveMultisampleTests PRIVATE ORGModuleServices::ORGModuleServices d3d12 dxgi)
+        target_include_directories(ORGResolveMultisampleTests PRIVATE "${OpenRenderGraph_SOURCE_DIR}/tests")
+        target_compile_definitions(ORGResolveMultisampleTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
+            ORG_SERVICES_TEST_SHADER_DIR="${CMAKE_CURRENT_SOURCE_DIR}/shaders")
+        if(MSVC)
+            target_compile_options(ORGResolveMultisampleTests PRIVATE /utf-8)
+        endif()
+        add_test(NAME ORGResolveMultisampleTests COMMAND ORGResolveMultisampleTests)
+        set_tests_properties(ORGResolveMultisampleTests PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
         # Texel encodings for value births, against a DirectXMath reference. CPU only.
         add_executable(ORGTexelEncodingTests tests/Versions/TexelEncodingTests.cpp)
         target_link_libraries(ORGTexelEncodingTests PRIVATE ORGModuleServices::ORGModuleServices d3d12 dxgi)
