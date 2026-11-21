@@ -12,12 +12,15 @@ option(ORG_MODULE_SERVICES_ENABLE_ASYNC_STATE_GRAPH "Build the shared CPU depend
 # Backend-independent coordination and immutable slot ownership. Kept separate
 # from shader/RHI services so CPU-only consumers and tests need no device.
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/AsyncRuntime.cmake)
+# The thread-pool scheduler and its lanes, which the OpenRenderGraph task service runs on.
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/AsyncExecutor.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/ShaderStore.cmake)
 if(ORG_MODULE_SERVICES_ENABLE_ASYNC_STATE_GRAPH)
     include(${CMAKE_CURRENT_LIST_DIR}/cmake/AsyncStateGraph.cmake)
 endif()
 
 add_library(ORGModuleServices STATIC
+    src/Async/ExecutorTaskService.cpp
     src/BackingPool.cpp
     src/BackingPoolBinding.cpp
     src/ComposedVersions.cpp
@@ -39,7 +42,8 @@ target_compile_features(ORGModuleServices PUBLIC cxx_std_20)
 target_include_directories(ORGModuleServices PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
-target_link_libraries(ORGModuleServices PUBLIC BasicRHI::BasicRHI OpenRenderGraph::OpenRenderGraph ORGModuleServices::ShaderStore)
+target_link_libraries(ORGModuleServices PUBLIC BasicRHI::BasicRHI OpenRenderGraph::OpenRenderGraph ORGModuleServices::ShaderStore
+    ORGModuleServices::AsyncExecutor)
 target_compile_definitions(ORGModuleServices PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 
 if(ORG_MODULE_SERVICES_ENABLE_DXC)
