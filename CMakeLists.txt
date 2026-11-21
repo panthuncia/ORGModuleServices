@@ -27,6 +27,8 @@ add_library(ORGModuleServices STATIC
     src/GraphJob.cpp
     src/GrowableBufferSet.cpp
     src/Passes/GenerateMipsPass.cpp
+    src/Passes/HzbPass.cpp
+    src/Passes/PrefixSumPass.cpp
     src/Passes/ResolveMultisamplePass.cpp
     src/Passes/UavClearPass.cpp
     src/PipelineRegistry.cpp
