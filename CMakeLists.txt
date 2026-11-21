@@ -111,6 +111,10 @@ if(ORG_MODULE_SERVICES_BUILD_TESTS)
     add_executable(ORGViolationPolicyTests tests/Policy/ViolationPolicyTests.cpp)
     target_link_libraries(ORGViolationPolicyTests PRIVATE ORGModuleServices::ORGModuleServices)
     add_test(NAME ORGViolationPolicyTests COMMAND ORGViolationPolicyTests)
+    # Indirect run coalescing, run recording and slab ordering, against a fake command list. CPU only.
+    add_executable(ORGIndirectRunsTests tests/Passes/IndirectRunsTests.cpp)
+    target_link_libraries(ORGIndirectRunsTests PRIVATE ORGModuleServices::ORGModuleServices)
+    add_test(NAME ORGIndirectRunsTests COMMAND ORGIndirectRunsTests)
     # Named texture versions and composed sets, against OpenRenderGraph on WARP (D3D12).
     if(WIN32)
         add_executable(ORGNamedVersionsTests tests/Versions/NamedVersionsTests.cpp)

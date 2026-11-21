@@ -226,6 +226,15 @@ DCLF's payload and FrameValues and for growable-set growth; BasicRenderer uses i
   runs `BuildVersionedBuffer` as graph work (modelled on `RegisterVersionGrowthProducer`): ready with its uploads, suspended
   (`Capacity`) until the pool's availability wakes the graph. Hooks: `decorate` (seeds `hostState` before the version is frozen)
   and `wrap` (the artifact payload; BasicRenderer: a `RendererStateFragmentArtifact`).
+- **`Async/VersionedBufferPosts.h`**: `PostVersionedBuffer` posts one version of that producer (lock-free, without a `wrap` hook) at
+  an address of its own, and runs the poster's `done` on its lane at GPU readiness with the version or why there is none.
+- **`Async/WindowGates.h`**: a resource's window made as graph work, a newer revision replacing an unstarted one, and gates that run a
+  request once a window reaches a revision and is GPU ready (`ReadyGateAtLeast`), each released after it ran.
+- **`Passes/IndirectRuns.h`**: CPU-recorded indirect draws coalesced into runs of one pipeline (`IndirectRunCounts`,
+  `IndirectRunWriter` on the host's bucket binder, `RecordIndirectRuns`), and `OrderBySlabs` for depth-only draw order. The host
+  keeps its draw record's layout. `ORGIndirectRunsTests` needs no device.
+- **`shaders/OrgResources.hlsli`**: one resource list per shader, expanded to register-bound declarations (FXC) or push-block
+  handles read from the descriptor heap (`ORG_BINDLESS`). Its C++ side is OpenRenderGraph's `Render/ShaderBindings.h`.
 
 The buffer tests are in `tests/Buffers`. `ORGBufferPoolTests` needs only these headers (the clock and pool, and the public
 headers' self-containment). `ORGRetirementTests` (the join, the recording pools and the pool defaults) also needs
