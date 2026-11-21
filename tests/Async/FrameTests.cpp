@@ -51,7 +51,7 @@ void TestStarvationWatch() {
         std::uint64_t misses = 0;
     };
     std::vector<Report> reports;
-    org::async::StarvationWatch watch{"the work", 3, [&](std::string_view what, std::string_view why, std::uint64_t misses) {
+    org::async::StarvationWatch watch{"the work", 3, [&](std::string_view what, std::string_view why, std::uint64_t misses, std::uint64_t) {
                                           reports.push_back({std::string(what), std::string(why), misses});
                                       }};
     assert(watch.What() == "the work" && watch.StarvedAfter() == 3);

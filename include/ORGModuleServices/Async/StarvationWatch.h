@@ -18,9 +18,9 @@ namespace org::async {
 class StarvationWatch {
 public:
     // what names the watched work, why says what happened at the reporting
-    // miss, and misses counts the misses since the last input, that one
-    // included.
-    using OnStarved = std::function<void(std::string_view what, std::string_view why, std::uint64_t misses)>;
+    // miss, misses counts the misses since the last input, that one included,
+    // and tag is the value the reporting miss passed.
+    using OnStarved = std::function<void(std::string_view what, std::string_view why, std::uint64_t misses, std::uint64_t tag)>;
 
     StarvationWatch(std::string what, std::uint64_t starvedAfter, OnStarved onStarved)
         : m_what(std::move(what)), m_starvedAfter(starvedAfter), m_onStarved(std::move(onStarved)) {}
@@ -29,11 +29,12 @@ public:
     void NoteInput() noexcept { m_misses = 0; }
 
     // One miss: the work was dropped, or came for other inputs, and is asked
-    // for again. Returns true when this miss reported starvation.
-    bool NoteMiss(std::string_view why) {
+    // for again. tag is passed through to the callback, for the owner's own
+    // use. Returns true when this miss reported starvation.
+    bool NoteMiss(std::string_view why, std::uint64_t tag = 0) {
         if (++m_misses <= m_starvedAfter) return false;
         const auto misses = std::exchange(m_misses, 0);
-        if (m_onStarved) m_onStarved(m_what, why, misses);
+        if (m_onStarved) m_onStarved(m_what, why, misses, tag);
         return true;
     }
 
