@@ -28,8 +28,9 @@ class LivePipelineSlot;
 // at b0. The default vertex stage is a fullscreen triangle with TEXCOORD0 from (0,0) top left to (1,1) bottom right. The
 // viewport is the pass's render area. Hot reload adds a new version to the same slot, which graphs built after it bind.
 struct RasterProgram {
-    // The fullscreen-triangle vertex shader, relative to the shader root. The host ships it.
-    static constexpr const char* kFullscreenVertexShader = "RenderGraph/FullscreenVS.hlsl";
+    // The fullscreen-triangle vertex shader (shaders/FullscreenVS.hlsl), relative to the shader root. It ships with the
+    // module's other shaders, under ORGModuleServices/.
+    static constexpr const char* kFullscreenVertexShader = "ORGModuleServices/FullscreenVS.hlsl";
 
     rhi::PipelineLayoutPtr layout;
     // Bind Pipeline(recording) at record time. Never keep a handle across recordings.

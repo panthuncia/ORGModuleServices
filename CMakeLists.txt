@@ -55,7 +55,7 @@ add_library(ORGModuleServices STATIC
     src/VersionedTextureGrowth.cpp
     src/ViolationPolicy.cpp)
 add_library(ORGModuleServices::ORGModuleServices ALIAS ORGModuleServices)
-# The passes' shaders (Passes/GenerateMipsPass.h, Passes/ResolveMultisamplePass.h, ImGui/ImGuiBackend.h). A host compiles them with its own
+# The module's shaders (the passes', ImGui/ImGuiBackend.h's, RasterProgram's default vertex stage). A host compiles them with its own
 # programs and ships this folder's files under "ORGModuleServices/" in its shader folder.
 set(ORG_MODULE_SERVICES_SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders" CACHE INTERNAL "ORGModuleServices pass shaders")
 target_compile_features(ORGModuleServices PUBLIC cxx_std_20)
