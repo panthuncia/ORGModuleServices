@@ -613,6 +613,20 @@ void TestJobLane()
     assert(ran.load() == 1 && !lane.Post(11) && !lane.Underlying().Wake());
 }
 
+// A pool whose jobs wait for work in their own domain leaves that work a thread.
+void TestWaitingPoolPlan()
+{
+    Executor four(4), one(1), five(5);
+    const auto halved = org::async::PlanWaitingPool(four, Executor::Preparation, Executor::Preparation.domain, Executor::Streaming);
+    assert(halved.lanes == 2 && halved.shared && halved.taskClass.domain == Executor::Preparation.domain);
+    const auto odd = org::async::PlanWaitingPool(five, Executor::Preparation, Executor::Preparation.domain, Executor::Streaming);
+    assert(odd.lanes == 2 && odd.shared);
+    const auto alone = org::async::PlanWaitingPool(one, Executor::Preparation, Executor::Preparation.domain, Executor::Streaming);
+    assert(alone.lanes == 1 && !alone.shared && alone.taskClass.domain == Executor::Streaming.domain);
+    const auto apart = org::async::PlanWaitingPool(four, Executor::Streaming, Executor::Preparation.domain, Executor::Streaming);
+    assert(apart.lanes == Executor::kDefaultStreamingWorkers && !apart.shared && apart.taskClass.domain == Executor::Streaming.domain);
+}
+
 int main()
 {
     TestLanesAndQueues();
@@ -628,4 +642,5 @@ int main()
     TestInvalidLayouts();
     TestLanes();
     TestJobLane();
+    TestWaitingPoolPlan();
 }

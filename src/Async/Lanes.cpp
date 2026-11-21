@@ -1,6 +1,8 @@
 // Lanes: serial passes and job queues on an Executor.
 #include <ORGModuleServices/Async/Lanes.h>
 
+#include <algorithm>
+
 namespace org::async {
 
 Lane::Lane(Executor& a_executor, LaneDesc a_desc, std::function<void()> a_drain) :
@@ -34,6 +36,15 @@ SerializedTaskPump& MakeLane(Executor& a_executor, LaneDesc a_desc, std::functio
     // Never destroyed: a completion may still wake it while the process tears down.
     auto* lane = new Lane(a_executor, std::move(a_desc), std::move(a_drain));
     return lane->Pump();
+}
+
+WaitingPoolPlan PlanWaitingPool(const Executor& executor, TaskClass runOn, std::uint32_t waitsOnDomain, TaskClass fallback) {
+    const unsigned workers = executor.Workers(runOn.domain);
+    if (runOn.domain != waitsOnDomain)
+        return {runOn, (std::max)(workers, 1u), false};
+    if (workers >= 2)
+        return {runOn, workers / 2, true};
+    return {fallback, 1u, false};
 }
 
 } // namespace org::async

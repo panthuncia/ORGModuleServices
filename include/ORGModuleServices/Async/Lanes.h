@@ -4,6 +4,7 @@
 #include <ORGModuleServices/Async/SerializedTaskPump.h>
 
 #include <atomic>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <mutex>
@@ -21,6 +22,20 @@ struct LaneDesc {
     // Runs when the lane stops by itself: its task was refused, or its drain threw. Empty: the lane stops silently.
     std::function<void()> refused;
 };
+
+// Where a pool of lanes runs when its jobs wait for other work on the same executor, such as builds that wait for their
+// compiles. The dependency is stated, so the pool never takes every thread the work it waits for needs.
+struct WaitingPoolPlan {
+    TaskClass taskClass = Executor::Preparation;
+    unsigned lanes = 1;
+    // The jobs run in the domain of the work they wait for.
+    bool shared = false;
+};
+
+// The jobs run on runOn and wait for work in waitsOnDomain. When that is runOn's domain and it has two or more workers, the
+// pool takes at most half of them, so the work waited for always has a thread. With one worker there, a single lane runs on
+// fallback, which must be another domain. When the domains differ, the pool takes every worker of runOn's domain.
+WaitingPoolPlan PlanWaitingPool(const Executor& executor, TaskClass runOn, std::uint32_t waitsOnDomain, TaskClass fallback);
 
 // A lane: a_drain runs one pass at a time on an executor. Wakes coalesce, and a wake during a pass runs one more.
 // It has its own scope, so Stop drops its queued pass and waits for a running one.

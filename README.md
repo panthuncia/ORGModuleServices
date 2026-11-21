@@ -10,6 +10,10 @@ Provided services:
 - DXIL targets by default and optional SPIR-V targets through `ORG_MODULE_SERVICES_ENABLE_VULKAN`.
 - One-shot asynchronous pipeline builds (`BuildPipeline`) and live pipeline slots for hot reload, with pinned versions and retirement (`PipelineRegistry`). Graph builds that pin a generation, carried in a recording tag (`PipelinePins`, `VersionFor`).
 - Stage reflection (`ShaderReflection.h`): inputs, used bindings, constant buffer members and outputs of DXC's SPIR-V (read word by word) and DXIL (through the loaded dxcompiler.dll, on Windows), with DXIL registers shifted onto the host's SPIR-V binding numbers. Tests: `tests/Reflection`.
+- Runtime-compiled programs (`Programs/`): `ComputeProgram` (a `ComputeKernel`) and `RasterProgram`, built from HLSL by
+  the shader compiler into live pipeline slots, and `ProgramService`, which builds them several at once on an executor
+  and gates on them without waiting. The host gives the shader root, the backend, its defines and the pipeline version
+  a recording binds through `ProgramEnvironment` (`Programs/ProgramBuild.h`).
 - Header-only async primitives: serialized task pumps, leased immutable array slots, and a bounded single-producer/single-consumer publication exchange.
 - Header-only containers in `Async/`: a latest-wins mailbox for any number of producers (`LatestSlot`), a lossless single-producer log with several consumer cursors (`PublicationLog`), generational slot tables freed after their last reference (`SlotTable`), and kept arrays: copy-on-write chunked arrays with change journals, so each mirroring buffer is sent only what it lacks (`KeptState.h`).
 - Ownership-based deferred reclamation (`RetirementChain.h`): batches return once every publication that may name them is gone, and `Retired<T>` hands the last drop of a publication to another thread. It queues through OpenRenderGraph's `EventQueue`.
@@ -35,7 +39,8 @@ The thread-pool scheduler is `ORGModuleServices::AsyncExecutor` (`cmake/AsyncExe
   threads of their own. The domains, worker counts, thread start hook and priority callbacks come from `Executor::Desc`;
   the default layout has a coordinator thread, a parallel pool, a serial thread and a small blocking pool.
 - `Async/Lanes.h`: `Lane` (one serial pass at a time, wakes coalesce), `JobLane<Job>` (posted jobs in order) and
-  `MakeLane` (a lane for the process's life), on an executor.
+  `MakeLane` (a lane for the process's life), on an executor. `PlanWaitingPool` sizes a pool whose jobs wait for other
+  work in the same domain, so that work always has a thread.
 - `Async/ExecutorTaskService.h` (in `ORGModuleServices`, which links OpenRenderGraph): OpenRenderGraph's `ITaskService`
   over an executor. A task that throws is reported through the host's `onTaskError` callback.
 The CPU sphere cull (`Cpu/SphereCull.h`) is the separate `ORGModuleServices::SphereCull`
