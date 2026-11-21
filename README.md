@@ -38,6 +38,10 @@ The thread-pool scheduler is `ORGModuleServices::AsyncExecutor` (`cmake/AsyncExe
   `MakeLane` (a lane for the process's life), on an executor.
 - `Async/ExecutorTaskService.h` (in `ORGModuleServices`, which links OpenRenderGraph): OpenRenderGraph's `ITaskService`
   over an executor. A task that throws is reported through the host's `onTaskError` callback.
+The CPU sphere cull (`Cpu/SphereCull.h`) is the separate `ORGModuleServices::SphereCull`
+target, from `cmake/SphereCull.cmake`. It tests sphere columns against a plane set with
+SSE2, AVX2 or AVX-512 kernels, picked at run time from CPUID, and every kernel gives the
+same verdicts. Its tests are in `tests/Cpu`.
 
 Standalone tests:
 
