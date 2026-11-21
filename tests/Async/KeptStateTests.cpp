@@ -135,6 +135,7 @@ void TestReferenceDrivenSlotRetirement() {
     assert(slots.DrainUnreferenced(release) == 0);  // Recovery recount is one atomic batch.
     slots.ResetReferences();
     assert(slots.DrainUnreferenced(release) == 1);
+    recycle();  // the freed slot is free again, so the next allocation takes it
 
     // A stale allocation event must not free a referenced reused slot.
     const auto abandoned = slots.Allocate().slot;
