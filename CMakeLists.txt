@@ -24,6 +24,7 @@ add_library(ORGModuleServices STATIC
     src/BackingPool.cpp
     src/BackingPoolBinding.cpp
     src/ComposedVersions.cpp
+    src/ContentOwners.cpp
     src/GraphJob.cpp
     src/GraphHostBackings.cpp
     src/GraphHostRetirement.cpp
@@ -88,6 +89,7 @@ if(ORG_MODULE_SERVICES_BUILD_TESTS)
     add_subdirectory(tests/ShaderStore)
     add_subdirectory(tests/Reflection)
     add_subdirectory(tests/Variables)
+    add_subdirectory(tests/Uploads)
     add_executable(ORGModuleServicesTests tests/ServicesTests.cpp)
     target_link_libraries(ORGModuleServicesTests PRIVATE ORGModuleServices::ORGModuleServices)
     add_test(NAME ORGModuleServicesTests COMMAND ORGModuleServicesTests)
