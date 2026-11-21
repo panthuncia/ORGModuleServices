@@ -28,7 +28,7 @@ namespace org::services {
  * @brief How a variable may be used.
  *
  * A variable with `sizes = false` holds constants only. It may not be a dependency of a texture description, nor of a
- * derived variable that sizes (RequireSizes checks the first at DeclareTexture).
+ * derived variable that sizes (RequireSizes checks the first where a host declares a texture).
  * RenderSize and the dynamic resolution ratios are such variables.
  */
 struct VariableTraits {
@@ -439,7 +439,7 @@ private:
 
 /**
  * @brief Throws std::invalid_argument when a dependency of `what` (a texture description) has `sizes = false`, or is not
- * declared in `snapshot`. Used at DeclareTexture.
+ * declared in `snapshot`. A host calls it where it declares a texture.
  */
 inline void RequireSizes(const VariableSnapshot& snapshot, std::span<const VariableIndex> deps, std::string_view what) {
     for (const VariableIndex dep : deps) {

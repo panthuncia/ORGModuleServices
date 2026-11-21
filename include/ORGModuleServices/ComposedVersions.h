@@ -13,7 +13,7 @@ namespace org::services {
 /**
  * @brief The versions of up to four sets as one (IResourceVersions): the first part that names a resource answers. Immutable.
  *
- * A frame revision names DCLF's buffer set and the frame's texture set this way without merging them. So a new texture set
+ * A frame revision can name a buffer set and a texture set this way without merging them. So a new texture set
  * never makes a new buffer set, and the reverse.
  */
 class ComposedVersions final : public IResourceVersions {

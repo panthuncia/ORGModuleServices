@@ -71,7 +71,6 @@ public:
         }
         return alive.size();
     }
-    std::size_t FreeCount() const { return freeList.size(); }
     std::size_t Retiring() const { return retiring.size(); }
     bool Alive(std::size_t a_slot) const { return a_slot < alive.size() && alive[a_slot]; }
     std::uint32_t Generation(std::size_t a_slot) const { return a_slot < generation.size() ? generation[a_slot] : 0; }

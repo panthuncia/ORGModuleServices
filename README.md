@@ -17,7 +17,10 @@ Provided services:
 - Staged graph builds off the owner thread (`StagedBuilds`): rebuild requests are built on an executor lane, attached or staged at frame boundaries, and staged sets attach as one. Extensions defer work to a build's staging, attach or failure (`BuildContext.h`). Immutable build inputs with a serial, and which one is built and which attached (`BuildInputs.h`).
 - Header-only async primitives: serialized task pumps, leased immutable array slots, and a bounded single-producer/single-consumer publication exchange.
 - Header-only containers in `Async/`: a latest-wins mailbox for any number of producers (`LatestSlot`), a lossless single-producer log with several consumer cursors (`PublicationLog`), generational slot tables freed after their last reference (`SlotTable`), and kept arrays: copy-on-write chunked arrays with change journals, so each mirroring buffer is sent only what it lacks (`KeptState.h`).
+- A host frame clock with the host's slot count (`Async/FrameClock.h`), a starvation rule for work asked for with no new input (`Async/StarvationWatch.h`), and a violation policy that makes rule violations fatal or counted (`ViolationPolicy.h`).
 - Ownership-based deferred reclamation (`RetirementChain.h`): batches return once every publication that may name them is gone, and `Retired<T>` hands the last drop of a publication to another thread. It queues through OpenRenderGraph's `EventQueue`.
+- GPU passes in `Passes/` with their shaders in `shaders/`: prefix sum, sort scatter, a min or max HZB (FidelityFX SPD), UAV clears, mip generation and multisample resolve. `shaders/FullscreenVS.hlsl` is the fullscreen-triangle vertex shader (`RasterProgram::kFullscreenVertexShader`).
+- Texel encoding for textures born with a value (`TexelEncoding.h`), and buffer chains that build a host's per-publication buffers as `VersionedBufferBuild` versions (`BufferChains.h`).
 - Shared graph contracts: classified scheduler dispatch/cancellation, immutable artifact payloads and leases, readiness milestones, backend-opaque GPU submission prerequisites, and host-defined artifact policy.
 - Host-kind-parameterized artifact identities, exact dependency recipes, snapshots and typed handles; validated host-provided scheduler queue layouts.
 - Shared build/request/suspension and move-only continuation-registration contracts, host-defined scheduling defaults, and kind-count-parameterized graph statistics.
@@ -130,8 +133,8 @@ state-graph work -> the next sealed set. A recording made against a sealed set b
   serves one set (its batches run in turn: the single acquirer). Fills are `VersionFill`s (`VersionFill.h`: segments gathered at an
   offset; `ZeroFill(bytes)` zeros the whole backing from one static page, so a reused backing keeps none of its older bytes).
 - **Binding.** The frame's owner adopts the selected set (`AdoptAll`) and, after the frame's last submission, binds it
-  (`NamedVersions::Bind(safeAt)`) with the clock point that retires once that submission completes on the GPU (CS:
-  `DCLF::SubmittedRetirementPoint()`), while it still holds the set. Binding at the frame's start would let a backing return while
+  (`NamedVersions::Bind(safeAt)`) with the clock point that retires once that submission completes on the GPU, while
+  it still holds the set. Binding at the frame's start would let a backing return while
   that frame's GPU work still reads it. The growth's own fills need no bind: a version is named only once its copies completed.
 - **Policies.** `GrowthPolicy.h`: `Doubling(min)` and `Headroom(pct, min)`; `Next` never clamps and throws past 64 bits or the
   capacity's type.
@@ -171,13 +174,13 @@ The CPU tests (owned rows, content owners) are in `tests/Uploads`.
 
 Pooled GPU backings reused once retired (BasicRenderer's `VersionedGpuBufferBackingPool`, generalised; namespace `org::services`):
 a version is made into a backing leased from a pool and filled from what that backing already holds (a predecessor copy and the
-delta); the backing is reused only after the frames that used it retired and its last lease went. Nothing waits on the GPU. CS uses it for
-DCLF's payload and FrameValues and for growable-set growth; BasicRenderer uses it through its adapter
+delta); the backing is reused only after the frames that used it retired and its last lease went. Nothing waits on the GPU. Hosts use it for
+per-frame payloads, and growable-set growth uses it too; BasicRenderer uses it through its adapter
 (`BasicRenderer/Streaming/VersionedGpuBuffer.h`).
 
 - **`RetirementClock`** (`BackingPool.h`; shared_ptr, lock-free, any thread): a host's monotonic completed point (a host frame, a
   renderer frame count). `Advance(completed)` publishes it atomically and runs the waiters it reached (a Treiber stack);
-  `Completed()`, `Reached(point)`; `Subscribe(point, wake)` is a one-shot wake. One clock per host (CS: DCLF's, advanced from the
+  `Completed()`, `Reached(point)`; `Subscribe(point, wake)` is a one-shot wake. One clock per host (advanced, for example, from the
   graph host's completed-frame callback; BasicRenderer: one per renderer). It replaces BasicRenderer's process-global
   `NotifyVersionedGpuBufferFrameRetirement`.
 - **`Backing`**: fixed `buffer`, `generation`, `capacityClass`, `byteCapacity`, `address`, `srvIndex`, `stride`, flags and
@@ -186,12 +189,12 @@ DCLF's payload and FrameValues and for growable-set growth; BasicRenderer uses i
 - **`BackingRequest`**: `capacityClass` (elements of `stride`, or bytes when `stride` is 0; the caller's size class), `stride`,
   `BackingFlags` (`unorderedAccess`, `indirectArguments`, `deviceAddress`), a host `compatibility` key, `name`, and an optional
   `like` (a buffer whose kind the allocation copies). Backings are reused only for an equal class, stride, flags and compatibility.
-- **`BackingPoolHooks`**: `allocate` (required; BasicRenderer: `CreateIndexedStructuredBuffer`, CS: an `org::Buffer` and its SRV;
+- **`BackingPoolHooks`**: `allocate` (required; BasicRenderer: `CreateIndexedStructuredBuffer`, `GraphHostBackingHooks`: an `org::Buffer` and its SRV;
   throws when it cannot: no fallback), `tag` (memory attribution), `telemetry(BackingPoolEvent, name, value)` (any thread),
   `exclusive(body)` (runs the acquirer-side bodies inside the host's
-  serialization: BasicRenderer's moved pool mutex; empty in CS) and `retire` (takes a released backing's buffer so the host picks
-  the destroying thread; CS: not the render thread).
-- **`BackingPool::Create(hooks, clock, Config)`**: `Config{name, maxPerClass (0: no cap; CS), framesInFlight (the host's, for
+  serialization: BasicRenderer's pool mutex; empty for a single acquirer) and `retire` (takes a released backing's buffer so the
+  host picks the destroying thread, such as one that is not the render thread).
+- **`BackingPool::Create(hooks, clock, Config)`**: `Config{name, maxPerClass (0: no cap), framesInFlight (the host's, for
   callers' safety windows), spareFree (free backings of the asked class kept warm)}`.
   - **Single acquirer.** `Acquire`, `Trim`, `OldestContentEpoch` and `Visit` run on one thread at a time (a documented contract,
     asserted in debug builds); there is no mutex inside. A host with several acquirers serializes them through `exclusive`.
@@ -227,7 +230,7 @@ DCLF's payload and FrameValues and for growable-set growth; BasicRenderer uses i
   predecessor's class for a Patch, a grown class for a Replace, preferring the backing nearest the predecessor's sequence),
   GPU-copies what that backing lacks of the predecessor, uploads the delta as `PooledBackingLease` writes, sets `contentEpoch`,
   and returns Ready with a readiness token, or Suspended on an exhausted pool; it never throws. `TokenForTickets` is the one
-  readiness token over upload tickets. The host keeps the change journal (CS: DCLF's `ChangeJournal`).
+  readiness token over upload tickets. The host keeps the change journal.
 - **`Async/VersionedBufferProducer.h`**: `RegisterVersionedBufferProducer<Binding>(graph, kinds, lane, domain, taskName, hooks)`
   runs `BuildVersionedBuffer` as graph work (modelled on `RegisterVersionGrowthProducer`): ready with its uploads, suspended
   (`Capacity`) until the pool's availability wakes the graph. Hooks: `decorate` (seeds `hostState` before the version is frozen)
@@ -245,7 +248,7 @@ DCLF's payload and FrameValues and for growable-set growth; BasicRenderer uses i
 The buffer tests are in `tests/Buffers`. `ORGBufferPoolTests` needs only these headers (the clock and pool, and the public
 headers' self-containment). `ORGRetirementTests` (the join, the recording pools and the pool defaults) also needs
 OpenRenderGraph's header-only `EventQueue.h` (`ORG_RETIREMENT_TEST_ORG_INCLUDE`). `ORGBufferBuildTests` (`BuildVersionedBuffer` through a recording upload service) also needs
-OpenRenderGraph's third-party headers (e.g. CommunityShaders' vcpkg tree) and the Vulkan SDK; it is skipped without them.
+OpenRenderGraph's third-party headers (e.g. a host's vcpkg tree) and the Vulkan SDK; it is skipped without them.
 
 ```sh
 cmake -S tests/Buffers -B build/buffers-tests

@@ -1031,12 +1031,6 @@ struct MarkedList {
         return true;
     }
     bool Contains(std::uint32_t a_index) const { return a_index < mark.size() && mark[a_index]; }
-    /** @brief Unlists the element at list position a_at. The last one takes its place. */
-    void RemoveAt(std::size_t a_at) {
-        mark[list[a_at]] = 0;
-        list[a_at] = list.back();
-        list.pop_back();
-    }
     void Clear() {
         for (const auto index : list)
             mark[index] = 0;

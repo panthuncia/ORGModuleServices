@@ -39,9 +39,6 @@ struct Window {
     bool Empty() const { return !builds && !synchronous && !attached && !superseded && !rejected && !failed && !stale; }
 };
 
-constexpr std::uint32_t kMaxSupersededInARow = 3;  // then the build is attached anyway, and built again after
-constexpr std::uint32_t kMaxRejectedInARow = 3;     // then the epoch counts as failed until it is asked for again
-constexpr std::uint64_t kStatsFrames = 3000;
 } // namespace
 
 struct StagedBuilds::Impl {
@@ -286,7 +283,7 @@ struct StagedBuilds::Impl {
         window.buildMaxMs = (std::max)(window.buildMaxMs, buildMs);
         // Requested again since it was handed out, so drop it and rebuild.
         // After too many in a row it goes in anyway, since it is newer than the running graph.
-        if (host.RebuildRequests(epoch) != done.job.requests && supersededInARow[epoch] < kMaxSupersededInARow) {
+        if (host.RebuildRequests(epoch) != done.job.requests && supersededInARow[epoch] < desc.maxSupersededInARow) {
             ++supersededInARow[epoch];
             ++window.superseded;
             return false;
@@ -330,9 +327,9 @@ struct StagedBuilds::Impl {
                 replaced ? "; another build replaced the graph meanwhile" : "; built again");
             if (replaced) {
                 rejectedInARow.erase(epoch);
-            } else if (++rejectedInARow[epoch] > kMaxRejectedInARow) {
+            } else if (++rejectedInARow[epoch] > desc.maxRejectedInARow) {
                 rejectedInARow.erase(epoch);
-                Fail(done, "rejected at the attach " + std::to_string(kMaxRejectedInARow + 1) + " times in a row: " + result.reason, false);
+                Fail(done, "rejected at the attach " + std::to_string(desc.maxRejectedInARow + 1) + " times in a row: " + result.reason, false);
             } else {
                 host.RequestRebuild(epoch, "its last build was rejected at the attach");
             }
@@ -449,7 +446,7 @@ struct StagedBuilds::Impl {
         Log(BuildLogLevel::Info,
             "[ORG] build manager, last {} frames: {} built off the render thread (mean {:.2f} ms, max {:.2f} ms), {} attached (mean {:.3f} ms, "
             "max {:.3f} ms on the render thread), {} superseded, {} rejected, {} failed, {} built on the render thread, {} stale alias rebuilds",
-            kStatsFrames, window.builds, window.builds ? window.buildMs / static_cast<double>(window.builds) : 0.0, window.buildMaxMs,
+            desc.statsFrames, window.builds, window.builds ? window.buildMs / static_cast<double>(window.builds) : 0.0, window.buildMaxMs,
             window.attached, window.attached ? window.attachMs / static_cast<double>(window.attached) : 0.0, window.attachMaxMs,
             window.superseded, window.rejected, window.failed, window.synchronous, window.stale);
         window = {};
@@ -595,7 +592,7 @@ void StagedBuilds::NoteFrameEnd() {
         m.Log(BuildLogLevel::Info, "[ORG] build manager: {}; from here a graph built on the render thread is logged as a warning",
             m.desc.steadyStateName);
     }
-    if (m.frames % kStatsFrames == 0)
+    if (m.desc.statsFrames && m.frames % m.desc.statsFrames == 0)
         m.LogWindow();
 }
 

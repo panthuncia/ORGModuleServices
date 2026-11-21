@@ -3,7 +3,6 @@
 
 #include <ORGModuleServices/Cpu/SphereCull.h>
 
-#include <cstring>
 #include <immintrin.h>
 
 namespace org::cpu {

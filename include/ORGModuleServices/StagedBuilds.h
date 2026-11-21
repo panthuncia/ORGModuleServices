@@ -80,6 +80,12 @@ public:
         std::string steadyStateName = "first steady frame";
         BuildObserver* observer = nullptr;  // optional; it outlives the builds
         std::function<void(BuildLogLevel, std::string_view)> log;  // optional
+        // A build superseded by a newer request this many times in a row is attached anyway, then built again.
+        std::uint32_t maxSupersededInARow = 3;
+        // A build rejected at the attach more than this many times in a row fails the epoch until it is asked for again.
+        std::uint32_t maxRejectedInARow = 3;
+        // Frames between the build statistics lines. 0: no statistics lines.
+        std::uint64_t statsFrames = 3000;
     };
 
     explicit StagedBuilds(Desc desc);

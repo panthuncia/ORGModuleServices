@@ -139,7 +139,7 @@ public:
      * pools' clock reaches `safeAt`, even once the last reference to its version is gone.
      *
      * The frame's contract: a frame that adopts or reads the set binds it after its last submission, with the point that retires
-     * once that submission is complete on the GPU (CS: DCLF::SubmittedRetirementPoint()), while it still holds the set. Binding at
+     * once that submission is complete on the GPU, while it still holds the set. Binding at
      * the frame's start would let a backing go back to the pool while that frame's GPU work still reads it. A set no frame bound
      * holds versions no GPU work read: their backings are reusable as soon as their last reference goes. The growth's own fills
      * need no bind: a version is named only once its copies completed.
