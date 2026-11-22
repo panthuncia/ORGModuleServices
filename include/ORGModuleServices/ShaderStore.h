@@ -25,6 +25,10 @@
 //  3. Otherwise compile, and save the result.
 //
 // The index only speeds up step 1. Losing it costs preprocessing, never a compile.
+//
+// Artifacts are zstd-compressed records appended to a few large pack files. The index says where each
+// one is, and a start reads only what was appended after the last save, so a killed process loses
+// nothing it finished writing. docs/development/shader-cache.md in Community Shaders has the layout.
 namespace org::services {
 
 struct ShaderStoreHash {
@@ -157,8 +161,18 @@ struct ShaderStoreStats {
 
 struct ShaderStoreIndexInfo {
     uint64_t variants{}, dependencySets{}, dependencyEntries{}, files{}, savedBytes{};
-    // What startup found and did. overCapBytes is what stayed over maxBytes because recent starts used it.
+    // What startup found and did. artifactBytesAtStart counts the stored (compressed) records, which is what
+    // maxBytes limits. overCapBytes is what stayed over maxBytes because recent starts used it.
     uint64_t artifactsAtStart{}, artifactBytesAtStart{}, artifactsEvicted{}, overCapBytes{};
+    // The pack files at startup: how many, their bytes on disk, and the artifacts found past the saved index,
+    // which a killed process appended.
+    uint64_t packsAtStart{}, packBytesAtStart{}, recoveredAtStart{};
+    // Compaction at startup: the packs rewritten, the live bytes copied out of them, and the bytes freed.
+    uint64_t packsCompacted{}, compactedBytes{}, reclaimedBytes{};
+    // Startup time: reading the index, opening the packs and reading their unsaved tails, and eviction with compaction.
+    uint64_t indexLoadMicroseconds{}, packScanMicroseconds{}, compactMicroseconds{};
+    // The artifacts now: how many, their stored bytes, and their bytes before compression.
+    uint64_t artifacts{}, storedBytes{}, rawBytes{};
 };
 
 struct ShaderStoreOptions {
@@ -173,6 +187,12 @@ struct ShaderStoreOptions {
     std::chrono::milliseconds saveInterval{ 5000 };
     // False reads and writes nothing on disk except source files. Requests always build.
     bool persistent{ true };
+    // Reads the cache but never writes, evicts or claims it, for tools that inspect a live game's cache.
+    bool readOnly{};
+    // A pack file is not appended past this size. A record larger than this gets a pack of its own.
+    uint64_t packBytes{ 64ull << 20 };
+    // The zstd level for new artifacts. Zero stores them uncompressed. Changing it needs no rebuild.
+    int compressionLevel{ 9 };
 };
 
 class ShaderStore {
@@ -199,17 +219,23 @@ public:
     ShaderStoreIndexInfo IndexInfo() const;
     // One line for the log: what happened, and why anything was not a plain hit.
     std::string Summary() const;
-    // False when another process owns this cache folder. Requests still work, but the index is not saved.
+    // False when another process owns this cache folder, or the store is read-only. Requests still work and
+    // read what the owner saved, but nothing is written: new compiles count as "not saved".
     bool OwnsIndex() const noexcept;
 
-    // How many artifacts are on disk and how many bytes they take. This walks the folder, so call it away from the frame.
+    // How many artifacts the store holds, and the bytes its pack files take on disk.
     struct ArtifactUsage { uint64_t count{}, bytes{}; };
     ArtifactUsage MeasureArtifacts() const;
+    // Reads one artifact by its compile key. False if it is missing, has another format or fails its check.
+    bool ReadArtifact(const ShaderStoreHash& compileKey, uint8_t format, std::vector<std::byte>& binary) const;
+    // Calls fn with each artifact the store holds, decompressed. Artifacts that fail their check are skipped.
+    void ForEachArtifact(const std::function<void(const ShaderStoreHash& compileKey, uint8_t format, std::span<const std::byte> binary)>& fn) const;
     // Removes one artifact, for one the host could not use (a device rejected it). The next request builds it again.
+    // Its bytes stay in the pack until compaction.
     void RemoveArtifact(const ShaderStoreHash& compileKey);
     // Removes every artifact and the index.
     void Clear();
-    // Removes only the index. The next start preprocesses but does not compile.
+    // Removes only the variant records. The next start preprocesses but does not compile.
     void ClearIndex();
 
 private:

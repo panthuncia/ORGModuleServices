@@ -3,6 +3,8 @@
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 
+#include <zstd.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -13,6 +15,8 @@
 #include <deque>
 #include <fstream>
 #include <functional>
+#include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -23,6 +27,10 @@
 
 #if defined(_WIN32)
 #include <Windows.h>
+#else
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 namespace org::services {
@@ -31,13 +39,17 @@ namespace {
 
 namespace fs = std::filesystem;
 
-constexpr uint32_t kIndexMagic = 0x58495353;     // "SSIX"
-constexpr uint32_t kArtifactMagic = 0x41435353;  // "SSCA"
-// Bump when the meaning of a key or of either file format changes.
-constexpr uint32_t kSchema = 1;
+constexpr uint32_t kIndexMagic = 0x58495353;   // "SSIX"
+constexpr uint32_t kPackMagic = 0x4B505353;    // "SSPK"
+constexpr uint32_t kRecordMagic = 0x52435353;  // "SSCR"
+// Bump when the meaning of a key or of any file format changes. 2: pack files of zstd records.
+constexpr uint32_t kSchema = 2;
 constexpr const char* kIndexSlots[2] = { "index.a", "index.b" };
+constexpr const char* kPackFolder = "packs";
 // A remembered failure keeps the start of its message. One broken header can fail thousands of variants.
 constexpr size_t kMaxRememberedDiagnostics = 4096;
+
+enum class Codec : uint8_t { Raw = 0, Zstd = 1 };
 
 struct HashOf {
     size_t operator()(const ShaderStoreHash& hash) const noexcept { return static_cast<size_t>(hash.low ^ (hash.high * 0x9E3779B97F4A7C15ull)); }
@@ -53,16 +65,27 @@ struct IndexHeader {
     uint64_t payloadSize{};
     ShaderStoreHash payloadHash;
 };
-struct ArtifactHeader {
-    uint32_t magic{ kArtifactMagic };
-    uint16_t schema{ static_cast<uint16_t>(kSchema) };
+// The start of every pack file.
+struct PackHeader {
+    uint32_t magic{ kPackMagic };
+    uint32_t schema{ kSchema };
+    uint32_t packId{};
+    uint32_t reserved{};
+};
+// The start of every record in a pack. The stored bytes follow it.
+struct RecordHeader {
+    uint32_t magic{ kRecordMagic };
     uint8_t format{};
-    uint8_t reserved{};
+    uint8_t codec{};
+    uint16_t reserved{};
     ShaderStoreHash key;
-    uint64_t size{};
-    ShaderStoreHash payloadHash;
+    uint32_t storedSize{};
+    uint32_t rawSize{};
+    // Covers the fields above and the stored bytes, so a torn or stale record never passes.
+    ShaderStoreHash hash;
 };
 #pragma pack(pop)
+static_assert(sizeof(PackHeader) == 16 && sizeof(RecordHeader) == 48);
 
 // Writes the index into a byte buffer.
 class Writer {
@@ -117,6 +140,215 @@ bool ReadWholeFile(const fs::path& path, std::string& out) {
     out.resize(static_cast<size_t>(size));
     stream.seekg(0);
     return out.empty() || static_cast<bool>(stream.read(out.data(), static_cast<std::streamsize>(out.size())));
+}
+
+ShaderStoreHash RecordHash(const RecordHeader& header, std::span<const std::byte> stored) noexcept {
+    XXH3_state_t state;
+    XXH3_128bits_reset(&state);
+    XXH3_128bits_update(&state, &header, sizeof(RecordHeader) - sizeof(ShaderStoreHash));
+    XXH3_128bits_update(&state, stored.data(), stored.size());
+    return ToHash(XXH3_128bits_digest(&state));
+}
+
+// One zstd context of each kind per thread, made on first use.
+struct ZstdContexts {
+    ZSTD_CCtx* compress{};
+    ZSTD_DCtx* decompress{};
+    ZstdContexts() = default;
+    ZstdContexts(const ZstdContexts&) = delete;
+    ZstdContexts& operator=(const ZstdContexts&) = delete;
+    ~ZstdContexts() {
+        ZSTD_freeCCtx(compress);
+        ZSTD_freeDCtx(decompress);
+    }
+};
+ZstdContexts& Zstd() {
+    thread_local ZstdContexts contexts;
+    return contexts;
+}
+
+// Fills header and stored for one artifact: zstd at the given level, or the raw bytes when that is no smaller.
+void EncodeRecord(const ShaderStoreHash& key, uint8_t format, std::span<const std::byte> binary, int level, RecordHeader& header, std::vector<std::byte>& stored) {
+    header = {};
+    header.format = format;
+    header.key = key;
+    header.rawSize = static_cast<uint32_t>(binary.size());
+    header.codec = static_cast<uint8_t>(Codec::Raw);
+    stored.clear();
+    if (level > 0) {
+        auto& contexts = Zstd();
+        if (!contexts.compress) contexts.compress = ZSTD_createCCtx();
+        if (contexts.compress) {
+            stored.resize(ZSTD_compressBound(binary.size()));
+            ZSTD_CCtx_reset(contexts.compress, ZSTD_reset_session_and_parameters);
+            ZSTD_CCtx_setParameter(contexts.compress, ZSTD_c_compressionLevel, level);
+            const size_t size = ZSTD_compress2(contexts.compress, stored.data(), stored.size(), binary.data(), binary.size());
+            if (!ZSTD_isError(size) && size < binary.size()) {
+                stored.resize(size);
+                header.codec = static_cast<uint8_t>(Codec::Zstd);
+            } else {
+                stored.clear();
+            }
+        }
+    }
+    if (header.codec == static_cast<uint8_t>(Codec::Raw)) stored.assign(binary.begin(), binary.end());
+    header.storedSize = static_cast<uint32_t>(stored.size());
+    header.hash = RecordHash(header, stored);
+}
+
+// Turns a record's stored bytes back into the artifact. False if they do not decode to exactly rawSize bytes.
+bool DecodeRecord(const RecordHeader& header, std::span<const std::byte> stored, std::vector<std::byte>& binary) {
+    if (header.codec == static_cast<uint8_t>(Codec::Raw)) {
+        if (header.storedSize != header.rawSize || stored.empty()) return false;
+        binary.assign(stored.begin(), stored.end());
+        return true;
+    }
+    if (header.codec != static_cast<uint8_t>(Codec::Zstd) || header.rawSize == 0) return false;
+    auto& contexts = Zstd();
+    if (!contexts.decompress) contexts.decompress = ZSTD_createDCtx();
+    if (!contexts.decompress) return false;
+    binary.resize(header.rawSize);
+    const size_t size = ZSTD_decompressDCtx(contexts.decompress, binary.data(), binary.size(), stored.data(), stored.size());
+    if (ZSTD_isError(size) || size != header.rawSize) {
+        binary.clear();
+        return false;
+    }
+    return true;
+}
+
+// A pack file, for positional reads and, in the process that owns the cache, writes. Many threads read at once.
+// Every handle shares delete, so a pack can be removed while another process still reads it.
+class PackFile {
+public:
+    // Opens an existing file, or creates a new one when create is set. Null on failure.
+    static std::unique_ptr<PackFile> Open(const fs::path& path, bool write, bool create) {
+        std::unique_ptr<PackFile> file(new PackFile());
+#if defined(_WIN32)
+        // Overlapped, so the system does not serialize the threads' reads on the handle.
+        file->handle_ = CreateFileW(path.c_str(), write ? (GENERIC_READ | GENERIC_WRITE) : GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, create ? CREATE_NEW : OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
+        if (file->handle_ == INVALID_HANDLE_VALUE) return nullptr;
+#else
+        file->fd_ = ::open(path.c_str(), (write ? O_RDWR : O_RDONLY) | (create ? (O_CREAT | O_EXCL) : 0), 0644);
+        if (file->fd_ < 0) return nullptr;
+#endif
+        return file;
+    }
+
+    ~PackFile() {
+#if defined(_WIN32)
+        if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_);
+#else
+        if (fd_ >= 0) ::close(fd_);
+#endif
+    }
+    PackFile(const PackFile&) = delete;
+    PackFile& operator=(const PackFile&) = delete;
+
+    std::optional<uint64_t> Size() const {
+#if defined(_WIN32)
+        LARGE_INTEGER size{};
+        if (!GetFileSizeEx(handle_, &size)) return std::nullopt;
+        return static_cast<uint64_t>(size.QuadPart);
+#else
+        struct stat info {};
+        if (::fstat(fd_, &info) != 0) return std::nullopt;
+        return static_cast<uint64_t>(info.st_size);
+#endif
+    }
+
+    // True only when all size bytes were read.
+    bool ReadAt(uint64_t offset, void* data, size_t size) const { return Transfer(offset, static_cast<std::byte*>(data), size, false); }
+    // True only when all size bytes were written.
+    bool WriteAt(uint64_t offset, const void* data, size_t size) { return Transfer(offset, const_cast<std::byte*>(static_cast<const std::byte*>(data)), size, true); }
+
+private:
+    PackFile() = default;
+
+    bool Transfer(uint64_t offset, std::byte* bytes, size_t size, bool write) const {
+        while (size > 0) {
+            const auto chunk = static_cast<uint32_t>(std::min<size_t>(size, size_t{ 1 } << 30));
+#if defined(_WIN32)
+            // Each thread waits on its own event. Without one, every caller would wait on the handle's single signal.
+            struct Event {
+                HANDLE handle{ CreateEventW(nullptr, TRUE, FALSE, nullptr) };
+                Event() = default;
+                Event(const Event&) = delete;
+                Event& operator=(const Event&) = delete;
+                ~Event() {
+                    if (handle) CloseHandle(handle);
+                }
+            };
+            thread_local Event event;
+            if (!event.handle) return false;
+            OVERLAPPED overlapped{};
+            overlapped.Offset = static_cast<DWORD>(offset);
+            overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32);
+            overlapped.hEvent = event.handle;
+            const BOOL started = write ? WriteFile(handle_, bytes, chunk, nullptr, &overlapped) : ReadFile(handle_, bytes, chunk, nullptr, &overlapped);
+            if (!started && GetLastError() != ERROR_IO_PENDING) return false;
+            DWORD done = 0;
+            if (!GetOverlappedResult(handle_, &overlapped, &done, TRUE) || done != chunk) return false;
+#else
+            const auto done = write ? ::pwrite(fd_, bytes, chunk, static_cast<off_t>(offset)) : ::pread(fd_, bytes, chunk, static_cast<off_t>(offset));
+            if (done != static_cast<ssize_t>(chunk)) return false;
+#endif
+            bytes += chunk;
+            offset += chunk;
+            size -= chunk;
+        }
+        return true;
+    }
+
+#if defined(_WIN32)
+    HANDLE handle_{ INVALID_HANDLE_VALUE };
+#else
+    int fd_{ -1 };
+#endif
+};
+
+// One pack file. Records are only ever appended, at end.
+struct Pack {
+    uint32_t id{};
+    fs::path path;
+    std::unique_ptr<PackFile> file;
+    // Where the next record goes. Everything before it is whole records. Changed only with appendMutex and tableMutex both held.
+    uint64_t end{};
+};
+
+// Where one artifact is.
+struct ArtifactEntry {
+    uint32_t pack{};
+    uint64_t offset{};
+    uint32_t storedSize{};
+    uint32_t rawSize{};
+    uint8_t format{};
+    uint8_t codec{};
+    uint64_t RecordBytes() const noexcept { return sizeof(RecordHeader) + storedSize; }
+};
+
+// What the saved index said about a pack: how far its records were indexed, and whether it was to be deleted.
+struct IndexedPack {
+    uint64_t end{};
+    bool retired{};
+};
+
+fs::path PackPath(const fs::path& cacheDirectory, uint32_t id) {
+    char name[24]{};
+    std::snprintf(name, sizeof(name), "%08x.pack", id);
+    return cacheDirectory / kPackFolder / name;
+}
+
+// The id in a pack file's name, or nothing for any other file.
+std::optional<uint32_t> PackIdOf(const fs::path& path) {
+    if (path.extension() != ".pack") return std::nullopt;
+    const auto stem = path.stem().generic_string();
+    if (stem.size() != 8 || !std::all_of(stem.begin(), stem.end(), [](unsigned char c) { return std::isxdigit(c) != 0; })) return std::nullopt;
+    return static_cast<uint32_t>(std::strtoul(stem.c_str(), nullptr, 16));
+}
+
+uint64_t MicrosecondsSince(std::chrono::steady_clock::time_point start) {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
 }
 
 // Case differs between include lines on Windows, so paths are compared in lower case there.
@@ -320,13 +552,23 @@ struct ShaderStore::Impl {
     explicit Impl(ShaderStoreOptions options) : options(std::move(options)), snapshot(this->options.sourceRoot) {
         if (this->options.persistent) {
             std::error_code ec;
-            fs::create_directories(this->options.cacheDirectory, ec);
+            if (!this->options.readOnly) fs::create_directories(this->options.cacheDirectory, ec);
             ClaimIndex();
+            auto start = std::chrono::steady_clock::now();
             LoadIndex();
+            indexLoadMicroseconds = MicrosecondsSince(start);
+            start = std::chrono::steady_clock::now();
+            OpenPacks();
+            packScanMicroseconds = MicrosecondsSince(start);
             ++startCount;
+            start = std::chrono::steady_clock::now();
             Evict();
+            Compact();
+            compactMicroseconds = MicrosecondsSince(start);
             dirty = true;
-            if (this->options.saveInterval.count() > 0 && ownsIndex) saver = std::thread([this] { SaveLoop(); });
+            // Compaction deleted packs, so save where their records went now.
+            if (packsCompacted) Save();
+            if (this->options.saveInterval.count() > 0 && Writable()) saver = std::thread([this] { SaveLoop(); });
         }
     }
 
@@ -342,9 +584,14 @@ struct ShaderStore::Impl {
 #endif
     }
 
+    // Whether this process may change the cache on disk.
+    bool Writable() const noexcept { return options.persistent && ownsIndex && !options.readOnly; }
+
     // --- Index ownership ---------------------------------------------------------------------------------------
 
     void ClaimIndex() {
+        // A read-only tool must not take the cache from a game that starts while it runs.
+        if (options.readOnly) return;
 #if defined(_WIN32)
         // The name comes from the folder, so two game instances sharing a cache find each other. Windows
         // releases the mutex if a process dies, so a crash cannot leave the cache locked.
@@ -468,12 +715,38 @@ struct ShaderStore::Impl {
             variant.diagnostics = reader.Text();
             if (variant.dependencySet >= sets.size()) reader.failed = true;
         }
+        const auto packCount = reader.Count(sizeof(uint32_t) + sizeof(uint64_t) + 1);
+        for (uint32_t i = 0; i < packCount && !reader.failed; ++i) {
+            const auto id = reader.Value<uint32_t>();
+            auto& pack = indexedPacks[id];
+            pack.end = reader.Value<uint64_t>();
+            pack.retired = reader.Value<uint8_t>() != 0;
+        }
+        const auto artifactCount = reader.Count(sizeof(ShaderStoreHash) + sizeof(uint32_t) + sizeof(uint64_t) + 2 * sizeof(uint32_t) + 2);
+        for (uint32_t i = 0; i < artifactCount && !reader.failed; ++i) {
+            const auto key = reader.Value<ShaderStoreHash>();
+            ArtifactEntry entry;
+            entry.pack = reader.Value<uint32_t>();
+            entry.offset = reader.Value<uint64_t>();
+            entry.storedSize = reader.Value<uint32_t>();
+            entry.rawSize = reader.Value<uint32_t>();
+            entry.format = reader.Value<uint8_t>();
+            entry.codec = reader.Value<uint8_t>();
+            artifacts[key] = entry;
+        }
         return !reader.failed;
     }
 
-    void ResetTables() {
+    // The variant records only. Artifacts stay findable by their compile key.
+    void ResetVariantTables() {
         paths.clear(); pathIds.clear(); files.clear(); fileIds.clear(); sets.clear(); setIds.clear(); variants.clear();
         startCount = 0;
+    }
+
+    void ResetTables() {
+        ResetVariantTables();
+        artifacts.clear();
+        indexedPacks.clear();
     }
 
     void LoadIndex() {
@@ -501,6 +774,7 @@ struct ShaderStore::Impl {
         }
     }
 
+    // Holds tableMutex shared.
     std::string SerializeIndex() const {
         Writer writer;
         writer.Value(startCount);
@@ -528,12 +802,34 @@ struct ShaderStore::Impl {
             writer.Value(variant.lastUsedStart.load(std::memory_order_relaxed));
             writer.Text(variant.diagnostics);
         }
+        // Each pack's end as of this save. A start reads only what lies past it.
+        writer.Value(static_cast<uint32_t>(packs.size() + retiredPacks.size()));
+        for (const auto& [id, pack] : packs) {
+            writer.Value(id);
+            writer.Value(pack->end);
+            writer.Value(uint8_t{ 0 });
+        }
+        for (const auto id : retiredPacks) {
+            writer.Value(id);
+            writer.Value(uint64_t{ 0 });
+            writer.Value(uint8_t{ 1 });
+        }
+        writer.Value(static_cast<uint32_t>(artifacts.size()));
+        for (const auto& [key, entry] : artifacts) {
+            writer.Value(key);
+            writer.Value(entry.pack);
+            writer.Value(entry.offset);
+            writer.Value(entry.storedSize);
+            writer.Value(entry.rawSize);
+            writer.Value(entry.format);
+            writer.Value(entry.codec);
+        }
         return std::move(writer.bytes);
     }
 
     // Writes over the older slot. There is no rename. A torn write fails the hash check on load, and the other slot is used.
     void Save() {
-        if (!options.persistent || !ownsIndex) return;
+        if (!Writable()) return;
         std::scoped_lock saving(saveMutex);
         std::string payload;
         {
@@ -567,97 +863,283 @@ struct ShaderStore::Impl {
         }
     }
 
-    // --- Artifacts ---------------------------------------------------------------------------------------------
+    // --- Packs -------------------------------------------------------------------------------------------------
 
-    fs::path ArtifactPath(const ShaderStoreHash& key) const {
-        const auto hex = key.ToHex();
-        return options.cacheDirectory / "cas" / hex.substr(0, 2) / (hex + ".bin");
+    // Reads the records in [from, size) of a pack and adds each whole one to the table. Returns where the whole
+    // records end: a torn record from a killed process ends the scan, and the next append writes over it.
+    // Only called at startup, with tableMutex held.
+    uint64_t ScanRecords(const Pack& pack, uint64_t from, uint64_t size) {
+        if (size <= from) return from;
+        std::vector<std::byte> region(static_cast<size_t>(size - from));
+        if (!pack.file->ReadAt(from, region.data(), region.size())) return from;
+        size_t at = 0;
+        while (region.size() - at >= sizeof(RecordHeader)) {
+            RecordHeader header{};
+            std::memcpy(&header, region.data() + at, sizeof(header));
+            const size_t left = region.size() - at - sizeof(header);
+            if (header.magic != kRecordMagic || header.storedSize == 0 || header.storedSize > left) break;
+            const std::span<const std::byte> stored(region.data() + at + sizeof(header), header.storedSize);
+            if (!(RecordHash(header, stored) == header.hash)) break;
+            // A later record for the same key is newer: a rebuild after a bad read, or a compaction copy.
+            const auto [found, added] = artifacts.insert_or_assign(header.key,
+                ArtifactEntry{ pack.id, from + at, header.storedSize, header.rawSize, header.format, header.codec });
+            if (added) ++recoveredAtStart;
+            at += sizeof(header) + header.storedSize;
+        }
+        return from + at;
     }
+
+    // Opens every pack and reads what was appended after the saved index. Runs once at startup, before any request.
+    void OpenPacks() {
+        const bool write = Writable();
+        std::map<uint32_t, fs::path> found;
+        std::error_code ec;
+        for (fs::directory_iterator it(options.cacheDirectory / kPackFolder, ec), end; !ec && it != end; it.increment(ec)) {
+            std::error_code entryError;
+            if (!it->is_regular_file(entryError)) continue;
+            if (const auto id = PackIdOf(it->path())) found.emplace(*id, it->path());
+        }
+        std::unique_lock lock(tableMutex);
+        for (const auto& [id, path] : found) {
+            nextPackId = std::max(nextPackId, id + 1);
+            const auto known = indexedPacks.find(id);
+            if (known != indexedPacks.end() && known->second.retired) {
+                // Compaction emptied it, but could not delete it then.
+                std::error_code removeError;
+                if (!write || !fs::remove(path, removeError)) retiredPacks.push_back(id);
+                continue;
+            }
+            auto pack = std::make_shared<Pack>();
+            pack->id = id;
+            pack->path = path;
+            pack->file = PackFile::Open(path, write, false);
+            if (!pack->file) continue;
+            const auto size = pack->file->Size();
+            PackHeader header{};
+            if (!size || *size < sizeof(header) || !pack->file->ReadAt(0, &header, sizeof(header)) || header.magic != kPackMagic ||
+                header.schema != kSchema || header.packId != id) {
+                // Not a pack this version can read, or one whose header was never written.
+                pack->file.reset();
+                std::error_code removeError;
+                if (write) fs::remove(path, removeError);
+                continue;
+            }
+            // A pack the index knows is read from its saved end. Any other is read whole: it was made after the save.
+            uint64_t from = sizeof(PackHeader);
+            if (known != indexedPacks.end() && known->second.end >= sizeof(PackHeader) && known->second.end <= *size) from = known->second.end;
+            pack->end = ScanRecords(*pack, from, *size);
+            packBytesAtStart += *size;
+            packs.emplace(id, std::move(pack));
+        }
+        // A retired pack that is gone needs nothing more.
+        indexedPacks.clear();
+        // Entries in packs that are gone, or past a pack's whole records, cannot be read.
+        std::erase_if(artifacts, [&](const auto& item) {
+            const auto pack = packs.find(item.second.pack);
+            return pack == packs.end() || item.second.offset < sizeof(PackHeader) || item.second.offset + item.second.RecordBytes() > pack->second->end;
+        });
+        for (const auto& [key, entry] : artifacts) artifactBytesAtStart += entry.RecordBytes();
+        artifactsAtStart = artifacts.size();
+        packsAtStart = packs.size();
+        // Keep appending to the newest pack while it has room.
+        if (write && !packs.empty() && packs.rbegin()->second->end < options.packBytes) activePack = packs.rbegin()->second;
+    }
+
+    // Makes a new, empty pack to append to. Holds appendMutex.
+    std::shared_ptr<Pack> CreatePack() {
+        std::error_code ec;
+        fs::create_directories(options.cacheDirectory / kPackFolder, ec);
+        auto pack = std::make_shared<Pack>();
+        pack->id = nextPackId++;
+        pack->path = PackPath(options.cacheDirectory, pack->id);
+        pack->file = PackFile::Open(pack->path, true, true);
+        if (!pack->file) return nullptr;
+        PackHeader header{};
+        header.packId = pack->id;
+        if (!pack->file->WriteAt(0, &header, sizeof(header))) {
+            pack->file.reset();
+            std::error_code removeError;
+            fs::remove(pack->path, removeError);
+            return nullptr;
+        }
+        pack->end = sizeof(header);
+        std::unique_lock lock(tableMutex);
+        packs.emplace(pack->id, pack);
+        dirty = true;
+        return pack;
+    }
+
+    // Appends one whole record (header and stored bytes) and points the key at it. The table changes only after
+    // the write, so a reader never finds a record that is still being written.
+    bool Append(const ShaderStoreHash& key, std::span<const std::byte> record) {
+        if (!Writable() || record.size() < sizeof(RecordHeader)) return false;
+        RecordHeader header{};
+        std::memcpy(&header, record.data(), sizeof(header));
+        std::scoped_lock appending(appendMutex);
+        // Roll over when this record would take the pack past its size. An empty pack takes any record.
+        if (activePack && activePack->end > sizeof(PackHeader) && activePack->end + record.size() > options.packBytes) activePack.reset();
+        if (!activePack) activePack = CreatePack();
+        if (!activePack) return false;
+        // Only appenders change end, and they hold appendMutex, so it can be read here without tableMutex.
+        const uint64_t offset = activePack->end;
+        // A failed write leaves end where it was, so the next record writes over what it left.
+        if (!activePack->file->WriteAt(offset, record.data(), record.size())) return false;
+        std::unique_lock lock(tableMutex);
+        activePack->end = offset + record.size();
+        artifacts.insert_or_assign(key, ArtifactEntry{ activePack->id, offset, header.storedSize, header.rawSize, header.format, header.codec });
+        dirty = true;
+        return true;
+    }
+
+    // Reads one record and checks it is the one the entry names. False for a short read or any mismatch.
+    static bool ReadRecord(const Pack& pack, const ArtifactEntry& entry, const ShaderStoreHash& key, std::vector<std::byte>& record) {
+        if (!pack.file) return false;
+        record.resize(static_cast<size_t>(entry.RecordBytes()));
+        if (!pack.file->ReadAt(entry.offset, record.data(), record.size())) return false;
+        RecordHeader header{};
+        std::memcpy(&header, record.data(), sizeof(header));
+        const std::span<const std::byte> stored(record.data() + sizeof(header), entry.storedSize);
+        return header.magic == kRecordMagic && header.key == key && header.format == entry.format && header.codec == entry.codec &&
+            header.storedSize == entry.storedSize && header.rawSize == entry.rawSize && RecordHash(header, stored) == header.hash;
+    }
+
+    // --- Artifacts ---------------------------------------------------------------------------------------------
 
     // True only for a whole artifact with the right key, format and contents.
     bool ReadArtifact(const ShaderStoreHash& key, uint8_t format, std::vector<std::byte>& binary) const {
         if (!options.persistent) return false;
-        std::string data;
-        if (!ReadWholeFile(ArtifactPath(key), data) || data.size() < sizeof(ArtifactHeader)) return false;
-        ArtifactHeader header{};
-        std::memcpy(&header, data.data(), sizeof(header));
-        const std::string_view payload(data.data() + sizeof(header), data.size() - sizeof(header));
-        if (header.magic != kArtifactMagic || header.schema != kSchema || header.format != format || !(header.key == key) || header.size != payload.size() ||
-            !(HashShaderText(payload) == header.payloadHash) || payload.empty()) return false;
-        const auto* first = reinterpret_cast<const std::byte*>(payload.data());
-        binary.assign(first, first + payload.size());
-        return true;
+        ArtifactEntry entry;
+        std::shared_ptr<const Pack> pack;
+        {
+            std::shared_lock lock(tableMutex);
+            const auto found = artifacts.find(key);
+            if (found == artifacts.end() || found->second.format != format) return false;
+            entry = found->second;
+            const auto owner = packs.find(entry.pack);
+            if (owner == packs.end()) return false;
+            // The pointer keeps the file open even if Clear drops the pack meanwhile.
+            pack = owner->second;
+        }
+        std::vector<std::byte> record;
+        if (!ReadRecord(*pack, entry, key, record)) return false;
+        RecordHeader header{};
+        std::memcpy(&header, record.data(), sizeof(header));
+        return DecodeRecord(header, std::span<const std::byte>(record).subspan(sizeof(header)), binary);
     }
 
-    // Creates the file at its final name, with no rename. Only a record in the index makes it reachable from a
-    // variant, and a reader checks the hash, so a torn write costs one rebuild.
-    bool WriteArtifact(const ShaderStoreHash& key, uint8_t format, std::span<const std::byte> binary) const {
+    // Compresses outside any lock, then appends. A record never names an artifact that was not written.
+    bool WriteArtifact(const ShaderStoreHash& key, uint8_t format, std::span<const std::byte> binary) {
         if (!options.persistent) return true;
-        ArtifactHeader header{};
-        header.format = format;
-        header.key = key;
-        header.size = binary.size();
-        header.payloadHash = HashShaderBytes(binary);
-        const auto path = ArtifactPath(key);
-        std::error_code ec;
-        fs::create_directories(path.parent_path(), ec);
-        std::ofstream stream(path, std::ios::binary | std::ios::trunc);
-        stream.write(reinterpret_cast<const char*>(&header), sizeof(header));
-        stream.write(reinterpret_cast<const char*>(binary.data()), static_cast<std::streamsize>(binary.size()));
-        stream.close();
-        return static_cast<bool>(stream);
+        if (!Writable() || binary.empty() || binary.size() > std::numeric_limits<uint32_t>::max()) return false;
+        RecordHeader header{};
+        std::vector<std::byte> stored;
+        EncodeRecord(key, format, binary, options.compressionLevel, header, stored);
+        std::vector<std::byte> record(sizeof(header) + stored.size());
+        std::memcpy(record.data(), &header, sizeof(header));
+        std::memcpy(record.data() + sizeof(header), stored.data(), stored.size());
+        return Append(key, record);
     }
 
-    // Runs once at startup, before any request.
+    // Runs once at startup, before any request. Drops entries from the table; Compact then frees their bytes.
     void Evict() {
-        if (!ownsIndex) return;
-        struct Artifact { fs::path path; uint64_t size; fs::file_time_type time; ShaderStoreHash key; uint32_t lastUsedStart; bool referenced; };
+        if (!Writable()) return;
+        struct Candidate { ShaderStoreHash key; uint64_t bytes; uint32_t lastUsedStart; bool referenced; uint32_t pack; uint64_t offset; };
         std::unordered_map<ShaderStoreHash, uint32_t, HashOf> lastUsed;
         for (const auto& [key, variant] : variants) {
             if (variant.status != VariantStatus::Ok) continue;
             auto& newest = lastUsed[variant.compileKey];
             newest = std::max(newest, variant.lastUsedStart.load(std::memory_order_relaxed));
         }
-        std::vector<Artifact> artifacts;
+        std::vector<Candidate> candidates;
+        candidates.reserve(artifacts.size());
         uint64_t total = 0;
-        std::error_code ec;
-        for (fs::recursive_directory_iterator it(options.cacheDirectory / "cas", ec), end; !ec && it != end; it.increment(ec)) {
-            std::error_code entryError;
-            if (!it->is_regular_file(entryError) || it->path().extension() != ".bin") continue;
-            const auto size = it->file_size(entryError);
-            const auto time = it->last_write_time(entryError);
-            if (entryError) continue;
-            const auto stem = it->path().stem().generic_string();
-            if (stem.size() != 32) continue;
-            ShaderStoreHash key{ std::strtoull(stem.substr(0, 16).c_str(), nullptr, 16), std::strtoull(stem.substr(16).c_str(), nullptr, 16) };
+        for (const auto& [key, entry] : artifacts) {
             const auto found = lastUsed.find(key);
-            artifacts.push_back({ it->path(), size, time, key, found == lastUsed.end() ? 0u : found->second, found != lastUsed.end() });
-            total += size;
+            candidates.push_back({ key, entry.RecordBytes(), found == lastUsed.end() ? 0u : found->second, found != lastUsed.end(), entry.pack, entry.offset });
+            total += entry.RecordBytes();
         }
-        artifactsAtStart = artifacts.size();
-        artifactBytesAtStart = total;
         if (total <= options.maxBytes) return;
-        // Unreferenced artifacts go first, oldest first. They only serve reverted edits.
-        std::sort(artifacts.begin(), artifacts.end(), [](const Artifact& a, const Artifact& b) {
+        // Unreferenced artifacts go first, oldest first. They only serve reverted edits. Older packs hold older records.
+        std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
             if (a.referenced != b.referenced) return !a.referenced;
             if (a.lastUsedStart != b.lastUsedStart) return a.lastUsedStart < b.lastUsedStart;
-            return a.time < b.time;
+            if (a.pack != b.pack) return a.pack < b.pack;
+            return a.offset < b.offset;
         });
         // startCount already counts this start, so this keeps what the last keepGenerations starts used.
         const uint32_t keepFrom = startCount > options.keepGenerations ? startCount - options.keepGenerations : 0;
         std::unordered_set<ShaderStoreHash, HashOf> removed;
-        for (const auto& artifact : artifacts) {
+        for (const auto& candidate : candidates) {
             if (total <= options.maxBytes) break;
-            if (artifact.referenced && artifact.lastUsedStart >= keepFrom) break;
-            std::error_code removeError;
-            fs::remove(artifact.path, removeError);
-            if (removeError) continue;
-            total -= artifact.size;
-            removed.insert(artifact.key);
+            if (candidate.referenced && candidate.lastUsedStart >= keepFrom) break;
+            artifacts.erase(candidate.key);
+            total -= candidate.bytes;
+            removed.insert(candidate.key);
             ++artifactsEvicted;
         }
         if (total > options.maxBytes) overCapBytes = total - options.maxBytes;
         std::erase_if(variants, [&](const auto& entry) { return removed.contains(entry.second.compileKey); });
+    }
+
+    // Runs once at startup, after Evict. A pack that is more than half dead bytes (removed, evicted or replaced
+    // records, or a torn tail) has its live records copied to the newest pack, and is deleted. Over the size limit,
+    // the packs with the most dead bytes go too, until what is left fits.
+    void Compact() {
+        if (!Writable()) return;
+        std::map<uint32_t, uint64_t> live;
+        for (const auto& [key, entry] : artifacts) live[entry.pack] += entry.RecordBytes();
+        struct Candidate { uint32_t id; uint64_t used; uint64_t dead; };
+        std::vector<Candidate> candidates;
+        uint64_t disk = 0;
+        for (const auto& [id, pack] : packs) {
+            const auto size = pack->file->Size().value_or(pack->end);
+            const uint64_t used = std::max(size, pack->end) - sizeof(PackHeader);
+            const uint64_t liveBytes = live[id];
+            disk += used;
+            candidates.push_back({ id, used, used > liveBytes ? used - liveBytes : 0 });
+        }
+        std::vector<uint32_t> victims;
+        uint64_t left = disk;
+        std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.dead > b.dead; });
+        for (const auto& candidate : candidates) {
+            const bool mostlyDead = candidate.dead > 0 && candidate.dead * 2 > candidate.used;
+            const bool overLimit = candidate.dead > 0 && left > options.maxBytes;
+            if (!mostlyDead && !overLimit) continue;
+            victims.push_back(candidate.id);
+            left -= candidate.dead;
+        }
+        if (victims.empty()) return;
+        // Never copy into a pack that is about to be deleted.
+        if (activePack && std::find(victims.begin(), victims.end(), activePack->id) != victims.end()) activePack.reset();
+        std::vector<std::byte> record;
+        for (const auto id : victims) {
+            const auto pack = packs.at(id);
+            std::vector<std::pair<ShaderStoreHash, ArtifactEntry>> moving;
+            for (const auto& [key, entry] : artifacts)
+                if (entry.pack == id) moving.emplace_back(key, entry);
+            std::sort(moving.begin(), moving.end(), [](const auto& a, const auto& b) { return a.second.offset < b.second.offset; });
+            bool copied = true;
+            for (const auto& [key, entry] : moving) {
+                // A record that fails its check is dropped: it would cost a rebuild anyway.
+                if (!ReadRecord(*pack, entry, key, record)) { artifacts.erase(key); continue; }
+                if (!Append(key, record)) { copied = false; break; }
+                compactedBytes += record.size();
+            }
+            // Out of disk space or the like: keep the pack, and what was copied is only a duplicate.
+            if (!copied) break;
+            const auto size = pack->file->Size().value_or(pack->end);
+            {
+                std::unique_lock lock(tableMutex);
+                packs.erase(id);
+                dirty = true;
+            }
+            pack->file.reset();
+            std::error_code removeError;
+            if (!fs::remove(pack->path, removeError)) retiredPacks.push_back(id);
+            reclaimedBytes += size;
+            ++packsCompacted;
+        }
+        reclaimedBytes = reclaimedBytes > compactedBytes ? reclaimedBytes - compactedBytes : 0;
     }
 
     // --- Lookup ------------------------------------------------------------------------------------------------
@@ -829,8 +1311,19 @@ struct ShaderStore::Impl {
     std::deque<DependencySet> sets;  // A deque, so a set stays in place while others are added.
     std::unordered_map<ShaderStoreHash, uint32_t, HashOf> setIds;
     std::unordered_map<ShaderStoreHash, VariantRecord, HashOf> variants;
+    std::unordered_map<ShaderStoreHash, ArtifactEntry, HashOf> artifacts;
+    std::map<uint32_t, std::shared_ptr<Pack>> packs;
+    std::vector<uint32_t> retiredPacks;  // Emptied by compaction but not yet deleted.
+    std::map<uint32_t, IndexedPack> indexedPacks;  // From the index, until OpenPacks reads it.
     uint32_t startCount{};
     uint64_t artifactsAtStart{}, artifactBytesAtStart{}, artifactsEvicted{}, overCapBytes{};
+    uint64_t packsAtStart{}, packBytesAtStart{}, recoveredAtStart{};
+    uint64_t packsCompacted{}, compactedBytes{}, reclaimedBytes{};
+    uint64_t indexLoadMicroseconds{}, packScanMicroseconds{}, compactMicroseconds{};
+
+    std::mutex appendMutex;
+    std::shared_ptr<Pack> activePack;  // The pack new records go to. Guarded by appendMutex.
+    uint32_t nextPackId{ 1 };          // Guarded by appendMutex after startup.
 
     std::atomic<bool> dirty{};
     std::mutex saveMutex;
@@ -862,7 +1355,7 @@ ShaderStoreResult ShaderStore::Resolve(const ShaderVariantRequest& request) { re
 void ShaderStore::BeginGeneration() { impl_->snapshot.BeginGeneration(); }
 uint64_t ShaderStore::Generation() const { return impl_->snapshot.Generation(); }
 void ShaderStore::Flush() { impl_->Save(); }
-bool ShaderStore::OwnsIndex() const noexcept { return impl_->ownsIndex; }
+bool ShaderStore::OwnsIndex() const noexcept { return impl_->Writable(); }
 
 bool ShaderStore::ForEachDependency(const ShaderStoreHash& variantKey, const std::function<void(const fs::path&)>& fn) const {
     std::shared_lock lock(impl_->tableMutex);
@@ -894,6 +1387,20 @@ ShaderStoreIndexInfo ShaderStore::IndexInfo() const {
     info.artifactBytesAtStart = impl_->artifactBytesAtStart;
     info.artifactsEvicted = impl_->artifactsEvicted;
     info.overCapBytes = impl_->overCapBytes;
+    info.packsAtStart = impl_->packsAtStart;
+    info.packBytesAtStart = impl_->packBytesAtStart;
+    info.recoveredAtStart = impl_->recoveredAtStart;
+    info.packsCompacted = impl_->packsCompacted;
+    info.compactedBytes = impl_->compactedBytes;
+    info.reclaimedBytes = impl_->reclaimedBytes;
+    info.indexLoadMicroseconds = impl_->indexLoadMicroseconds;
+    info.packScanMicroseconds = impl_->packScanMicroseconds;
+    info.compactMicroseconds = impl_->compactMicroseconds;
+    info.artifacts = impl_->artifacts.size();
+    for (const auto& [key, entry] : impl_->artifacts) {
+        info.storedBytes += entry.storedSize;
+        info.rawBytes += entry.rawSize;
+    }
     return info;
 }
 
@@ -910,37 +1417,75 @@ std::string ShaderStore::Summary() const {
 }
 
 ShaderStore::ArtifactUsage ShaderStore::MeasureArtifacts() const {
+    std::shared_lock lock(impl_->tableMutex);
     ArtifactUsage usage;
-    std::error_code ec;
-    for (fs::recursive_directory_iterator it(impl_->options.cacheDirectory / "cas", ec), end; !ec && it != end; it.increment(ec)) {
-        std::error_code entryError;
-        if (!it->is_regular_file(entryError) || it->path().extension() != ".bin") continue;
-        const auto size = it->file_size(entryError);
-        if (entryError) continue;
-        ++usage.count;
-        usage.bytes += size;
-    }
+    usage.count = impl_->artifacts.size();
+    for (const auto& [id, pack] : impl_->packs) usage.bytes += pack->file ? pack->file->Size().value_or(pack->end) : 0;
     return usage;
 }
 
+bool ShaderStore::ReadArtifact(const ShaderStoreHash& compileKey, uint8_t format, std::vector<std::byte>& binary) const {
+    return impl_->ReadArtifact(compileKey, format, binary);
+}
+
+void ShaderStore::ForEachArtifact(const std::function<void(const ShaderStoreHash&, uint8_t, std::span<const std::byte>)>& fn) const {
+    struct Item { ShaderStoreHash key; ArtifactEntry entry; std::shared_ptr<const Pack> pack; };
+    std::vector<Item> items;
+    {
+        std::shared_lock lock(impl_->tableMutex);
+        items.reserve(impl_->artifacts.size());
+        for (const auto& [key, entry] : impl_->artifacts)
+            if (const auto pack = impl_->packs.find(entry.pack); pack != impl_->packs.end()) items.push_back({ key, entry, pack->second });
+    }
+    // In file order, so the packs are read front to back.
+    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
+        return a.entry.pack != b.entry.pack ? a.entry.pack < b.entry.pack : a.entry.offset < b.entry.offset;
+    });
+    std::vector<std::byte> record, binary;
+    for (const auto& item : items) {
+        if (!Impl::ReadRecord(*item.pack, item.entry, item.key, record)) continue;
+        RecordHeader header{};
+        std::memcpy(&header, record.data(), sizeof(header));
+        if (!DecodeRecord(header, std::span<const std::byte>(record).subspan(sizeof(header)), binary)) continue;
+        fn(item.key, item.entry.format, binary);
+    }
+}
+
 void ShaderStore::RemoveArtifact(const ShaderStoreHash& compileKey) {
-    std::error_code ec;
-    fs::remove(impl_->ArtifactPath(compileKey), ec);
+    std::unique_lock lock(impl_->tableMutex);
+    if (impl_->artifacts.erase(compileKey)) impl_->dirty = true;
 }
 
 void ShaderStore::ClearIndex() {
-    std::unique_lock lock(impl_->tableMutex);
-    impl_->ResetTables();
-    impl_->startCount = 1;
-    std::error_code ec;
-    for (const auto* slot : kIndexSlots) fs::remove(impl_->options.cacheDirectory / slot, ec);
-    impl_->dirty = true;
+    {
+        std::unique_lock lock(impl_->tableMutex);
+        impl_->ResetVariantTables();
+        impl_->startCount = 1;
+        impl_->dirty = true;
+    }
+    impl_->Save();
 }
 
 void ShaderStore::Clear() {
-    ClearIndex();
+    std::vector<fs::path> remove;
+    {
+        std::scoped_lock appending(impl_->appendMutex);
+        std::unique_lock lock(impl_->tableMutex);
+        impl_->ResetTables();
+        impl_->startCount = 1;
+        for (const auto& [id, pack] : impl_->packs) remove.push_back(pack->path);
+        for (const auto id : impl_->retiredPacks) remove.push_back(PackPath(impl_->options.cacheDirectory, id));
+        // Readers still holding a pack keep its file open until they finish.
+        impl_->packs.clear();
+        impl_->retiredPacks.clear();
+        impl_->activePack.reset();
+        impl_->dirty = true;
+    }
+    // Another process's packs are not this one's to delete.
+    if (!impl_->Writable()) return;
     std::error_code ec;
-    fs::remove_all(impl_->options.cacheDirectory / "cas", ec);
+    for (const auto& path : remove) fs::remove(path, ec);
+    for (const auto* slot : kIndexSlots) fs::remove(impl_->options.cacheDirectory / slot, ec);
 }
 
 }  // namespace org::services

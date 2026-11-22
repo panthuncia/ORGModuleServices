@@ -13,8 +13,12 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -172,6 +176,56 @@ ShaderStoreResult Run(ShaderStore& store, const Fixture& fixture, const Variant&
 }
 
 std::string Text(const ShaderStoreResult& result) { return std::string(reinterpret_cast<const char*>(result.binary.data()), result.binary.size()); }
+
+// Text that zstd cannot shrink much, so sizes on disk stay close to the text's size.
+std::string Noise(size_t size, uint32_t seed) {
+    static constexpr char kAlphabet[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.";
+    std::string text(size, ' ');
+    for (auto& c : text) {
+        seed = seed * 1664525u + 1013904223u;
+        c = kAlphabet[(seed >> 24) & 63];
+    }
+    return text + "\n";
+}
+
+// The store's pack files, in id order.
+std::vector<fs::path> PackFiles(const fs::path& cache) {
+    std::vector<fs::path> packs;
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(cache / "packs", ec))
+        if (entry.path().extension() == ".pack") packs.push_back(entry.path());
+    std::sort(packs.begin(), packs.end());
+    return packs;
+}
+
+uint64_t PackBytes(const fs::path& cache) {
+    uint64_t total = 0;
+    for (const auto& pack : PackFiles(cache)) total += fs::file_size(pack);
+    return total;
+}
+
+// Both index slots as they are now, to put back later as if no later save had happened.
+struct IndexCopy {
+    explicit IndexCopy(const fs::path& cache) : cache_(cache) {
+        for (int i = 0; i < 2; ++i) {
+            const auto path = cache_ / kSlots[i];
+            if (fs::exists(path)) slots_[i] = ReadFile(path);
+        }
+    }
+    void Restore() const {
+        for (int i = 0; i < 2; ++i) {
+            const auto path = cache_ / kSlots[i];
+            std::error_code ec;
+            if (slots_[i]) WriteFile(path, *slots_[i]);
+            else fs::remove(path, ec);
+        }
+    }
+
+private:
+    static constexpr const char* kSlots[2] = { "index.a", "index.b" };
+    fs::path cache_;
+    std::optional<std::string> slots_[2];
+};
 
 // One "boot": a fresh store over the same folder, as a new game process would make.
 template <typename Body> void Boot(ShaderStoreOptions options, Body&& body) {
@@ -401,17 +455,15 @@ void TestDefinesThatChangeTextDoNotShare() {
 void TestCorruptArtifactCompilesAgain() {
     Fixture fixture;
     WriteBasicShaders(fixture);
-    fs::path artifact;
-    Boot(fixture, [&](ShaderStore& store) {
-        const auto hex = Run(store, fixture).compileKey.ToHex();
-        artifact = fixture.cache() / "cas" / hex.substr(0, 2) / (hex + ".bin");
-    });
-    CHECK(fs::exists(artifact));
-    // Flip a byte, keeping the length. A length check alone would accept this.
-    auto bytes = ReadFile(artifact);
+    Boot(fixture, [&](ShaderStore& store) { Run(store, fixture); });
+    const auto packs = PackFiles(fixture.cache());
+    CHECK(packs.size() == 1);
+    const auto pack = packs.front();
+    // Flip the last byte, inside the only record, keeping the length. A length check alone would accept this.
+    auto bytes = ReadFile(pack);
     const auto intact = bytes;
     bytes.back() ^= 0x55;
-    WriteFile(artifact, bytes);
+    WriteFile(pack, bytes);
     Boot(fixture, [&](ShaderStore& store) {
         const auto result = Run(store, fixture);
         CHECK(result.miss == ShaderStoreMiss::ArtifactInvalid);
@@ -420,16 +472,19 @@ void TestCorruptArtifactCompilesAgain() {
         CHECK(g_compiles == 1);
     });
     Boot(fixture, [&](ShaderStore& store) { CHECK(Run(store, fixture).outcome == ShaderStoreOutcome::Hit); });
-    CHECK(ReadFile(artifact) == intact);
-    // A truncated file and a deleted file behave the same way.
-    WriteFile(artifact, intact.substr(0, 10));
+    // The rebuild was appended. The damaged record is dead bytes for compaction.
+    CHECK(fs::file_size(pack) > intact.size());
+    // A truncated pack and a deleted pack behave the same way.
+    WriteFile(pack, intact.substr(0, 26));
     Boot(fixture, [&](ShaderStore& store) { CHECK(Run(store, fixture).outcome == ShaderStoreOutcome::Compiled); });
-    fs::remove(artifact);
+    std::error_code ec;
+    fs::remove_all(fixture.cache() / "packs", ec);
     Boot(fixture, [&](ShaderStore& store) {
         const auto result = Run(store, fixture);
         CHECK(result.outcome == ShaderStoreOutcome::Compiled);
         CHECK(!result.binary.empty());
     });
+    Boot(fixture, [&](ShaderStore& store) { CHECK(Run(store, fixture).outcome == ShaderStoreOutcome::Hit); });
 }
 
 void TestCorruptIndexSlotFallsBack() {
@@ -749,8 +804,8 @@ void TestRememberedDiagnosticsAreCapped() {
 
 void TestStartupReportsWhatItFound() {
     Fixture fixture;
-    WriteFile(fixture.shaders() / "A.hlsl", "a" + std::string(4000, 'x') + "\n");
-    WriteFile(fixture.shaders() / "B.hlsl", "b" + std::string(4000, 'x') + "\n");
+    WriteFile(fixture.shaders() / "A.hlsl", Noise(8000, 1));
+    WriteFile(fixture.shaders() / "B.hlsl", Noise(8000, 2));
     const Variant a{ "A.hlsl" }, b{ "B.hlsl" };
     Boot(fixture, [&](ShaderStore& store) {
         CHECK(store.MeasureArtifacts().count == 0);
@@ -913,6 +968,324 @@ void TestCanonicalText() {
     CHECK(CanonicalizePreprocessedText("#pragma warning(disable: 1)\nfloat x;\n") == "#pragma warning(disable: 1)\nfloat x;\n");
 }
 
+
+void TestArtifactsRoundTripCompressed() {
+    Fixture fixture;
+    // One artifact that compresses well, as SPIR-V does, and one that does not.
+    WriteFile(fixture.shaders() / "Plain.hlsl", std::string(50000, 'x') + "\nend\n");
+    WriteFile(fixture.shaders() / "Noisy.hlsl", Noise(20000, 7));
+    const Variant plain{ "Plain.hlsl" }, noisy{ "Noisy.hlsl" };
+    std::string plainText, noisyText;
+    Boot(fixture, [&](ShaderStore& store) {
+        plainText = Text(Run(store, fixture, plain));
+        noisyText = Text(Run(store, fixture, noisy));
+        CHECK(plainText.size() > 50000);
+        // In the same start, the bytes come back from the pack.
+        CHECK(Text(Run(store, fixture, plain)) == plainText);
+        const auto info = store.IndexInfo();
+        CHECK(info.artifacts == 2);
+        CHECK(info.rawBytes == plainText.size() + noisyText.size());
+        CHECK(info.storedBytes < noisyText.size() + plainText.size() / 20);
+    });
+    CHECK(PackFiles(fixture.cache()).size() == 1);
+    CHECK(!fs::exists(fixture.cache() / "cas"));
+    CHECK(PackBytes(fixture.cache()) < noisyText.size() + plainText.size() / 10);
+    Boot(fixture, [&](ShaderStore& store) {
+        const auto a = Run(store, fixture, plain);
+        const auto b = Run(store, fixture, noisy);
+        CHECK(a.outcome == ShaderStoreOutcome::Hit && Text(a) == plainText);
+        CHECK(b.outcome == ShaderStoreOutcome::Hit && Text(b) == noisyText);
+    });
+    // Level zero stores new artifacts raw and still reads the compressed ones.
+    WriteFile(fixture.shaders() / "Raw.hlsl", std::string(30000, 'y') + "\n");
+    auto options = fixture.Options();
+    options.compressionLevel = 0;
+    std::string rawText;
+    const auto packBytes = PackBytes(fixture.cache());
+    Boot(options, [&](ShaderStore& store) {
+        CHECK(Text(Run(store, fixture, plain)) == plainText);
+        rawText = Text(Run(store, fixture, Variant{ "Raw.hlsl" }));
+    });
+    CHECK(PackBytes(fixture.cache()) >= packBytes + rawText.size());
+    Boot(fixture, [&](ShaderStore& store) { CHECK(Text(Run(store, fixture, Variant{ "Raw.hlsl" })) == rawText); });
+}
+
+void TestPacksRollOver() {
+    Fixture fixture;
+    auto options = fixture.Options();
+    options.packBytes = 4096;
+    std::vector<std::string> texts;
+    Boot(options, [&](ShaderStore& store) {
+        for (int i = 0; i < 20; ++i) {
+            WriteFile(fixture.shaders() / ("S" + std::to_string(i) + ".hlsl"), Noise(1000, 100 + i));
+            texts.push_back(Text(Run(store, fixture, Variant{ "S" + std::to_string(i) + ".hlsl" })));
+        }
+    });
+    const auto packs = PackFiles(fixture.cache());
+    CHECK(packs.size() >= 5);
+    for (const auto& pack : packs) CHECK(fs::file_size(pack) <= 4096);
+    Boot(options, [&](ShaderStore& store) {
+        CHECK(store.IndexInfo().packsAtStart == packs.size());
+        CHECK(store.IndexInfo().recoveredAtStart == 0);
+        for (int i = 0; i < 20; ++i) {
+            const auto result = Run(store, fixture, Variant{ "S" + std::to_string(i) + ".hlsl" });
+            CHECK(result.outcome == ShaderStoreOutcome::Hit);
+            CHECK(Text(result) == texts[i]);
+        }
+        CHECK(g_compiles == 0);
+    });
+}
+
+void TestKilledProcessKeepsItsAppends() {
+    Fixture fixture;
+    for (const auto* name : { "A", "B", "C", "D" }) WriteFile(fixture.shaders() / (std::string(name) + ".hlsl"), Noise(2000, name[0]));
+    const Variant a{ "A.hlsl" }, b{ "B.hlsl" }, c{ "C.hlsl" }, d{ "D.hlsl" };
+    std::optional<IndexCopy> saved;
+    Boot(fixture, [&](ShaderStore& store) {
+        Run(store, fixture, a);
+        store.Flush();
+        saved.emplace(fixture.cache());
+        Run(store, fixture, b);
+        Run(store, fixture, c);
+    });
+    // The process was killed before it saved again: the index knows only A, and the last append was torn.
+    saved->Restore();
+    const auto pack = PackFiles(fixture.cache()).back();
+    const auto bytes = ReadFile(pack);
+    WriteFile(pack, bytes + bytes.substr(16, 40));
+    Boot(fixture, [&](ShaderStore& store) {
+        CHECK(store.IndexInfo().recoveredAtStart == 2);
+        CHECK(Run(store, fixture, a).outcome == ShaderStoreOutcome::Hit);
+        // B's and C's records were lost with the index, but their artifacts were read from the pack's tail.
+        CHECK(Run(store, fixture, b).outcome == ShaderStoreOutcome::Absorbed);
+        CHECK(Run(store, fixture, c).outcome == ShaderStoreOutcome::Absorbed);
+        CHECK(g_compiles == 0);
+        // A new artifact goes over the torn record.
+        CHECK(Run(store, fixture, d).outcome == ShaderStoreOutcome::Compiled);
+    });
+    Boot(fixture, [&](ShaderStore& store) {
+        for (const auto& variant : { a, b, c, d }) CHECK(Run(store, fixture, variant).outcome == ShaderStoreOutcome::Hit);
+        CHECK(g_compiles == 0);
+    });
+    // Killed in the middle of writing a record: that one artifact is rebuilt, and the one before it is kept.
+    WriteFile(fixture.shaders() / "E.hlsl", Noise(2000, 'E'));
+    WriteFile(fixture.shaders() / "F.hlsl", Noise(2000, 'F'));
+    const Variant e{ "E.hlsl" }, f{ "F.hlsl" };
+    Boot(fixture, [&](ShaderStore& store) {
+        Run(store, fixture, a);
+        store.Flush();
+        saved.emplace(fixture.cache());
+        Run(store, fixture, e);
+        Run(store, fixture, f);
+    });
+    saved->Restore();
+    const auto last = PackFiles(fixture.cache()).back();
+    fs::resize_file(last, fs::file_size(last) - 500);
+    Boot(fixture, [&](ShaderStore& store) {
+        CHECK(store.IndexInfo().recoveredAtStart == 1);
+        CHECK(Run(store, fixture, e).outcome == ShaderStoreOutcome::Absorbed);
+        CHECK(Run(store, fixture, f).outcome == ShaderStoreOutcome::Compiled);
+        CHECK(g_compiles == 1);
+    });
+    Boot(fixture, [&](ShaderStore& store) {
+        for (const auto& variant : { a, b, c, d, e, f }) CHECK(Run(store, fixture, variant).outcome == ShaderStoreOutcome::Hit);
+    });
+}
+
+void TestConcurrentWritersAppend() {
+    Fixture fixture;
+    // The defines reach the text, so every variant is its own artifact.
+    WriteFile(fixture.shaders() / "Root.hlsl", "USE_DEFINES\n" + Noise(600, 3));
+    auto options = fixture.Options();
+    options.packBytes = 8192;  // Many rollovers while threads append.
+    constexpr int kThreads = 16, kPerThread = 20;
+    std::vector<std::string> texts(kThreads * kPerThread);
+    const auto hammer = [&](ShaderStore& store, ShaderStoreOutcome expected) {
+        std::vector<std::thread> threads;
+        std::atomic<bool> go{};
+        std::atomic<int> wrong{};
+        for (int t = 0; t < kThreads; ++t) {
+            threads.emplace_back([&, t] {
+                while (!go) std::this_thread::yield();
+                for (int i = 0; i < kPerThread; ++i) {
+                    const int n = t * kPerThread + i;
+                    const auto result = Run(store, fixture, Variant{ "Root.hlsl", "DEFINE_" + std::to_string(n) });
+                    const auto text = Text(result);
+                    if (result.outcome != expected || text.find("DEFINE_" + std::to_string(n) + "\n") == std::string::npos) ++wrong;
+                    if (expected == ShaderStoreOutcome::Compiled) texts[n] = text;
+                    else if (texts[n] != text) ++wrong;
+                }
+            });
+        }
+        go = true;
+        for (auto& thread : threads) thread.join();
+        CHECK(wrong == 0);
+    };
+    Boot(options, [&](ShaderStore& store) {
+        hammer(store, ShaderStoreOutcome::Compiled);
+        CHECK(g_compiles == kThreads * kPerThread);
+        CHECK(store.Stats().notSaved == 0);
+        CHECK(store.IndexInfo().artifacts == kThreads * kPerThread);
+    });
+    CHECK(PackFiles(fixture.cache()).size() > 4);
+    Boot(options, [&](ShaderStore& store) {
+        hammer(store, ShaderStoreOutcome::Hit);
+        CHECK(g_compiles == 0);
+        CHECK(g_preprocesses == 0);
+    });
+}
+
+void TestCompactionReclaimsSpace() {
+    Fixture fixture;
+    auto options = fixture.Options();
+    options.packBytes = 4096;
+    constexpr int kCount = 30, kKept = 5;
+    std::vector<ShaderStoreHash> keys;
+    std::vector<std::string> texts;
+    const auto variant = [](int i) { return Variant{ "S" + std::to_string(i) + ".hlsl" }; };
+    Boot(options, [&](ShaderStore& store) {
+        for (int i = 0; i < kCount; ++i) {
+            WriteFile(fixture.shaders() / variant(i).rootName, Noise(1000, 500 + i));
+            const auto result = Run(store, fixture, variant(i));
+            keys.push_back(result.compileKey);
+            texts.push_back(Text(result));
+        }
+    });
+    const uint64_t before = PackBytes(fixture.cache());
+    // Most artifacts become dead bytes. Nothing is reclaimed until the next start.
+    Boot(options, [&](ShaderStore& store) {
+        CHECK(store.IndexInfo().packsCompacted == 0);
+        for (int i = kKept; i < kCount; ++i) store.RemoveArtifact(keys[i]);
+    });
+    CHECK(PackBytes(fixture.cache()) == before);
+    Boot(options, [&](ShaderStore& store) {
+        const auto info = store.IndexInfo();
+        CHECK(info.packsCompacted > 0);
+        CHECK(info.reclaimedBytes > 0);
+        CHECK(info.artifacts == kKept);
+        CHECK(store.MeasureArtifacts().bytes < before / 2);
+        for (int i = 0; i < kKept; ++i) {
+            const auto result = Run(store, fixture, variant(i));
+            CHECK(result.outcome == ShaderStoreOutcome::Hit);
+            CHECK(Text(result) == texts[i]);
+        }
+        CHECK(g_compiles == 0);
+        for (int i = kKept; i < kCount; ++i) CHECK(Run(store, fixture, variant(i)).miss == ShaderStoreMiss::ArtifactInvalid);
+    });
+    CHECK(PackBytes(fixture.cache()) < before * 2);
+    Boot(options, [&](ShaderStore& store) {
+        CHECK(store.IndexInfo().packsCompacted == 0);
+        for (int i = 0; i < kCount; ++i) CHECK(Text(Run(store, fixture, variant(i))) == texts[i]);
+        CHECK(g_compiles == 0);
+    });
+    // Killed during compaction: the copies are in a pack the index does not know, and the old pack is still there.
+    const auto first = PackFiles(fixture.cache()).front();
+    auto copy = ReadFile(first);
+    const uint32_t id = 0x999;
+    std::memcpy(copy.data() + 8, &id, sizeof(id));
+    WriteFile(fixture.cache() / "packs" / "00000999.pack", copy);
+    Boot(options, [&](ShaderStore& store) {
+        CHECK(store.IndexInfo().packsCompacted >= 1);
+        for (int i = 0; i < kCount; ++i) CHECK(Run(store, fixture, variant(i)).outcome == ShaderStoreOutcome::Hit);
+    });
+    CHECK(!fs::exists(first));
+    Boot(options, [&](ShaderStore& store) {
+        CHECK(store.IndexInfo().packsCompacted == 0);
+        for (int i = 0; i < kCount; ++i) CHECK(Text(Run(store, fixture, variant(i))) == texts[i]);
+    });
+}
+
+void TestEvictionCompactsThePacks() {
+    Fixture fixture;
+    auto options = fixture.Options();
+    options.packBytes = 4096;
+    options.keepGenerations = 1;
+    std::vector<std::string> texts;
+    Boot(options, [&](ShaderStore& store) {
+        for (int i = 0; i < 20; ++i) {
+            WriteFile(fixture.shaders() / ("S" + std::to_string(i) + ".hlsl"), Noise(1000, 900 + i));
+            texts.push_back(Text(Run(store, fixture, Variant{ "S" + std::to_string(i) + ".hlsl" })));
+        }
+    });
+    // Only S0 is used from now on. Over a small cap, the rest go, and their packs with them.
+    Boot(options, [&](ShaderStore& store) { CHECK(Run(store, fixture, Variant{ "S0.hlsl" }).outcome == ShaderStoreOutcome::Hit); });
+    options.maxBytes = 1000;
+    Boot(options, [&](ShaderStore& store) {
+        const auto info = store.IndexInfo();
+        CHECK(info.artifactsEvicted == 19);
+        CHECK(info.packsCompacted > 0);
+        CHECK(store.MeasureArtifacts().bytes < 4096 * 2);
+        const auto result = Run(store, fixture, Variant{ "S0.hlsl" });
+        CHECK(result.outcome == ShaderStoreOutcome::Hit);
+        CHECK(Text(result) == texts[0]);
+    });
+}
+
+void TestReadOnlyStoreWritesNothing() {
+    Fixture fixture;
+    WriteBasicShaders(fixture);
+    WriteFile(fixture.shaders() / "Other.hlsl", "other\n");
+    std::string text;
+    Boot(fixture, [&](ShaderStore& store) { text = Text(Run(store, fixture)); });
+    const auto pack = PackFiles(fixture.cache()).front();
+    const auto packBefore = ReadFile(pack);
+    auto options = fixture.Options();
+    options.readOnly = true;
+    {
+        ResetCounts();
+        ShaderStore reader(options);
+        CHECK(!reader.OwnsIndex());
+        // A game started while the tool runs still owns the cache.
+        {
+            ShaderStore game(fixture.Options());
+            CHECK(game.OwnsIndex());
+        }
+        const auto hit = Run(reader, fixture);
+        CHECK(hit.outcome == ShaderStoreOutcome::Hit);
+        CHECK(Text(hit) == text);
+        CHECK(Run(reader, fixture, Variant{ "Other.hlsl" }).outcome == ShaderStoreOutcome::Compiled);
+        CHECK(reader.Stats().notSaved == 1);
+        int seen = 0;
+        reader.ForEachArtifact([&](const ShaderStoreHash& key, uint8_t format, std::span<const std::byte> binary) {
+            ++seen;
+            CHECK(key == hit.compileKey);
+            CHECK(format == 1);
+            CHECK(std::string(reinterpret_cast<const char*>(binary.data()), binary.size()) == text);
+        });
+        CHECK(seen == 1);
+        std::vector<std::byte> bytes;
+        CHECK(reader.ReadArtifact(hit.compileKey, 1, bytes));
+        CHECK(std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size()) == text);
+        CHECK(!reader.ReadArtifact(hit.compileKey, 2, bytes));
+        reader.Flush();
+    }
+    CHECK(ReadFile(pack) == packBefore);
+    CHECK(PackFiles(fixture.cache()).size() == 1);
+}
+
+// The startup cost of an index the size of the game's, about 7,000 artifacts. Printed, not checked.
+void TestIndexLoadTimeAtGameSize() {
+    Fixture fixture;
+    WriteFile(fixture.shaders() / "Root.hlsl", "#include \"Common.hlsli\"\nUSE_DEFINES\n" + Noise(200, 11));
+    WriteFile(fixture.shaders() / "Common.hlsli", "common\n");
+    constexpr int kVariants = 7000;
+    Boot(fixture, [&](ShaderStore& store) {
+        for (int i = 0; i < kVariants; ++i) Run(store, fixture, Variant{ "Root.hlsl", "V" + std::to_string(i) });
+    });
+    Boot(fixture, [&](ShaderStore& store) {
+        const auto info = store.IndexInfo();
+        CHECK(info.variants == kVariants);
+        CHECK(info.artifacts == kVariants);
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < kVariants; ++i) CHECK(Run(store, fixture, Variant{ "Root.hlsl", "V" + std::to_string(i) }).outcome == ShaderStoreOutcome::Hit);
+        const auto hits = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+        std::printf("7000 variants: index load %llu us, pack open %llu us, evict and compact %llu us, %d hits in %lld us, index %llu KB\n",
+            static_cast<unsigned long long>(info.indexLoadMicroseconds), static_cast<unsigned long long>(info.packScanMicroseconds),
+            static_cast<unsigned long long>(info.compactMicroseconds), kVariants, static_cast<long long>(hits),
+            static_cast<unsigned long long>(fs::file_size(fixture.cache() / "index.a") >> 10));
+    });
+}
+
 }  // namespace
 
 int main() {
@@ -955,6 +1328,14 @@ int main() {
     TestPathsOutsideTheRootStillWork();
     TestNonAsciiPaths();
     TestEmptyIncludeIsNotMissing();
+    TestArtifactsRoundTripCompressed();
+    TestPacksRollOver();
+    TestKilledProcessKeepsItsAppends();
+    TestConcurrentWritersAppend();
+    TestCompactionReclaimsSpace();
+    TestEvictionCompactsThePacks();
+    TestReadOnlyStoreWritesNothing();
+    TestIndexLoadTimeAtGameSize();
     std::puts("ShaderStore tests passed");
     return 0;
 }

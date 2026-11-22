@@ -5,6 +5,10 @@ endif()
 
 # The persistent shader cache. It needs no renderer, RHI or compiler, so a host without
 # the rest of this module can still build it. xxhash.h is private and fully inlined.
+# zstd compresses the artifacts. The host provides it, as vcpkg's zstd port does.
+if(NOT TARGET zstd::libzstd)
+    find_package(zstd CONFIG REQUIRED)
+endif()
 add_library(ORGShaderStore STATIC
     ${CMAKE_CURRENT_LIST_DIR}/../src/ShaderStore.cpp
     ${CMAKE_CURRENT_LIST_DIR}/../include/ORGModuleServices/ShaderStore.h)
@@ -18,3 +22,4 @@ target_include_directories(ORGShaderStore
     PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}/../third_party/xxhash)
 target_compile_definitions(ORGShaderStore PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(ORGShaderStore PRIVATE zstd::libzstd)
