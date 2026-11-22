@@ -80,8 +80,9 @@ private:
 // The program service: programs are built here, several at once on an executor. The owner thread never builds a program and
 // never waits for one, except in the setup join.
 //
-// The pool's builds wait for their compiles. When the compiles run in the pool's own domain, the pool takes at most half of
-// that domain's workers (org::async::PlanWaitingPool), so a compile always has a thread.
+// The pool's builds compile on their own lanes, not through the compiler's submitter. A build can still join a compile that
+// another thread owns. When the compiles run in the pool's own domain, the pool takes at most half of that domain's workers
+// (org::async::PlanWaitingPool), so such a compile always has a thread.
 //
 // Owner thread: Queue, Collect, Pending, JoinSetup. Post and the slots' reads are for any thread.
 class ProgramService {

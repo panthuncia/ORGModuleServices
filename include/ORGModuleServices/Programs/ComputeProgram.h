@@ -51,7 +51,8 @@ struct ComputeProgram final : ComputeKernel {
         bool commonDefines = true;
     };
 
-    // Null and logged on failure. Blocks on a compile the cache does not have, so call it at setup, not per frame.
+    // Null and logged on failure. A compile the cache does not have runs on the calling thread (ShaderCompiler::CompileHere),
+    // so call it at setup or on a build thread, not per frame.
     static std::shared_ptr<const ComputeProgram> Load(rhi::Device device, const Desc& desc);
 
     // Records nothing when the constants are longer than constantWords or a group count is zero.

@@ -77,8 +77,9 @@ struct RasterProgram {
         std::vector<std::pair<std::wstring, std::wstring>> pixelStageDefines;
     };
 
-    // Compiles both stages or finds them cached, and makes the pipeline. Null, logged, on failure. Blocks on an uncached
-    // compile, so call it at setup, not per frame.
+    // Compiles both stages or finds them cached, and makes the pipeline. Null, logged, on failure. An uncached compile runs
+    // on the calling thread (ShaderCompiler::CompileHere), not through the compiler's submitter, so call it at setup or on a
+    // build thread, not per frame.
     static std::shared_ptr<const RasterProgram> Load(rhi::Device device, const Desc& desc);
 
     // Compiles both stages into the shader store without making a pipeline, so a later Load finds them. Blocks. False when

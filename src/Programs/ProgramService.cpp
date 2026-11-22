@@ -76,7 +76,8 @@ void ReportProgramNotBuilt(const ProgramSlot& slot) {
 
 // A few lanes that take jobs from one queue, so several builds run at once.
 //
-// A build waits for its compiles. PlanWaitingPool sizes the pool from the compile domain, so the compiles always keep a thread.
+// A build compiles on its own lane (CompileHere). It can still join a compile another thread owns, so PlanWaitingPool sizes
+// the pool from the compile domain and that compile keeps a thread.
 class ProgramService::Pool {
 public:
     explicit Pool(const ProgramService& service) {

@@ -188,7 +188,9 @@ std::vector<std::byte> CompileStage(ShaderCompiler& compiler, const std::string&
         build::Log(ProgramLogLevel::Error, std::format("Missing shader source {}", path.string()));
         return {};
     }
-    const auto artifact = compiler.Compile(StageRequest(path, bytes, entry, target, stages));
+    // The compile runs on this thread. A host may route the compiler's submitter to a queue of its own bulk work,
+    // and a build waiting there would wait behind all of it.
+    const auto artifact = compiler.CompileHere(StageRequest(path, bytes, entry, target, stages));
     if (!artifact) {
         build::Log(failureLevel,
             std::format("{} build of {} ({}) failed:\n{}", ShaderFormatName(build::Format()), source, build::Narrow(entry), artifact.diagnostics.substr(0, 2000)));

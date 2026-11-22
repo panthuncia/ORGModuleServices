@@ -148,7 +148,8 @@ std::shared_ptr<const ComputeProgram> ComputeProgram::Load(rhi::Device device, c
         return {};
     }
     const std::string entry = build::Narrow(desc.entry);
-    const auto artifact = compiler->Compile(MakeComputeRequest(desc, path, bytes));
+    // On this thread, as a raster program's stages: not behind the compiler's submitter queue.
+    const auto artifact = compiler->CompileHere(MakeComputeRequest(desc, path, bytes));
     if (!artifact) {
         build::Log(ProgramLogLevel::Error,
             std::format("{} build of {} ({}) failed:\n{}", ShaderFormatName(build::Format()), desc.source, entry, artifact.diagnostics.substr(0, 2000)));
