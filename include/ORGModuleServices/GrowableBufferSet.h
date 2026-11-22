@@ -114,6 +114,11 @@ public:
 
     /** @brief Process-unique: moves exactly when any named version or latch block does. */
     [[nodiscard]] std::uint64_t Serial() const noexcept { return m_serial; }
+    /**
+     * @brief The set's buffer moves this set's device addresses follow (GrowableBufferSet::NoteBuffersMoved). A set below
+     * GrowableBufferSet::MovedEpoch may name addresses a buffer had before it moved. 0 for a texture set.
+     */
+    [[nodiscard]] std::uint64_t AddressEpoch() const noexcept { return m_addressEpoch; }
     [[nodiscard]] bool Names(GrowableHandle handle) const noexcept { return handle.index < m_entries.size() && m_entries[handle.index].version; }
     [[nodiscard]] bool Names(const VersionedBuffer& buffer) const noexcept { return IndexOf(buffer) != UINT32_MAX; }
     [[nodiscard]] bool Names(const std::shared_ptr<VersionedBuffer>& buffer) const noexcept { return buffer && Names(*buffer); }
@@ -157,6 +162,7 @@ private:
     struct NamedTexture;
     [[nodiscard]] const NamedTexture* TextureOf(const VersionedTexture& texture) const noexcept;
     std::uint64_t m_serial = 0;
+    std::uint64_t m_addressEpoch = 0;
     std::vector<NamedEntry> m_entries;                       // by handle (version null: not named)
     std::vector<std::weak_ptr<VersionedBuffer>> m_buffers;   // by handle
     std::vector<std::pair<const void*, std::uint32_t>> m_byKey;  // (VersionedBuffer::Key, handle), sorted
@@ -286,6 +292,17 @@ public:
      */
     [[nodiscard]] bool ShrinkPending(ShrinkWindow::Clock::time_point now = ShrinkWindow::Clock::now()) const;
 
+    /**
+     * @brief Any thread: the host moved buffers (a defragmentation while the GPU was idle), so device addresses the set names may
+     * be old. The producer's next seal reads every named version's address again and names a new set, whose AddressEpoch is at
+     * least the returned value. Lock-free.
+     */
+    std::uint64_t NoteBuffersMoved() noexcept { return m_movedEpoch.fetch_add(1, std::memory_order_acq_rel) + 1; }
+    /** @brief Any thread: how many NoteBuffersMoved calls there were. A sealed set whose AddressEpoch is below it may name old addresses. */
+    [[nodiscard]] std::uint64_t MovedEpoch() const noexcept { return m_movedEpoch.load(std::memory_order_acquire); }
+    /** @brief Producer: whether a buffer move is not followed by a seal yet. A producer that skips its seals seals again for this. */
+    [[nodiscard]] bool AddressesMoved() const noexcept { return MovedEpoch() != m_addressEpoch; }
+
     /** @brief Producer: counters since the last call (batches posted, buffers grown, failures, latch blocks made, seals). */
     struct Stats {
         std::uint64_t batches = 0, grown = 0, failed = 0, latches = 0, sealed = 0, kept = 0;
@@ -313,6 +330,8 @@ private:
 
     void TakeRegistered();
     void Settle();
+    // Reads the named versions' addresses again after NoteBuffersMoved.
+    void RefreshAddresses();
     NamedEntry EntryOf(const Slot& slot, std::shared_ptr<const BufferVersion> version, std::optional<std::uint64_t> stamp, BackingLease lease) const;
     // One batch: each (slot, units) a version of exactly those units.
     bool Post(const std::vector<std::pair<std::uint32_t, std::uint64_t>>& asks);
@@ -321,12 +340,14 @@ private:
     // Any thread: registrations not yet taken (Treiber stack) and the handles handed out.
     std::atomic<Registered*> m_registered{nullptr};
     std::atomic<std::uint32_t> m_nextHandle{0}, m_nextLatch{0};
+    std::atomic<std::uint64_t> m_movedEpoch{0};  // NoteBuffersMoved calls
     // The producer's.
     std::vector<Slot> m_slots;
     std::vector<LatchSlot> m_latchSlots;
     std::vector<std::pair<const void*, std::uint32_t>> m_handles;  // (VersionedBuffer::Key, handle), sorted
     std::shared_ptr<Batch> m_batch;  // in flight
     bool m_changed = true;           // since the last sealed set
+    std::uint64_t m_addressEpoch = 0;  // the moves `current`'s addresses follow
     Sealed m_last;                   // the last sealed set: returned again while nothing changed
     std::string m_failure;           // the last batch's, until a seal reports it
     Stats m_stats;

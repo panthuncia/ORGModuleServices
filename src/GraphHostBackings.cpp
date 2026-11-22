@@ -43,6 +43,8 @@ BackingAllocation AllocateGraphHostBacking(const GraphHostAccess& host, const Ba
             buffer = Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, request.capacityClass, request.flags.unorderedAccess);
         }
         if (!request.name.empty()) buffer->SetName(std::string(request.name).c_str());
+        // Before Materialize: the group picks the block pool the allocation comes from.
+        if (request.flags.perFrame) buffer->SetMemoryGroup(MemoryGroup::PerFrame);
         buffer->Materialize();
         allocation.address = request.flags.deviceAddress ? GraphHostDeviceAddress(host, *buffer) : 0;
         assert(allocation.address % 16 == 0);  // row and block offsets keep 16-byte alignment

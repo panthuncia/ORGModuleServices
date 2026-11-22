@@ -328,6 +328,20 @@ void GrowableBufferSet::Settle() {
     m_batch.reset();
 }
 
+void GrowableBufferSet::RefreshAddresses() {
+    const std::uint64_t epoch = m_movedEpoch.load(std::memory_order_acquire);
+    if (epoch == m_addressEpoch) return;
+    // Loaded before the addresses are read: the moves up to it were committed before NoteBuffersMoved was called.
+    if (m_hooks.addressOf)
+        for (auto& slot : m_slots) {
+            if (!slot.registration || !slot.registration->address || !slot.current.version || !slot.current.version->buffer) continue;
+            // The entry keeps its serial: the version is the same, only its memory moved. The new set's serial tells readers.
+            slot.current.deviceAddress = m_hooks.addressOf(*slot.current.version->buffer);
+        }
+    m_addressEpoch = epoch;
+    m_changed = true;
+}
+
 GrowableBufferSet::Build GrowableBufferSet::Begin() {
     TakeRegistered();
     Settle();
@@ -432,6 +446,7 @@ bool GrowableBufferSet::Post(const std::vector<std::pair<std::uint32_t, std::uin
 GrowableBufferSet::Sealed GrowableBufferSet::Seal(Build&& build) {
     // Registered between Begin and the requirements naming them.
     TakeRegistered();
+    RefreshAddresses();
     std::vector<std::uint32_t> unmet;
     for (std::uint32_t i = 0; i < build.m_required.size(); ++i) {
         const auto& required = build.m_required[i];
@@ -507,6 +522,7 @@ GrowableBufferSet::Sealed GrowableBufferSet::Seal(Build&& build) {
     }
     auto named = std::make_shared<NamedVersions>();
     named->m_serial = NextSerial();
+    named->m_addressEpoch = m_addressEpoch;
     named->m_entries.resize(m_slots.size());
     named->m_buffers.resize(m_slots.size());
     for (std::uint32_t i = 0; i < m_slots.size(); ++i) {

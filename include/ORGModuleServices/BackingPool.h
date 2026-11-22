@@ -68,6 +68,9 @@ struct BackingFlags {
     bool unorderedAccess = false;
     bool indirectArguments = false;  // BasicRenderer: its indexed structured buffer's counter/argument variant
     bool deviceAddress = false;      // the allocation reports its device address (Backing::address)
+    // A backing made and reused about once a frame: ORG keeps it in blocks of its own (org::MemoryGroup::PerFrame), apart from
+    // long-lived buffers and textures, and never moves it.
+    bool perFrame = false;
     friend constexpr bool operator==(const BackingFlags&, const BackingFlags&) = default;
 };
 
