@@ -321,6 +321,9 @@ public:
         }
         return result;
     }
+    // Releases the publications the frame owner retired since the last call: the one it replaced at its last selection, or
+    // one it rejected. Collect does this too, but it runs only when a revision completes, so call it once a frame.
+    void ReclaimRetired() noexcept { m_exchange.ReclaimRetired(); }
     [[nodiscard]] std::uint64_t LatestSequence() const noexcept { return m_latestSequence; }
     [[nodiscard]] std::size_t Pending() const noexcept { return m_pending.size(); }
     [[nodiscard]] const Stats& GetStats() const noexcept { return m_stats; }
