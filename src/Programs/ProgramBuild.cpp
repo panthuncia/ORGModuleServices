@@ -1,7 +1,11 @@
 #include <ORGModuleServices/Programs/ProgramBuild.h>
 
 #include <ORGModuleServices/Programs/ShaderTarget.h>
+#include <ORGModuleServices/ShaderReflection.h>
 #include <ORGModuleServices/ShaderStore.h>
+
+#include <algorithm>
+#include <cstdlib>
 
 #include <cstring>
 #include <fstream>
@@ -90,7 +94,55 @@ ShaderCompileRequest MakeRequest(const std::filesystem::path& path, std::span<co
             request.defines.push_back({ std::move(name), std::move(value) });
     for (const auto& [name, value] : defines)
         request.defines.push_back({ name, value });
+    if (BoundPushTables())
+        request.defines.push_back({ L"ORG_BOUND_PUSH_TABLES", L"1" });
     return request;
+}
+
+bool BoundPushTables() {
+    static const bool off = [] {
+        char* value = nullptr;
+        size_t length = 0;
+        const bool zero = _dupenv_s(&value, &length, "ORG_BOUND_PUSH_TABLES") == 0 && value && value[0] == '0';
+        std::free(value);
+        return zero;
+    }();
+    if (off)
+        return false;
+    if (Format() == ShaderBinaryFormat::Dxil)
+        return true;
+    const auto& spirvBound = CurrentProgramEnvironment().spirvBoundPushTables;
+    return spirvBound && spirvBound();
+}
+
+std::vector<rhi::LayoutBindingRange> BoundPushTableRanges(std::initializer_list<std::span<const std::byte>> a_stages, uint32_t a_constantWords,
+    rhi::ShaderStage a_visibility) {
+    std::vector<rhi::LayoutBindingRange> ranges;
+    if (!BoundPushTables())
+        return ranges;
+    for (const auto stage : a_stages) {
+        // DXIL registers and DXC's SPIR-V bindings agree here: program builds shift no register class, so register(b<w>, space11)
+        // is set 11, binding w in SPIR-V, the numbers BasicRHI's lowering matches the range against.
+        ShaderReflection reflection;
+        if (!reflection.Parse(stage))
+            continue;
+        for (const auto& binding : reflection.bindings) {
+            if (binding.kind != ShaderReflection::BindingKind::ConstantBuffer || binding.set != kBoundPushTableSpace || binding.binding >= a_constantWords)
+                continue;
+            if (std::ranges::any_of(ranges, [&](const auto& a_range) { return a_range.binding == binding.binding; }))
+                continue;
+            rhi::LayoutBindingRange range{};
+            range.set = kBoundPushTableSpace;
+            range.binding = binding.binding;
+            range.count = 1;
+            range.visibility = a_visibility;
+            range.source = rhi::LayoutRangeSource::PushIndex;
+            range.addressRootIndex = 0;
+            range.addressOffset32 = binding.binding;
+            ranges.push_back(range);
+        }
+    }
+    return ranges;
 }
 
 std::string Narrow(std::wstring_view text) {

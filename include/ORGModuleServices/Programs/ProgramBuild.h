@@ -55,6 +55,9 @@ struct ProgramEnvironment {
     std::function<void(const char*)> labelPipelines;
     // The programs' messages. Optional.
     std::function<void(ProgramLogLevel, std::string_view)> log;
+    // Whether SPIR-V builds take bound push tables: the Vulkan device binds PushIndex constant buffers as real uniform buffers
+    // (rhi::vulkan::BoundUniformBuffers). Empty: they do not. DXIL builds always take them.
+    std::function<bool()> spirvBoundPushTables;
 };
 
 // Setup, once, before any program loads and before any other thread reads it.
@@ -95,6 +98,21 @@ ShaderCompileRequest MakeRequest(const std::filesystem::path& path, std::span<co
 
 // Narrows an ASCII name, such as an entry point.
 std::string Narrow(std::wstring_view text);
+
+// Bound push tables. A program build gets ORG_BOUND_PUSH_TABLES defined: DXIL always, SPIR-V when the environment's
+// spirvBoundPushTables says the device binds them. A constant buffer a stage then declares at register(b<w>, space
+// kBoundPushTableSpace) is bound at the heap slot pushed in word w of the program's push constants: a descriptor table on D3D12,
+// a push descriptor uniform buffer on Vulkan (DXC puts it at set kBoundPushTableSpace, binding w). On NVIDIA its values are free
+// operands, where a heap-indexed constant buffer's cost a register each. Other SPIR-V builds read every constant buffer from the
+// heap. ORG_BOUND_PUSH_TABLES=0 in the environment turns them off, for A/B runs.
+inline constexpr uint32_t kBoundPushTableSpace = 11;
+
+// Whether this environment's builds take bound push tables.
+bool BoundPushTables();
+
+// The layout ranges for the bound push tables a_stages declare (DXIL or SPIR-V reflection), at most a_constantWords of them.
+std::vector<rhi::LayoutBindingRange> BoundPushTableRanges(std::initializer_list<std::span<const std::byte>> a_stages, uint32_t a_constantWords,
+    rhi::ShaderStage a_visibility);
 
 } // namespace program_build
 

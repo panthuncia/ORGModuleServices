@@ -10,6 +10,7 @@
 #include "Render/PreparedPass.h"
 #include "Resources/Buffers/Buffer.h"
 
+#include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <span>
@@ -161,8 +162,9 @@ std::shared_ptr<const ComputeProgram> ComputeProgram::Load(rhi::Device device, c
     rhi::PushConstantRangeDesc constants{};
     constants.visibility = rhi::ShaderStage::Compute;
     constants.num32BitValues = desc.constantWords;
-    if (device.CreatePipelineLayout(rhi::PipelineLayoutDesc{ .pushConstants = { &constants, 1 }, .flags = rhi::PipelineLayoutFlags::PF_None }, program->layout) !=
-        rhi::Result::Ok) {
+    const auto tables = build::BoundPushTableRanges({ artifact.binary }, desc.constantWords, rhi::ShaderStage::Compute);
+    if (device.CreatePipelineLayout(rhi::PipelineLayoutDesc{ .ranges = { tables.data(), static_cast<std::uint32_t>(tables.size()) }, .pushConstants = { &constants, 1 },
+            .flags = rhi::PipelineLayoutFlags::PF_None }, program->layout) != rhi::Result::Ok) {
         build::Log(ProgramLogLevel::Error, std::format("{}: the pipeline layout could not be created", desc.source));
         return {};
     }

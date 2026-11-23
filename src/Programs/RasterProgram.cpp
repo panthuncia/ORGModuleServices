@@ -275,7 +275,10 @@ std::shared_ptr<const RasterProgram> RasterProgram::Load(rhi::Device device, con
     rhi::PushConstantRangeDesc constants{};
     constants.visibility = rhi::ShaderStage::AllGraphics;
     constants.num32BitValues = desc.constantWords;
-    if (device.CreatePipelineLayout(rhi::PipelineLayoutDesc{ .pushConstants = { &constants, desc.constantWords ? 1u : 0u }, .flags = rhi::PipelineLayoutFlags::PF_None },
+    // The bound push tables either stage declares (ProgramBuild.h).
+    const auto tables = build::BoundPushTableRanges({ vertex, pixel }, desc.constantWords, rhi::ShaderStage::AllGraphics);
+    if (device.CreatePipelineLayout(rhi::PipelineLayoutDesc{ .ranges = { tables.data(), static_cast<std::uint32_t>(tables.size()) },
+            .pushConstants = { &constants, desc.constantWords ? 1u : 0u }, .flags = rhi::PipelineLayoutFlags::PF_None },
             program->layout) != rhi::Result::Ok) {
         build::Log(ProgramLogLevel::Error, std::format("{}: the pipeline layout could not be created", stages.label));
         return {};

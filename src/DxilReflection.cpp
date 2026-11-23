@@ -86,26 +86,30 @@ bool ReflectDxil(std::span<const std::byte> a_dxil, ShaderReflection& a_out, con
         D3D12_SHADER_INPUT_BIND_DESC bind{};
         if (FAILED(reflector->GetResourceBindingDesc(i, &bind)))
             continue;
+        // The register space is the set. Only space 0 is shifted as the SPIR-V builds shift registers; other spaces keep
+        // their registers as bindings.
+        const uint32_t set = bind.Space;
+        const auto shifted = [&](uint32_t a_shift) { return (set == 0 ? a_shift : 0u) + bind.BindPoint; };
         switch (bind.Type) {
         case D3D_SIT_CBUFFER:
             // Push data, not a binding.
-            if (bind.BindPoint == a_layout.pushConstantRegister)
+            if (set == 0 && bind.BindPoint == a_layout.pushConstantRegister)
                 continue;
-            a_out.bindings.push_back({ 0, a_layout.constantBufferShift + bind.BindPoint, Kind::ConstantBuffer });
+            a_out.bindings.push_back({ set, shifted(a_layout.constantBufferShift), Kind::ConstantBuffer });
             break;
         case D3D_SIT_TEXTURE:
         case D3D_SIT_TBUFFER:
-            a_out.bindings.push_back({ 0, a_layout.textureShift + bind.BindPoint, Kind::Texture });
+            a_out.bindings.push_back({ set, shifted(a_layout.textureShift), Kind::Texture });
             break;
         case D3D_SIT_STRUCTURED:
         case D3D_SIT_BYTEADDRESS:
-            a_out.bindings.push_back({ 0, a_layout.textureShift + bind.BindPoint, Kind::StorageBuffer });
+            a_out.bindings.push_back({ set, shifted(a_layout.textureShift), Kind::StorageBuffer });
             break;
         case D3D_SIT_SAMPLER:
-            a_out.bindings.push_back({ 0, a_layout.samplerShift + bind.BindPoint, Kind::Sampler });
+            a_out.bindings.push_back({ set, shifted(a_layout.samplerShift), Kind::Sampler });
             break;
         default:
-            a_out.bindings.push_back({ 0, a_layout.unorderedShift + bind.BindPoint, Kind::Other });
+            a_out.bindings.push_back({ set, shifted(a_layout.unorderedShift), Kind::Other });
             break;
         }
     }
