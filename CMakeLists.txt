@@ -25,6 +25,8 @@ add_library(ORGModuleServices STATIC
     src/Async/ExecutorTaskService.cpp
     src/BackingPool.cpp
     src/BackingPoolBinding.cpp
+    src/BufferImage.cpp
+    src/BufferJournal.cpp
     src/BuildContext.cpp
     src/BufferChains.cpp
     src/ComposedVersions.cpp
@@ -33,6 +35,7 @@ add_library(ORGModuleServices STATIC
     src/GraphHostBackings.cpp
     src/GraphHostRetirement.cpp
     src/GrowableBufferSet.cpp
+    src/JournaledBufferSet.cpp
     src/Passes/GenerateMipsPass.cpp
     src/Passes/HzbPass.cpp
     src/Passes/PrefixSumPass.cpp

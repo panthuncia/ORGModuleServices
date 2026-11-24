@@ -86,14 +86,14 @@ struct Executor::State {
     unsigned frameCriticalWorkers = 0;
     std::counting_semaphore<> frameCriticalAvailable{0};
     // Lock-free lookup and insertion; nodes never move.
-    tbb::concurrent_unordered_map<std::string, std::unique_ptr<ParallelForEntry>, NameHash, std::equal_to<>> parallelFor;
+    tbb::concurrent_unordered_map<std::string, std::shared_ptr<ParallelForEntry>, NameHash, std::equal_to<>> parallelFor;
 
     ParallelForEntry& Entry(std::string_view a_name) {
-        if (const auto found = parallelFor.find(a_name); found != parallelFor.end())
+        if (const auto found = parallelFor.find(std::string(a_name)); found != parallelFor.end())
             return *found->second;
-        auto entry = std::make_unique<ParallelForEntry>();
+        auto entry = std::make_shared<ParallelForEntry>();
         entry->name = a_name;
-        return *parallelFor.emplace(std::string(a_name), std::move(entry)).first->second;  // a racing insert of the name wins
+        return *parallelFor.insert(std::make_pair(std::string(a_name), std::move(entry))).first->second;  // a racing insert of the name wins
     }
     bool Boosts() const { return priority.get && priority.set; }
     TaskClass ParallelClass() const { return {0, parallelDomain}; }

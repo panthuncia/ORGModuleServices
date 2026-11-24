@@ -394,6 +394,7 @@ BackingLease BackingPool::Acquire(const BackingRequest& request, std::uint64_t p
             if (!chosen) {
                 if (detail::TryClaim(*backing)) {
                     backing->retired.store(false, std::memory_order_seq_cst);  // reused: back in circulation
+                    backing->sealedBytes.store(0, std::memory_order_relaxed);  // a fresh fill: no version names it
                     chosen = backing;
                 }
                 continue;
@@ -437,6 +438,7 @@ BackingLease BackingPool::Acquire(const BackingRequest& request, std::uint64_t p
             if (bound) {
                 local.writeAfter = bound->safeAt.load(std::memory_order_acquire);
                 bound->retired.store(false, std::memory_order_seq_cst);
+                bound->sealedBytes.store(0, std::memory_order_relaxed);
                 std::erase(state.free, bound);
                 home.free.fetch_sub(1, std::memory_order_relaxed);
                 home.reused.fetch_add(1, std::memory_order_relaxed);

@@ -15,6 +15,7 @@ class Buffer;
 
 namespace org::services {
 
+class BufferImage;
 class BackingPool;
 namespace detail {
 struct BackingHome;
@@ -137,8 +138,8 @@ struct BackingPoolHooks {
  * @brief One pooled GPU allocation. The pool owns it (shared_ptr); a BackingLease names it while a version, a payload or a frame
  * uses it. Reused only when it has no lease, no binding consumer and no readback pin, and its clock has reached safeAt.
  *
- * The fixed fields are set when it is made. contentEpoch belongs to the lease holder that fills it (the single acquirer's side):
- * it says what it holds, so the next acquirer catches up from there (the host's change journal).
+ * The fixed fields are set when it is made. contentEpoch and image belong to the lease holder that fills it (the single acquirer's
+ * side): they say what it holds, so the next acquirer catches up from there (BufferJournal writes, a KeptView's runs).
  */
 struct Backing {
     std::shared_ptr<Buffer> buffer;
@@ -151,8 +152,14 @@ struct Backing {
     BackingFlags flags;
     std::uint64_t compatibility = 0;
 
-    // The write position its contents hold (0: nothing; written whole). Set by the lease holder after it queued the catch-up.
+    // The journal position its contents hold (0: nothing; written whole). Set by the lease holder after it queued the catch-up.
     std::atomic<std::uint64_t> contentEpoch{0};
+    // The sealed mark: the most bytes any published version names of it (monotonic while leased; 0 when the pool reuses it). A
+    // reader of a published version reads only below its own units, so writes at or past the mark (JournaledPartRequest::
+    // appendInto) reach nothing a frame may read. The lease holder's, like contentEpoch.
+    std::atomic<std::uint64_t> sealedBytes{0};
+    // BasicRenderer: the image its contents are (journal catch-up needs the same byte size). The lease holder's.
+    std::shared_ptr<const BufferImage> image;
     // Reusable once the clock reached it (max of every Bind).
     std::atomic<std::uint64_t> safeAt{0};
     std::atomic<std::uint32_t> leases{0};

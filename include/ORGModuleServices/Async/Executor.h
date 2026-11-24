@@ -13,6 +13,15 @@
 
 namespace org::async {
 
+// Executor::ThreadPriority. At namespace scope so the constructor's default argument can use its member initializers (a
+// nested class's are not usable inside the enclosing class's definition).
+struct ExecutorThreadPriority {
+    std::function<int()> get;
+    std::function<void(int)> set;
+    // A frame-critical job runs at least at this priority, restored after.
+    int frameCritical = 0;
+};
+
 // A thread pool that implements GraphScheduler. Its threads are grouped in domains (TaskClass::domain), each with its own
 // workers and its own unbounded MPMC queue. One lane per domain (TaskClass::lane is always 0).
 //
@@ -67,12 +76,7 @@ public:
     // Get and set the calling thread's priority, in host-defined values where larger is higher.
     // With both set, a helper running a ParallelFor caller's chunks runs at least at the caller's priority and is
     // restored afterwards. Each worker reads its own once after ThreadStart. Nothing else may change a worker's priority.
-    struct ThreadPriority {
-        std::function<int()> get;
-        std::function<void(int)> set;
-        // A frame-critical job runs at least at this priority, restored after.
-        int frameCritical = 0;
-    };
+    using ThreadPriority = ExecutorThreadPriority;
 
     struct Desc {
         // Worker threads per domain, indexed by TaskClass::domain. Every domain needs at least one.
