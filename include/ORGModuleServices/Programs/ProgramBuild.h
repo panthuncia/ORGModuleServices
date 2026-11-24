@@ -58,6 +58,8 @@ struct ProgramEnvironment {
     // Whether SPIR-V builds take bound push tables: the Vulkan device binds PushIndex constant buffers as real uniform buffers
     // (rhi::vulkan::BoundUniformBuffers). Empty: they do not. DXIL builds always take them.
     std::function<bool()> spirvBoundPushTables;
+    // Whether stages carry source-level debug info for graphics debuggers. Empty: they do.
+    std::function<bool()> debugInfo;
 };
 
 // Setup, once, before any program loads and before any other thread reads it.

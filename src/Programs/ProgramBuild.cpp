@@ -82,8 +82,9 @@ ShaderCompileRequest MakeRequest(const std::filesystem::path& path, std::span<co
     // SPIR-V on Vulkan, DXIL on D3D12, from the same HLSL.
     request.format = Format();
     request.warningsAsErrors = false;
-    // Source-level debug info for graphics debuggers. Drivers ignore it and optimization is unchanged.
-    request.debugInfo = true;
+    // Source-level debug info for graphics debuggers. Drivers ignore it and optimization is unchanged, but it makes stages
+    // several times larger, so the host can leave it out.
+    request.debugInfo = !environment.debugInfo || environment.debugInfo();
     request.includeDirectories = { environment.shaderRoot };
     // Storage images take their view's format. Without it DXC types every float4 RWTexture as Rgba32f, which must not be
     // written through an RGBA16F view. D3D12 always works this way.
