@@ -5,7 +5,6 @@
 #include <ORGModuleServices/ShaderStore.h>
 
 #include <algorithm>
-#include <cstdlib>
 
 #include <cstring>
 #include <fstream>
@@ -101,15 +100,6 @@ ShaderCompileRequest MakeRequest(const std::filesystem::path& path, std::span<co
 }
 
 bool BoundPushTables() {
-    static const bool off = [] {
-        char* value = nullptr;
-        size_t length = 0;
-        const bool zero = _dupenv_s(&value, &length, "ORG_BOUND_PUSH_TABLES") == 0 && value && value[0] == '0';
-        std::free(value);
-        return zero;
-    }();
-    if (off)
-        return false;
     if (Format() == ShaderBinaryFormat::Dxil)
         return true;
     const auto& spirvBound = CurrentProgramEnvironment().spirvBoundPushTables;

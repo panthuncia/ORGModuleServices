@@ -106,7 +106,7 @@ std::string Narrow(std::wstring_view text);
 // kBoundPushTableSpace) is bound at the heap slot pushed in word w of the program's push constants: a descriptor table on D3D12,
 // a push descriptor uniform buffer on Vulkan (DXC puts it at set kBoundPushTableSpace, binding w). On NVIDIA its values are free
 // operands, where a heap-indexed constant buffer's cost a register each. Other SPIR-V builds read every constant buffer from the
-// heap. ORG_BOUND_PUSH_TABLES=0 in the environment turns them off, for A/B runs.
+// heap.
 inline constexpr uint32_t kBoundPushTableSpace = 11;
 
 // Whether this environment's builds take bound push tables.
