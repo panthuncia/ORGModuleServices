@@ -24,6 +24,7 @@ public:
         Cancel();
         Wait();
     }
+    bool Idle() const noexcept override { return pending.load(std::memory_order_acquire) == 0; }
     bool Cancelled() const noexcept { return cancelled.load(std::memory_order_acquire); }
     void Enter() { pending.fetch_add(1, std::memory_order_acq_rel); }
     void Leave() {

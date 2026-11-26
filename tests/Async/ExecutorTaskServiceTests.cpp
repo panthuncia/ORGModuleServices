@@ -49,6 +49,7 @@ public:
     void Cancel() noexcept override {}
     void Wait() override {}
     void CancelAndWait() override {}
+    bool Idle() const noexcept override { return true; }
 };
 
 }
