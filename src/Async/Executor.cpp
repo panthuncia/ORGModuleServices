@@ -1,5 +1,6 @@
 // Executor: per-domain job queues, worker threads, timers, scopes and ParallelFor.
 #include <ORGModuleServices/Async/Executor.h>
+#include <ORGModuleServices/Async/InboxQueue.h>
 
 #include <algorithm>
 #include <atomic>
@@ -13,7 +14,6 @@
 #include <utility>
 #include <vector>
 
-#include <tbb/concurrent_queue.h>
 #include <tbb/concurrent_unordered_map.h>
 
 namespace org::async {
@@ -44,16 +44,17 @@ struct Executor::State {
         bool frameCritical = false;  // DispatchFrameCritical's
     };
 
-    // Unbounded and lock-free for producers: any thread pushes, every worker of the domain pops.
+    // Unbounded and lock-free for producers: any thread pushes, every worker of the domain pops. Workers that pop at once block
+    // on each other rather than spin (InboxQueue), so a worker preempted mid-pop never has the others spinning on it.
     struct Queue {
-        tbb::concurrent_queue<Job> jobs;
+        InboxQueue<Job> jobs;
         std::atomic<std::size_t> size{0};  // pushed and not yet popped, for statistics
         void Push(Job&& a_job) {
             size.fetch_add(1, std::memory_order_relaxed);
-            jobs.push(std::move(a_job));
+            jobs.Push(std::move(a_job));
         }
         bool Pop(Job& a_job) {
-            if (!jobs.try_pop(a_job))
+            if (!jobs.TryPop(a_job))
                 return false;
             size.fetch_sub(1, std::memory_order_relaxed);
             return true;

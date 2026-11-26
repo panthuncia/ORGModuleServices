@@ -1,6 +1,7 @@
 #include <ORGModuleServices/Async/ArtifactBuild.h>
 #include <ORGModuleServices/Async/ArtifactSnapshot.h>
 #include <ORGModuleServices/Async/GraphSchedulingLayout.h>
+#include <ORGModuleServices/Async/InboxQueue.h>
 #include <ORGModuleServices/Async/ArtifactResources.h>
 #include <ORGModuleServices/Async/LeasedArraySlots.h>
 #include <ORGModuleServices/Async/PublicationExchange.h>
@@ -13,6 +14,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <type_traits>
@@ -691,6 +693,51 @@ void TestConcurrentPump() {
 }
 }
 
+// Every item comes out once, each producer's items in its push order, with several producers and consumers at once.
+void TestInboxQueue() {
+    org::async::InboxQueue<std::unique_ptr<int>> empty;
+    std::unique_ptr<int> none;
+    assert(!empty.TryPop(none));
+    {
+        org::async::InboxQueue<std::unique_ptr<int>> leftover;  // freed with items still queued, some taken from the inbox
+        for (int i = 0; i < 3; ++i) leftover.Push(std::make_unique<int>(i));
+        assert(leftover.TryPop(none) && *none == 0);
+        leftover.Push(std::make_unique<int>(3));
+    }
+    constexpr unsigned kProducers = 4, kConsumers = 4, kPushes = 50000;
+    org::async::InboxQueue<std::uint64_t> queue;
+    std::atomic<unsigned> popped{ 0 };
+    std::vector<std::vector<std::uint64_t>> got(kConsumers);
+    std::vector<std::thread> threads;
+    for (unsigned c = 0; c < kConsumers; ++c)
+        threads.emplace_back([&, c] {
+            for (std::uint64_t item; popped.load() < kProducers * kPushes;)
+                if (queue.TryPop(item)) {
+                    got[c].push_back(item);
+                    popped.fetch_add(1);
+                }
+        });
+    for (unsigned p = 0; p < kProducers; ++p)
+        threads.emplace_back([&, p] {
+            for (std::uint64_t i = 0; i < kPushes; ++i) queue.Push((std::uint64_t(p) << 32) | i);
+        });
+    for (auto& thread : threads) thread.join();
+    std::vector<unsigned> count(kProducers);
+    for (const auto& items : got) {
+        std::vector<std::int64_t> last(kProducers, -1);  // each consumer sees each producer's items in order
+        for (const std::uint64_t item : items) {
+            const auto p = unsigned(item >> 32);
+            const auto i = std::int64_t(item & 0xFFFFFFFFu);
+            assert(i > last[p]);
+            last[p] = i;
+            ++count[p];
+        }
+    }
+    for (unsigned p = 0; p < kProducers; ++p) assert(count[p] == kPushes);
+    std::uint64_t extra;
+    assert(!queue.TryPop(extra));
+}
+
 int main() {
     TestArtifactBuildContracts();
     TestArtifactRegistrations();
@@ -705,4 +752,5 @@ int main() {
     TestConcurrentTripleBuffer();
     TestPump();
     TestConcurrentPump();
+    TestInboxQueue();
 }
