@@ -354,6 +354,88 @@ void TestFrameCritical()
     assert(queuedRan.load());
 }
 
+namespace
+{
+    // The OS thread priority, settable from another thread by the address of the thread's own value (ThreadPriority::thread).
+    thread_local std::atomic_int sharedPriority{ 0 };
+    Executor::ThreadPriority SharedPriority()
+    {
+        Executor::ThreadPriority priority{ [] { return sharedPriority.load(); }, [](int a_priority) { sharedPriority = a_priority; } };
+        priority.thread = [] { return reinterpret_cast<std::uintptr_t>(&sharedPriority); };
+        priority.setThread = [](std::uintptr_t a_thread, int a_priority) { reinterpret_cast<std::atomic_int*>(a_thread)->store(a_priority); };
+        return priority;
+    }
+}
+
+// A thread waiting on a scope raises the workers to its own priority while it waits, a running task included, and they go back to
+// their own afterwards. A worker's own raise (a frame-critical job) is kept under the boost and restored after it.
+void TestWaitBoost()
+{
+    constexpr unsigned kWorkers = 2;
+    auto priority = SharedPriority();
+    priority.frameCritical = 2;
+    Executor executor(Executor::Desc{ .domainWorkers = { 1, kWorkers, 1, 1 },
+        .onThreadStart = [](org::async::TaskClass a_class, unsigned) { sharedPriority = a_class.domain == Executor::Preparation.domain ? -1 : 1; },
+        .priority = std::move(priority) });
+    const auto scope = executor.CreateScope("boosted wait");
+    std::promise<void> started;
+    auto running = started.get_future();
+    std::atomic_int seen{ -100 };
+    assert(executor.SubmitCpu(scope, 0, 1, "starved", [&](const auto&) {
+        started.set_value();
+        // Runs until a waiter raised it.
+        for (const auto deadline = std::chrono::steady_clock::now() + 5s; sharedPriority.load() < 0 && std::chrono::steady_clock::now() < deadline;)
+            std::this_thread::yield();
+        seen = sharedPriority.load();
+    }));
+    Ready(running);
+    sharedPriority = 0;  // the waiting thread: normal
+    scope->Wait();
+    assert(seen.load() == 0 && executor.GetStatistics().waitBoosts == 1);
+    // Restored once the wait ended.
+    const auto check = executor.CreateScope("after");
+    std::mutex seenMutex;
+    std::vector<int> after;
+    std::atomic_uint arrived{ 0 };
+    for (unsigned i = 0; i != kWorkers; ++i)
+        assert(executor.SubmitCpu(check, 0, 1, "priority", [&](const auto&) {
+            {
+                std::lock_guard lock(seenMutex);
+                after.push_back(sharedPriority.load());
+            }
+            arrived.fetch_add(1);
+            for (const auto deadline = std::chrono::steady_clock::now() + 5s; arrived.load() != kWorkers && std::chrono::steady_clock::now() < deadline;)
+                std::this_thread::yield();
+        }));
+    // Polled, not waited: a wait would raise them while they report.
+    for (const auto deadline = std::chrono::steady_clock::now() + 5s; arrived.load() != kWorkers && std::chrono::steady_clock::now() < deadline;)
+        std::this_thread::yield();
+    check->Wait();
+    assert(after.size() == kWorkers && std::all_of(after.begin(), after.end(), [](int a_priority) { return a_priority == -1; }));
+    // A frame-critical job above the waiter keeps its own priority, and the worker goes back to -1 after both.
+    std::promise<void> criticalStarted;
+    auto criticalRunning = criticalStarted.get_future();
+    std::atomic_bool release{ false };
+    std::atomic_int during{ -100 };
+    assert(executor.DispatchFrameCritical(check, "critical", [&](const auto&) {
+        criticalStarted.set_value();
+        while (!release.load())
+            std::this_thread::yield();
+        during = sharedPriority.load();
+    }));
+    Ready(criticalRunning);
+    std::thread waiter([&] {
+        sharedPriority = 0;
+        check->Wait();
+    });
+    for (const auto deadline = std::chrono::steady_clock::now() + 5s; executor.GetStatistics().waitBoosts != 2 && std::chrono::steady_clock::now() < deadline;)
+        std::this_thread::yield();
+    release = true;
+    waiter.join();
+    assert(during.load() == 2);
+    sharedPriority = 0;
+}
+
 // The caller waits only for a chunk a helper holds, and that wait is reported under its name; helpers that start late do nothing.
 void TestParallelForWaitAndLateHelpers()
 {
@@ -637,6 +719,7 @@ int main()
     TestParallelForPriority();
     TestParallelForWaitAndLateHelpers();
     TestFrameCritical();
+    TestWaitBoost();
     TestDefaultLayout();
     TestCustomLayout();
     TestInvalidLayouts();

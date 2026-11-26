@@ -74,6 +74,10 @@ public:
         });
     }
 
+    std::shared_ptr<void> RaiseWorkersForWait() override {
+        return std::make_shared<Executor::WaitBoost>(executor.BoostWorkersForWait());
+    }
+
     std::shared_ptr<runtime::ITaskScope> CreateScope(std::string_view) override { return std::make_shared<CountingScope>(executor); }
 
     bool Submit(const std::shared_ptr<runtime::ITaskScope>& a_scope, runtime::TaskPriority a_priority, std::string_view a_name,
