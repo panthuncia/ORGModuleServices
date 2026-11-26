@@ -15,8 +15,13 @@ namespace {
 // once every one has left. A task leaves when the executor drops it, run or not.
 class CountingScope final : public runtime::ITaskScope {
 public:
+    explicit CountingScope(const Executor& a_executor) : executor(a_executor) {}
     void Cancel() noexcept override { cancelled.store(true, std::memory_order_release); }
+    // The workers run at least at the waiting thread's priority meanwhile (Executor::WaitBoost).
     void Wait() override {
+        if (pending.load(std::memory_order_acquire) == 0)
+            return;
+        const auto boost = executor.BoostWorkersForWait();
         for (auto value = pending.load(std::memory_order_acquire); value != 0; value = pending.load(std::memory_order_acquire))
             pending.wait(value);
     }
@@ -33,6 +38,7 @@ public:
     }
 
 private:
+    const Executor& executor;
     std::atomic_bool cancelled{false};
     std::atomic<std::size_t> pending{0};
 };
@@ -68,7 +74,7 @@ public:
         });
     }
 
-    std::shared_ptr<runtime::ITaskScope> CreateScope(std::string_view) override { return std::make_shared<CountingScope>(); }
+    std::shared_ptr<runtime::ITaskScope> CreateScope(std::string_view) override { return std::make_shared<CountingScope>(executor); }
 
     bool Submit(const std::shared_ptr<runtime::ITaskScope>& a_scope, runtime::TaskPriority a_priority, std::string_view a_name,
         std::function<void()>&& a_task) override {

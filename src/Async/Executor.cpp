@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <exception>
 #include <mutex>
 #include <semaphore>
@@ -24,6 +25,8 @@ thread_local const void* currentExecutor = nullptr;
 thread_local int threadPriority = 0;
 // The worker runs a frame-critical job, so its ParallelFor's helpers are frame-critical too.
 thread_local bool inFrameCritical = false;
+// The worker's entry in its executor's boost list (State::Worker), or null.
+thread_local void* currentWorker = nullptr;
 
 template <class T>
 void RaiseTo(std::atomic<T>& a_max, T a_value) {
@@ -77,6 +80,14 @@ struct Executor::State {
         std::size_t operator()(std::string_view a_name) const noexcept { return std::hash<std::string_view>{}(a_name); }
     };
 
+    // A worker whose priority a waiting thread may raise (WaitBoost). own: what the worker set for itself (threadPriority).
+    // applied: what it runs at, at least the waiters' boost. Both change under the mutex.
+    struct Worker {
+        std::mutex mutex;
+        std::uintptr_t thread = 0;
+        int own = 0, applied = 0;
+    };
+
     std::atomic_bool stopping{false};
     std::vector<std::unique_ptr<Domain>> domains;
     std::uint32_t parallelDomain = 0;
@@ -87,6 +98,13 @@ struct Executor::State {
     std::counting_semaphore<> frameCriticalAvailable{0};
     // Lock-free lookup and insertion; nodes never move.
     tbb::concurrent_unordered_map<std::string, std::unique_ptr<ParallelForEntry>, NameHash, std::equal_to<>> parallelFor;
+    // Waits that raise the workers: the waiting threads' priorities, and the highest of them (INT_MIN with none). Workers
+    // join the list at start. The boost mutex is taken before a worker's.
+    std::mutex boostMutex;
+    std::vector<int> waiters;
+    std::atomic<int> boost{INT_MIN};
+    std::vector<std::unique_ptr<Worker>> boostable;
+    std::atomic<std::uint64_t> waitBoosts{0};
 
     ParallelForEntry& Entry(std::string_view a_name) {
         if (const auto found = parallelFor.find(a_name); found != parallelFor.end())
@@ -96,6 +114,54 @@ struct Executor::State {
         return *parallelFor.emplace(std::string(a_name), std::move(entry)).first->second;  // a racing insert of the name wins
     }
     bool Boosts() const { return priority.get && priority.set; }
+    bool BoostsForWaits() const { return Boosts() && priority.thread && priority.setThread; }
+
+    // A worker starting: it reads its priority and joins the boost list.
+    void StartWorker() {
+        if (!Boosts())
+            return;
+        threadPriority = priority.get();  // after ThreadStart set it
+        if (!BoostsForWaits())
+            return;
+        auto worker = std::make_unique<Worker>();
+        worker->thread = priority.thread();
+        worker->own = worker->applied = threadPriority;
+        currentWorker = worker.get();
+        std::lock_guard boostLock(boostMutex);
+        std::lock_guard lock(worker->mutex);
+        if (const int applied = (std::max)(worker->own, boost.load(std::memory_order_relaxed)); applied != worker->applied) {
+            priority.set(applied);
+            worker->applied = applied;
+        }
+        boostable.push_back(std::move(worker));
+    }
+    // The calling worker sets its own priority. It runs at least at a waiter's boost meanwhile.
+    void SetOwn(int a_priority) {
+        threadPriority = a_priority;
+        auto* worker = static_cast<Worker*>(currentWorker);
+        if (!worker) {
+            priority.set(a_priority);
+            return;
+        }
+        std::lock_guard lock(worker->mutex);
+        worker->own = a_priority;
+        if (const int applied = (std::max)(a_priority, boost.load(std::memory_order_relaxed)); applied != worker->applied) {
+            priority.set(applied);
+            worker->applied = applied;
+        }
+    }
+    // With the boost mutex: the boost follows the waiters, and every worker runs at its own priority or the boost.
+    void ApplyBoostLocked() {
+        const int raised = waiters.empty() ? INT_MIN : *std::max_element(waiters.begin(), waiters.end());
+        boost.store(raised, std::memory_order_relaxed);
+        for (const auto& worker : boostable) {
+            std::lock_guard lock(worker->mutex);
+            if (const int applied = (std::max)(worker->own, raised); applied != worker->applied) {
+                priority.setThread(worker->thread, applied);
+                worker->applied = applied;
+            }
+        }
+    }
     TaskClass ParallelClass() const { return {0, parallelDomain}; }
 
     explicit State(const std::vector<unsigned>& a_domainWorkers, std::uint32_t a_parallelDomain, unsigned a_frameCriticalWorkers,
@@ -125,6 +191,32 @@ struct Executor::State {
     void Execute(unsigned domain, Job& job);
 };
 
+Executor::WaitBoost::~WaitBoost() {
+    if (!state)
+        return;
+    std::lock_guard lock(state->boostMutex);
+    if (const auto found = std::find(state->waiters.begin(), state->waiters.end(), priority); found != state->waiters.end())
+        state->waiters.erase(found);
+    state->ApplyBoostLocked();
+}
+
+Executor::WaitBoost::WaitBoost(WaitBoost&& a_other) noexcept : state(std::move(a_other.state)), priority(a_other.priority) {}
+
+Executor::WaitBoost Executor::Boost(const std::shared_ptr<State>& a_state) {
+    WaitBoost boost;
+    if (currentExecutor == a_state.get() || !a_state->BoostsForWaits())
+        return boost;
+    boost.priority = a_state->priority.get();
+    boost.state = a_state;
+    a_state->waitBoosts.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard lock(a_state->boostMutex);
+    a_state->waiters.push_back(boost.priority);
+    a_state->ApplyBoostLocked();
+    return boost;
+}
+
+Executor::WaitBoost Executor::BoostWorkersForWait() const { return Boost(state); }
+
 struct Executor::ExecutorScope final : TaskScope {
     std::shared_ptr<State> owner;
     std::atomic_bool cancelled{false};
@@ -140,8 +232,11 @@ struct Executor::ExecutorScope final : TaskScope {
     }
     void Wait() const override {
         if (currentExecutor == owner.get()) throw std::logic_error("executor workers cannot wait on their executor's scopes");
-        for (auto value = pending.load(); value != 0; value = pending.load())
-            pending.wait(value);
+        if (pending.load() != 0) {
+            const auto boost = Boost(owner);
+            for (auto value = pending.load(); value != 0; value = pending.load())
+                pending.wait(value);
+        }
         std::exception_ptr error;
         {
             std::lock_guard lock(failureMutex);
@@ -166,18 +261,14 @@ void Executor::State::Execute(unsigned domain, Job& job) {
         // Hold the worker at the raised priority for a frame-critical job, since workers may sit below other threads. Restored after.
         const int previous = threadPriority;
         const bool raise = job.frameCritical && Boosts() && priority.frameCritical > previous;
-        if (raise) {
-            priority.set(priority.frameCritical);
-            threadPriority = priority.frameCritical;
-        }
+        if (raise)
+            SetOwn(priority.frameCritical);
         const bool wasFrameCritical = std::exchange(inFrameCritical, inFrameCritical || job.frameCritical);
         try { job.task({[scope] { return scope->StopRequested(); }}); }
         catch (...) { error = std::current_exception(); }
         inFrameCritical = wasFrameCritical;
-        if (raise) {
-            priority.set(previous);
-            threadPriority = previous;
-        }
+        if (raise)
+            SetOwn(previous);
     }
     // Release captured resources before signalling completion, even when the task never started. Cancel never destroys queued work.
     job.task = {};
@@ -197,8 +288,7 @@ void Executor::State::Execute(unsigned domain, Job& job) {
 
 void Executor::State::Run(unsigned domain) {
     currentExecutor = this;
-    if (Boosts())
-        threadPriority = priority.get();  // after ThreadStart set it
+    StartWorker();
     auto& d = *domains[domain];
     // Delayed jobs this worker took from the ring early, earliest first.
     std::vector<Job> timers;
@@ -242,8 +332,7 @@ void Executor::State::Run(unsigned domain) {
 
 void Executor::State::RunFrameCritical() {
     currentExecutor = this;
-    if (Boosts())
-        threadPriority = priority.get();  // after ThreadStart set it
+    StartWorker();
     auto& d = *domains[parallelDomain];
     for (;;) {
         if (stopping.load() && d.frameCritical.Size() == 0) {
@@ -375,7 +464,7 @@ void Executor::ParallelFor(std::string_view a_name, std::size_t a_count, std::si
         std::atomic<std::size_t> next{0}, done{0};
         std::size_t count = 0, grain = 0, chunks = 0;
         const std::function<void(std::size_t, std::size_t)>* body = nullptr;
-        const ThreadPriority* priority = nullptr;  // null leaves priorities alone
+        State* boosts = nullptr;  // null leaves priorities alone
         int callerPriority = 0;
         State::ParallelForEntry* entry = nullptr;
         std::mutex errorMutex;
@@ -402,17 +491,14 @@ void Executor::ParallelFor(std::string_view a_name, std::size_t a_count, std::si
         // waits on is raised to the caller's priority, never lowered, and restored after.
         void Help() {
             const int previous = threadPriority;
-            const bool raise = priority && callerPriority > previous && next.load(std::memory_order_relaxed) < chunks;
+            const bool raise = boosts && callerPriority > previous && next.load(std::memory_order_relaxed) < chunks;
             if (raise) {
-                priority->set(callerPriority);
-                threadPriority = callerPriority;  // a nested ParallelFor's helpers inherit it
+                boosts->SetOwn(callerPriority);  // a nested ParallelFor's helpers inherit it
                 entry->boosts.fetch_add(1, std::memory_order_relaxed);
             }
             const std::size_t ran = Work();
-            if (raise) {
-                priority->set(previous);
-                threadPriority = previous;
-            }
+            if (raise)
+                boosts->SetOwn(previous);
             if (ran)
                 entry->helperChunks.fetch_add(ran, std::memory_order_relaxed);
             else
@@ -426,7 +512,7 @@ void Executor::ParallelFor(std::string_view a_name, std::size_t a_count, std::si
     shared->body = &a_body;
     shared->entry = &entry;
     if (state->Boosts()) {
-        shared->priority = &state->priority;
+        shared->boosts = state.get();
         // A worker's priority is cached, and a boosted helper counts as its caller's. Any other thread is asked.
         shared->callerPriority = currentExecutor == state.get() ? threadPriority : state->priority.get();
     }
@@ -463,6 +549,7 @@ Executor::Statistics Executor::GetStatistics() const {
     stats.cancelled = state->cancelled.load();
     stats.rejected = state->rejected.load();
     stats.failed = state->failed.load();
+    stats.waitBoosts = state->waitBoosts.load(std::memory_order_relaxed);
     const std::size_t count = state->domains.size();
     stats.queued.resize(count);
     stats.active.resize(count);

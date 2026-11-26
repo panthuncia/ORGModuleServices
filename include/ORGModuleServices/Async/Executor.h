@@ -27,6 +27,8 @@ namespace org::async {
 // The default layout has four domains: a coordinator thread, a parallel preparation pool, a serial thread and a small
 // blocking pool. A host may pass its own domains in Desc.
 class Executor final : public GraphScheduler {
+    struct State;
+
 public:
     // The default layout's classes. A host with its own domains uses its own classes.
     static constexpr TaskClass Coordinator{0, 0};
@@ -44,6 +46,7 @@ public:
 
     struct Statistics {
         std::uint64_t accepted = 0, completed = 0, cancelled = 0, rejected = 0, failed = 0;
+        std::uint64_t waitBoosts = 0;  // waits that raised the workers (WaitBoost)
         // Per domain.
         std::vector<std::size_t> queued, active, highWater;
     };
@@ -72,6 +75,29 @@ public:
         std::function<void(int)> set;
         // A frame-critical job runs at least at this priority, restored after.
         int frameCritical = 0;
+        // Optional, with get and set: a handle to the calling thread that stays valid for the executor's life, and set for a
+        // thread by that handle. With them, a thread waiting for the executor's work raises the workers (WaitBoost).
+        std::function<std::uintptr_t()> thread;
+        std::function<void(std::uintptr_t, int)> setThread;
+    };
+
+    // A thread waiting for this executor's work. While it lives, every worker runs at least at the waiting thread's priority,
+    // then each goes back to its own. Workers may sit below other threads, and a waiter above them would otherwise wait until
+    // the scheduler lends them time. Does nothing on a worker of this executor, or without ThreadPriority::thread and setThread.
+    // Scope waits take one.
+    class WaitBoost {
+    public:
+        WaitBoost() = default;
+        ~WaitBoost();
+        WaitBoost(WaitBoost&& a_other) noexcept;
+        WaitBoost& operator=(WaitBoost&&) = delete;
+        WaitBoost(const WaitBoost&) = delete;
+        WaitBoost& operator=(const WaitBoost&) = delete;
+
+    private:
+        friend class Executor;
+        std::shared_ptr<State> state;
+        int priority = 0;
     };
 
     struct Desc {
@@ -113,6 +139,9 @@ public:
     void ParallelFor(std::string_view a_name, std::size_t a_count, std::size_t a_grain,
         const std::function<void(std::size_t, std::size_t)>& a_body);
 
+    // Any thread about to wait for work of this executor (WaitBoost).
+    [[nodiscard]] WaitBoost BoostWorkersForWait() const;
+
     [[nodiscard]] Statistics GetStatistics() const;
     // Every ParallelFor name seen so far. a_takePeaks resets each maxBlockedNanoseconds once read.
     [[nodiscard]] std::vector<ParallelForStatistics> GetParallelForStatistics(bool a_takePeaks = false) const;
@@ -129,7 +158,7 @@ public:
     void Shutdown();
 
 private:
-    struct State;
+    static WaitBoost Boost(const std::shared_ptr<State>& a_state);
     struct ExecutorScope;
     struct Threads;
     std::shared_ptr<State> state;
